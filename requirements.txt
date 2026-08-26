@@ -1,0 +1,7 @@
+aiogram
+google-genai
+sqlalchemy
+apscheduler
+python-dotenv
+upstash-redis
+aiohttp

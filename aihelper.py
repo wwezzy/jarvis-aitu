@@ -1,6 +1,6 @@
+from upstash_redis.asyncio import Redis as AsyncRedis
+from aiohttp import web
 import asyncio
-import ctypes
-import subprocess  # Используем современную библиотеку вместо os
 from datetime import datetime
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -15,6 +15,7 @@ from database.models import User, Workout, Habit, Reminder
 from services.llm import parse_user_message, client
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+redis_client = AsyncRedis(url=os.getenv("UPSTASH_REDIS_REST_URL"), token=os.getenv("UPSTASH_REDIS_REST_TOKEN"))
 
 # ВСТАВЬ СЮДА СВОЙ TELEGRAM ID
 ADMIN_ID = 2016952162
@@ -138,18 +139,12 @@ async def handle_any_message(message: Message, bot: Bot):
         # НОВАЯ ПЕРЕМЕННАЯ: Читаем команду из ответа Gemini
         sys_cmd = data.get("system_command")
 
-        # --- СИСТЕМА УПРАВЛЕНИЯ НОУТБУКОМ ---
-        if sys_cmd == "lock":
-            ctypes.windll.user32.LockWorkStation()
-            reply_text += "\n\n*(🔒 Рабочая станция заблокирована)*"
-        elif sys_cmd == "sleep":
-            # Посылаем системный сигнал на отключение монитора (включает Modern Standby)
-            ctypes.windll.user32.SendMessageW(0xFFFF, 0x0112, 0xF170, 2)
-            reply_text += "\n\n*(🌙 Экран погашен, система в легком сне)*"
-        elif sys_cmd == "shutdown":
-            subprocess.run(["shutdown", "/s", "/t", "0"])
-            reply_text += "\n\n*(⚠️ Инициировано полное завершение работы)*"
-        # ------------------------------------
+        # --- СИСТЕМА УПРАВЛЕНИЯ НОУТБУКОМ (ЧЕРЕЗ REDIS) ---
+        if sys_cmd in ["lock", "sleep", "shutdown"]:
+            # Отправляем команду в облако, она "сгорит" через 60 секунд, если ноут выключен
+            await redis_client.set("pc_command", sys_cmd, ex=60)
+            reply_text += f"\n\n*(📡 Команда {sys_cmd} отправлена на G16)*"
+        # ---------------------------------------------------
 
         if extracted_items or new_prefs or reminders:
             async with async_session_factory() as session:
@@ -195,15 +190,6 @@ async def handle_any_message(message: Message, bot: Bot):
 
 
 async def morning_briefing():
-    async def water_reminder():
-        try:
-            await bot.send_message(
-                ADMIN_ID,
-                "💧 **Сэр, режим Lock-in требует ресурса.**\nПожалуйста, выпейте стакан воды.",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            print(f"Ошибка напоминания о воде: {e}")
     try:
         # Получаем данные пользователя
         async with async_session_factory() as session:
@@ -225,9 +211,6 @@ async def morning_briefing():
     except Exception as e:
         print(f"Ошибка брифинга: {e}")
 
-
-
-
 async def water_reminder():
     try:
         await bot.send_message(
@@ -238,21 +221,35 @@ async def water_reminder():
     except Exception as e:
         print(f"Ошибка напоминания о воде: {e}")
 
+async def health_check(request):
+    return web.Response(text="Джарвис в сети и готов к работе!")
+
+
 async def main():
     print("Инициализация базы данных...")
     await init_db()
     print("Запуск планировщика задач...")
 
-    # Твой утренний брифинг в 07:00
     scheduler.add_job(morning_briefing, trigger='cron', hour=7, minute=0)
-
-    # НОВОЕ: Напоминание про воду КАЖДЫЕ 2 ЧАСА(поменял интервалҚ
     scheduler.add_job(water_reminder, trigger='cron', hour='8-22/2')
     scheduler.start()
+
+    # --- DUMMY-СЕРВЕР ДЛЯ ОБХОДА БЛОКИРОВОК ОБЛАКА ---
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"Web-сервер запущен на порту {port}")
+    # ------------------------------------------------
+
+# ... (тут заканчивается функция main) ...
     print("Система Джарвис запускается...")
     await dp.start_polling(bot)
 
-
+# ПРОВЕРЬ: Здесь не должно быть никаких пробелов в начале строк!
 if __name__ == "__main__":
     try:
         asyncio.run(main())
