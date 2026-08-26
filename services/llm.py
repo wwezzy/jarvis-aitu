@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from datetime import datetime
 from google import genai
 from google.genai import types
@@ -20,10 +21,18 @@ async def parse_user_message(text: str, user_name: str, preferences: str | None,
     {pref_text}
     ВНИМАНИЕ! ТЕКУЩЕЕ ВРЕМЯ НА СЕРВЕРЕ: {current_time}.
 
-    🔴 КРИТИЧЕСКОЕ ПРАВИЛО: Ты современный мультимодальный ИИ. Если тебе присылают аудио — ты УМЕЕШЬ его слушать. Расшифруй его и выполни просьбу.
+    🔴 КРИТИЧЕСКОЕ ПРАВИЛО ПО АУДИО: Ты современный мультимодальный ИИ. Если тебе присылают аудио — ты УМЕЕШЬ его слушать. Расшифруй его и выполни просьбу.
 
-    ТЫ ОБЯЗАН ВСЕГДА ВОЗВРАЩАТЬ ОТВЕТ СТРОГО В ФОРМАТЕ JSON. Без markdown, без текста до/после.
-    Ключи: "reply", "extracted_data", "new_preferences", "reminders", "system_command".
+    🔴 СТРОГИЙ СИНТАКСИС JSON:
+    Ты ОБЯЗАН возвращать ответ СТРОГО в формате JSON.
+    ЗАПРЕЩЕНО использовать двойные кавычки (") внутри текстовых значений! Если нужно выделить слово, используй только одинарные кавычки (').
+
+    Обязательные ключи:
+    1. "reply": Твой текстовый ответ.
+    2. "extracted_data": Массив объектов [{{"type": "workout"|"habit", "name": "название", "notes": "инфо"}}]. Иначе [].
+    3. "new_preferences": Если юзер просит что-то запомнить (например, как его называть), напиши это здесь. Иначе null.
+    4. "reminders": Массив объектов [{{"text": "текст", "remind_at": "YYYY-MM-DD HH:MM:SS"}}]. Иначе [].
+    5. "system_command": Если юзер просит заблокировать компьютер/экран, верни "lock". Если просит перевести комп в спящий режим, верни "sleep". Если просит полностью выключить ПК, верни "shutdown". Иначе null.
     """
 
     contents = []
@@ -31,23 +40,36 @@ async def parse_user_message(text: str, user_name: str, preferences: str | None,
         contents.append(types.Part.from_bytes(data=file_bytes, mime_type=mime_type))
     contents.append(user_text)
 
-    response = await client.aio.models.generate_content(
-        model='gemini-3.6-flash',
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=prompt,
-            temperature=0.2
+    try:
+        response = await client.aio.models.generate_content(
+            model='gemini-3.6-flash',
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=prompt,
+                temperature=0.2,
+                response_mime_type="application/json"
+            )
         )
-    )
 
-    # --- Бронебойная очистка от маркдауна ---
-    raw_text = response.text.strip()
-    if raw_text.startswith("```json"):
-        raw_text = raw_text.replace("```json", "", 1)
-    elif raw_text.startswith("```"):
-        raw_text = raw_text.replace("```", "", 1)
+        raw_text = response.text.strip()
 
-    if raw_text.endswith("```"):
-        raw_text = raw_text[:-3]
+        # Бронебойная очистка: ищем структуру JSON с помощью регулярного выражения
+        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if match:
+            raw_text = match.group(0)
 
-    return json.loads(raw_text.strip())
+        return json.loads(raw_text)
+
+    except Exception as e:
+        # Если парсинг всё равно сломался, бот не зависнет, а ответит этим запасным словарем
+        print(f"КРИТИЧЕСКАЯ ОШИБКА ПАРСИНГА LLM: {e}")
+        if 'raw_text' in locals():
+            print(f"Сырой ответ от Gemini: {raw_text}")
+
+        return {
+            "reply": "Сэр, произошла ошибка в моих нейронных цепях при форматировании данных. Пожалуйста, повторите команду.",
+            "extracted_data": [],
+            "new_preferences": None,
+            "reminders": [],
+            "system_command": None
+        }
