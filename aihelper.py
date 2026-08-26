@@ -1,17 +1,18 @@
 import asyncio
-import os
+import ctypes
+import subprocess  # Используем современную библиотеку вместо os
 from datetime import datetime
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 from sqlalchemy import select
 from dotenv import load_dotenv
+import os
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from database.engine import init_db, async_session_factory
 from database.models import User, Workout, Habit, Reminder
-from services.llm import parse_user_message
-
+from services.llm import parse_user_message, client
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -55,15 +56,41 @@ async def cmd_start(message: Message) -> None:
     await message.answer(f"Привет, {user_name}! Я твой личный Джарвис. 🚀\nСистема безопасности активирована.")
 
 
+@dp.message(F.text.lower() == "аналитика тренировок")
+async def analyze_workouts(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    status = await message.answer("📊 Поднимаю архивы из базы данных...")
+
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(Workout).where(Workout.user_id == ADMIN_ID).order_by(Workout.workout_date.desc()).limit(10)
+        )
+        workouts = result.scalars().all()
+
+    if not workouts:
+        await status.edit_text("База пуста. Вы еще не записывали тренировки.")
+        return
+
+    workout_history = "\n".join([f"{w.workout_date}: {w.workout_type} - {w.notes}" for w in workouts])
+
+    prompt = f"""Ты спортивный аналитик. Вот последние 10 записей тренировок пользователя:
+    {workout_history}
+    Сделай краткий анализ прогресса, укажи на сильные стороны и дай 1-2 конкретных совета по восстановлению или корректировке нагрузки. Текст должен быть коротким и мотивирующим."""
+
+    response = await client.aio.models.generate_content(
+        model='gemini-3.6-flash',
+        contents=[prompt]
+    )
+
+    await status.edit_text(f"💪 **Аналитика физической подготовки:**\n\n{response.text}", parse_mode="Markdown")
+
+# УДАЛИЛИ ШАБЛОННЫЕ КОМАНДЫ, ТЕПЕРЬ ВСЁ ИДЕТ ЧЕРЕЗ ИИ
 @dp.message(F.text | F.photo | F.document | F.voice)
 async def handle_any_message(message: Message, bot: Bot):
-    # --- СИСТЕМА ДИАГНОСТИКИ ---
-    print(f"📥 Пришло сообщение от ID: {message.from_user.id}")
-
     if message.from_user.id != ADMIN_ID:
-        print(f"❌ ДОСТУП ЗАКРЫТ: В коде стоит ADMIN_ID = {ADMIN_ID}, а пишет {message.from_user.id}")
         return
-        # ---------------------------
 
     status_msg = await message.answer("👀 Джарвис обрабатывает...")
 
@@ -93,7 +120,6 @@ async def handle_any_message(message: Message, bot: Bot):
             result = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
             user = result.scalar_one_or_none()
 
-            # АВТОРЕГИСТРАЦИЯ (на случай если ты не нажал /start)
             if user is None:
                 user = User(telegram_id=message.from_user.id, name=message.from_user.full_name)
                 session.add(user)
@@ -108,6 +134,22 @@ async def handle_any_message(message: Message, bot: Bot):
         extracted_items = data.get("extracted_data", [])
         new_prefs = data.get("new_preferences")
         reminders = data.get("reminders", [])
+
+        # НОВАЯ ПЕРЕМЕННАЯ: Читаем команду из ответа Gemini
+        sys_cmd = data.get("system_command")
+
+        # --- СИСТЕМА УПРАВЛЕНИЯ НОУТБУКОМ ---
+        if sys_cmd == "lock":
+            ctypes.windll.user32.LockWorkStation()
+            reply_text += "\n\n*(🔒 Рабочая станция заблокирована)*"
+        elif sys_cmd == "sleep":
+            # Посылаем системный сигнал на отключение монитора (включает Modern Standby)
+            ctypes.windll.user32.SendMessageW(0xFFFF, 0x0112, 0xF170, 2)
+            reply_text += "\n\n*(🌙 Экран погашен, система в легком сне)*"
+        elif sys_cmd == "shutdown":
+            subprocess.run(["shutdown", "/s", "/t", "0"])
+            reply_text += "\n\n*(⚠️ Инициировано полное завершение работы)*"
+        # ------------------------------------
 
         if extracted_items or new_prefs or reminders:
             async with async_session_factory() as session:
@@ -151,10 +193,61 @@ async def handle_any_message(message: Message, bot: Bot):
         print(f"Ошибка: {e}")
         await status_msg.edit_text("❌ Ошибка при обработке. Убедись, что формат поддерживается.")
 
+
+async def morning_briefing():
+    async def water_reminder():
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                "💧 **Сэр, режим Lock-in требует ресурса.**\nПожалуйста, выпейте стакан воды.",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            print(f"Ошибка напоминания о воде: {e}")
+    try:
+        # Получаем данные пользователя
+        async with async_session_factory() as session:
+            result = await session.execute(select(User).where(User.telegram_id == ADMIN_ID))
+            user = result.scalar_one_or_none()
+            user_prefs = user.preferences if user else "Досье пусто."
+
+        # Формируем системный промпт для генерации утренней сводки
+        prompt = f"""Ты Джарвис. Напиши бодрое, короткое утреннее сообщение для пользователя.
+        Контекст пользователя: {user_prefs}.
+        Обязательно напомни про режим Lock-in и упомяни, что библиотека AITU открыта до 22:00, так что времени на продуктивную работу полно.
+        Без лишней воды, строго по делу и с уважением."""
+
+        response = await client.aio.models.generate_content(
+            model='gemini-3.6-flash',
+            contents=[prompt]
+        )
+        await bot.send_message(ADMIN_ID, f"🌅 **Утренний протокол активен:**\n\n{response.text}", parse_mode="Markdown")
+    except Exception as e:
+        print(f"Ошибка брифинга: {e}")
+
+
+
+
+async def water_reminder():
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            "💧 **Сэр, режим Lock-in требует ресурса.**\nПожалуйста, выпейте стакан воды.",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        print(f"Ошибка напоминания о воде: {e}")
+
 async def main():
     print("Инициализация базы данных...")
     await init_db()
     print("Запуск планировщика задач...")
+
+    # Твой утренний брифинг в 07:00
+    scheduler.add_job(morning_briefing, trigger='cron', hour=7, minute=0)
+
+    # НОВОЕ: Напоминание про воду КАЖДЫЕ 2 ЧАСА(поменял интервалҚ
+    scheduler.add_job(water_reminder, trigger='cron', hour='8-22/2')
     scheduler.start()
     print("Система Джарвис запускается...")
     await dp.start_polling(bot)
