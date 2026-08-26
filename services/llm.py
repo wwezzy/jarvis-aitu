@@ -18,14 +18,12 @@ async def parse_user_message(text: str, user_name: str, preferences: str | None,
     prompt = f"""Ты — Джарвис, умный и продуктивный личный ИИ-ассистент.
     Твоя задача — быть полезным дневником и собеседником для пользователя по имени {user_name}. 
     {pref_text}
-    ВНИМАНИЕ! ТЕКУЩЕЕ ВРЕМЯ НА СЕРВЕРЕ: {current_time}. Учитывай это при расчете времени напоминаний.
+    ВНИМАНИЕ! ТЕКУЩЕЕ ВРЕМЯ НА СЕРВЕРЕ: {current_time}.
 
-    ТЫ ОБЯЗАН ВСЕГДА ВОЗВРАЩАТЬ ОТВЕТ СТРОГО В ФОРМАТЕ JSON, содержащем ПЯТЬ ключей:
-    1. "reply": Твой текстовый ответ.
-    2. "extracted_data": Массив объектов [{{"type": "workout"|"habit", "name": "название", "notes": "инфо"}}]. Иначе [].
-    3. "new_preferences": Если из текста можно извлечь новые факты о пользователе, верни обновленный текст. Иначе null.
-    4. "reminders": Массив объектов [{{"text": "текст", "remind_at": "YYYY-MM-DD HH:MM:SS"}}]. Иначе [].
-    5. "system_command": Если юзер просит заблокировать компьютер/экран, верни "lock". Если просит перевести комп в спящий режим, верни "sleep". Если просит полностью выключить (вырубить) ПК, верни "shutdown". Во всех остальных случаях верни null.
+    🔴 КРИТИЧЕСКОЕ ПРАВИЛО: Ты современный мультимодальный ИИ. Если тебе присылают аудио — ты УМЕЕШЬ его слушать. Расшифруй его и выполни просьбу.
+
+    ТЫ ОБЯЗАН ВСЕГДА ВОЗВРАЩАТЬ ОТВЕТ СТРОГО В ФОРМАТЕ JSON. Без markdown, без текста до/после.
+    Ключи: "reply", "extracted_data", "new_preferences", "reminders", "system_command".
     """
 
     contents = []
@@ -38,8 +36,18 @@ async def parse_user_message(text: str, user_name: str, preferences: str | None,
         contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=prompt,
-            response_mime_type="application/json",
             temperature=0.2
         )
     )
-    return json.loads(response.text)
+
+    # --- Бронебойная очистка от маркдауна ---
+    raw_text = response.text.strip()
+    if raw_text.startswith("```json"):
+        raw_text = raw_text.replace("```json", "", 1)
+    elif raw_text.startswith("```"):
+        raw_text = raw_text.replace("```", "", 1)
+
+    if raw_text.endswith("```"):
+        raw_text = raw_text[:-3]
+
+    return json.loads(raw_text.strip())
