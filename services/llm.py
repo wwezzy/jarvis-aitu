@@ -7,7 +7,14 @@ from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv()
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+# Собираем все доступные ключи в пул
+API_KEYS = [
+    os.getenv("GEMINI_API_KEY"),
+    os.getenv("GEMINI_API_KEY_2")
+]
+# Очищаем список от пустых значений (если вдруг добавишь только один)
+VALID_KEYS = [key for key in API_KEYS if key]
 
 
 async def parse_user_message(text: str, user_name: str, preferences: str | None, file_bytes: bytes = None,
@@ -40,36 +47,52 @@ async def parse_user_message(text: str, user_name: str, preferences: str | None,
         contents.append(types.Part.from_bytes(data=file_bytes, mime_type=mime_type))
     contents.append(user_text)
 
-    try:
-        response = await client.aio.models.generate_content(
-            model='gemini-3.6-flash',
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=prompt,
-                temperature=0.2,
-                response_mime_type="application/json"
+    # Проходимся по пулу ключей
+    for index, api_key in enumerate(VALID_KEYS):
+        try:
+            # Инициализируем клиента с текущим ключом из цикла
+            client = genai.Client(api_key=api_key)
+
+            response = await client.aio.models.generate_content(
+                model='gemini-3.6-flash',
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=prompt,
+                    temperature=0.2,
+                    response_mime_type="application/json"
+                )
             )
-        )
 
-        raw_text = response.text.strip()
+            raw_text = response.text.strip()
+            match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+            if match:
+                raw_text = match.group(0)
 
-        # Бронебойная очистка: ищем структуру JSON с помощью регулярного выражения
-        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-        if match:
-            raw_text = match.group(0)
+            return json.loads(raw_text)
 
-        return json.loads(raw_text)
+        except Exception as e:
+            err_str = str(e)
+            # Если словили лимит, и есть следующий ключ — пробуем его
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                print(f"Ключ {index + 1} словил лимит 429. Переключаюсь на следующий...")
+                continue
 
-    except Exception as e:
-        # Если парсинг всё равно сломался, бот не зависнет, а ответит этим запасным словарем
-        print(f"КРИТИЧЕСКАЯ ОШИБКА ПАРСИНГА LLM: {e}")
-        if 'raw_text' in locals():
-            print(f"Сырой ответ от Gemini: {raw_text}")
+            # Если ошибка синтаксиса JSON или сбой парсинга
+            print(f"КРИТИЧЕСКАЯ ОШИБКА ПАРСИНГА LLM (Ключ {index + 1}): {e}")
+            return {
+                "reply": "Сэр, произошла ошибка в моих нейронных цепях. Пожалуйста, повторите команду.",
+                "extracted_data": [],
+                "new_preferences": None,
+                "reminders": [],
+                "system_command": None
+            }
 
-        return {
-            "reply": "Сэр, произошла ошибка в моих нейронных цепях при форматировании данных. Пожалуйста, повторите команду.",
-            "extracted_data": [],
-            "new_preferences": None,
-            "reminders": [],
-            "system_command": None
-        }
+    # Если цикл закончился, значит оба ключа "сгорели" на лимитах
+    print("ВЕСЬ ПУЛ КЛЮЧЕЙ ИСЧЕРПАН (429).")
+    return {
+        "reply": "Сэр, оба моих API-ключа временно заблокированы из-за лимитов Google. Подождите пару минут.",
+        "extracted_data": [],
+        "new_preferences": None,
+        "reminders": [],
+        "system_command": None
+    }
