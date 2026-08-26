@@ -16,6 +16,8 @@ API_KEYS = [
 # Очищаем список от пустых значений (если вдруг добавишь только один)
 VALID_KEYS = [key for key in API_KEYS if key]
 
+client = genai.Client(api_key=VALID_KEYS[0])
+
 
 async def parse_user_message(text: str, user_name: str, preferences: str | None, file_bytes: bytes = None,
                              mime_type: str = None) -> dict:
