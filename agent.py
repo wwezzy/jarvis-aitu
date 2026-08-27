@@ -1,5 +1,5 @@
 import time
-import os
+import ctypes
 from upstash_redis import Redis
 
 # Твои данные вшиты напрямую
@@ -22,9 +22,11 @@ while True:
             redis.delete("pc_command")
 
             if cmd == "sleep":
-                os.system("rundll32.exe powrprof.dll,SetSuspendState 0,1,0")
+                # Прямой вызов ядра Windows для сна
+                ctypes.windll.PowrProf.SetSuspendState(0, 1, 0)
             elif cmd == "lock":
-                os.system("rundll32.exe user32.dll,LockWorkStation")
+                # Прямой вызов ядра Windows для блокировки
+                ctypes.windll.user32.LockWorkStation()
     except Exception as e:
         print(f"❌ Ошибка чтения базы: {e}")
 
