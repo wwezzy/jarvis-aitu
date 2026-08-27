@@ -1,4 +1,5 @@
 from upstash_redis.asyncio import Redis as AsyncRedis
+from google import genai
 from aiohttp import web
 import asyncio
 from datetime import datetime
@@ -12,7 +13,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from database.engine import init_db, async_session_factory
 from database.models import User, Workout, Habit, Reminder
-from services.llm import parse_user_message, client
+from services.llm import parse_user_message
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 redis_client = AsyncRedis(url=os.getenv("UPSTASH_REDIS_REST_URL"), token=os.getenv("UPSTASH_REDIS_REST_TOKEN"))
@@ -77,8 +78,11 @@ async def analyze_workouts(message: Message):
     workout_history = "\n".join([f"{w.workout_date}: {w.workout_type} - {w.notes}" for w in workouts])
 
     prompt = f"""Ты спортивный аналитик. Вот последние 10 записей тренировок пользователя:
-    {workout_history}
-    Сделай краткий анализ прогресса, укажи на сильные стороны и дай 1-2 конкретных совета по восстановлению или корректировке нагрузки. Текст должен быть коротким и мотивирующим."""
+        {workout_history}
+        Сделай краткий анализ прогресса, укажи на сильные стороны и дай 1-2 конкретных совета по восстановлению или корректировке нагрузки. Текст должен быть коротким и мотивирующим."""
+
+    # --- ДОБАВЬ ВОТ ЭТУ СТРОКУ ---
+    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
     response = await client.aio.models.generate_content(
         model='gemini-3.6-flash',
@@ -197,16 +201,19 @@ async def morning_briefing():
             user = result.scalar_one_or_none()
             user_prefs = user.preferences if user else "Досье пусто."
 
-        # Формируем системный промпт для генерации утренней сводки
-        prompt = f"""Ты Джарвис. Напиши бодрое, короткое утреннее сообщение для пользователя.
-        Контекст пользователя: {user_prefs}.
-        Обязательно напомни про режим Lock-in и упомяни, что библиотека AITU открыта до 22:00, так что времени на продуктивную работу полно.
-        Без лишней воды, строго по делу и с уважением."""
+            # Формируем системный промпт для генерации утренней сводки
+            prompt = f"""Ты Джарвис. Напиши бодрое, короткое утреннее сообщение для пользователя.
+                Контекст пользователя: {user_prefs}.
+                Обязательно напомни про режим Lock-in и упомяни, что библиотека AITU открыта до 22:00, так что времени на продуктивную работу полно.
+                Без лишней воды, строго по делу и с уважением."""
 
-        response = await client.aio.models.generate_content(
-            model='gemini-3.6-flash',
-            contents=[prompt]
-        )
+            # --- ДОБАВЬ ВОТ ЭТУ СТРОКУ ---
+            client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+            response = await client.aio.models.generate_content(
+                model='gemini-3.6-flash',
+                contents=[prompt]
+            )
         await bot.send_message(ADMIN_ID, f"🌅 **Утренний протокол активен:**\n\n{response.text}", parse_mode="Markdown")
     except Exception as e:
         print(f"Ошибка брифинга: {e}")
@@ -255,6 +262,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Джарвис отключен.")
-
-
-        # Принудительный рестарт облака

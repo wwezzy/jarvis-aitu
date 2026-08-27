@@ -35,9 +35,9 @@ def get_chat_history() -> list:
 
 
 def save_chat_history(history: list):
-    """Сохраняет историю, обрезая старые сообщения (Sliding Window на 10 сообщений)"""
+    """Сохраняет историю, обрезая старые сообщения (Sliding Window на 50 сообщений)"""
     try:
-        trimmed_history = history[-10:]
+        trimmed_history = history[-50:] # <--- ТЕПЕРЬ ОН ПОМНИТ 50 СООБЩЕНИЙ
         redis.set(HISTORY_KEY, json.dumps(trimmed_history))
     except Exception as e:
         print(f"Ошибка записи памяти в Redis: {e}")
