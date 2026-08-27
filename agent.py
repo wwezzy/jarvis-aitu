@@ -1,41 +1,31 @@
-import os
 import time
-import json
+import os
 from upstash_redis import Redis
-from dotenv import load_dotenv
 
-load_dotenv()
+# Твои данные вшиты напрямую
+UPSTASH_URL = "https://vocal-wren-179571.upstash.io"
+UPSTASH_TOKEN = "gQAAAAAAAr1zAAIgcDI5MTk3MTEwOGU4OWI0ZjVjODJmZmM3MzkwMjE4N2E0NA"
 
-# Подключаемся к базе
-redis = Redis(url=os.getenv("UPSTASH_REDIS_REST_URL"), token=os.getenv("UPSTASH_REDIS_REST_TOKEN"))
+print("Агент запускается...")
 
+try:
+    redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
+    print("✅ Успешное подключение к Upstash! Слушаю команды...")
+except Exception as e:
+    print(f"❌ Ошибка подключения: {e}")
 
-def execute_command(command: str):
-    if command == "sleep":
-        print("Команда получена: Спящий режим")
-        os.system("rundll32.exe powrprof.dll,SetSuspendState 0,1,0")
-    elif command == "shutdown":
-        print("Команда получена: Выключение")
-        os.system("shutdown /s /t 1")
+while True:
+    try:
+        cmd = redis.get("pc_command")
+        if cmd:
+            print(f"🔥 ПОЛУЧЕНА КОМАНДА: {cmd}")
+            redis.delete("pc_command")
 
+            if cmd == "sleep":
+                os.system("rundll32.exe powrprof.dll,SetSuspendState 0,1,0")
+            elif cmd == "lock":
+                os.system("rundll32.exe user32.dll,LockWorkStation")
+    except Exception as e:
+        print(f"❌ Ошибка чтения базы: {e}")
 
-def listen_for_commands():
-    print("Агент запущен. Ожидание команд...")
-    while True:
-        try:
-            # Читаем команду из Redis
-            command = redis.get("jarvis_system_command")
-            if command:
-                execute_command(command)
-                # Удаляем команду после выполнения
-                redis.delete("jarvis_system_command")
-
-            # Ждем 3 секунды, чтобы не спамить Redis
-            time.sleep(3)
-        except Exception as e:
-            print(f"Ошибка Агента: {e}")
-            time.sleep(5)
-
-
-if __name__ == "__main__":
-    listen_for_commands()
+    time.sleep(2)
