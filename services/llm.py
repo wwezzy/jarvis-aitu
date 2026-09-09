@@ -1,146 +1,183 @@
+from __future__ import annotations
+
+import asyncio
 import json
+import logging
 import os
-import re
+import uuid
 from datetime import datetime
+from pathlib import Path
+
 from google import genai
 from google.genai import types
-from dotenv import load_dotenv
-from upstash_redis import Redis
+from pydantic import ValidationError
+from upstash_redis.asyncio import Redis
 
-load_dotenv()
+from config import get_settings
+from services.schemas import JarvisResponse
 
-# 1. Пул из 5 ключей для обхода лимитов
-API_KEYS = [
-    os.getenv("GEMINI_API_KEY"),
-    os.getenv("GEMINI_API_KEY_2"),
-    os.getenv("GEMINI_API_KEY_3"),
-    os.getenv("GEMINI_API_KEY_4"),
-    os.getenv("GEMINI_API_KEY_5")
-]
-VALID_KEYS = [key for key in API_KEYS if key]
+logger = logging.getLogger(__name__)
+settings = get_settings()
 
-# 2. Подключение к Redis для оперативной памяти
-redis = Redis(url=os.getenv("UPSTASH_REDIS_REST_URL"), token=os.getenv("UPSTASH_REDIS_REST_TOKEN"))
-HISTORY_KEY = "jarvis_chat_history"
+RECENT_HISTORY_MESSAGES = 24
+HISTORY_TTL_SECONDS = 60 * 60 * 24 * 30
+LEGACY_HISTORY_KEY = "jarvis_chat_history"
+
+redis: Redis | None = None
+if settings.redis_url and settings.redis_token:
+    redis = Redis(url=settings.redis_url, token=settings.redis_token)
 
 
-def get_chat_history() -> list:
-    """Достает историю переписки из Redis (формат: [{"role": "user"/"model", "text": "..."}])"""
+def _history_key(user_id: int) -> str:
+    return f"jarvis:chat_history:{user_id}"
+
+
+def _read_prompt_file() -> str:
+    path = Path(__file__).resolve().parent.parent / "prompts" / "jarvis_system.md"
+    return path.read_text(encoding="utf-8")
+
+
+def _read_private_profile() -> str:
+    configured = os.getenv("JARVIS_PROFILE_FILE", "profile.local.md").strip()
+    if not configured:
+        return ""
+    path = Path(configured)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent.parent / path
     try:
-        history_data = redis.get(HISTORY_KEY)
-        return json.loads(history_data) if history_data else []
-    except Exception as e:
-        print(f"Ошибка чтения памяти из Redis: {e}")
+        return path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        logger.exception("Could not read private Jarvis profile file")
+        return ""
+
+
+async def get_chat_history(user_id: int) -> list[dict]:
+    if redis is None:
+        return []
+    try:
+        history_data = await redis.get(_history_key(user_id))
+        if not history_data:
+            history_data = await redis.get(LEGACY_HISTORY_KEY)
+        parsed = json.loads(history_data) if history_data else []
+        return parsed if isinstance(parsed, list) else []
+    except Exception:
+        logger.exception("Failed to read short-term chat history")
         return []
 
 
-def save_chat_history(history: list):
-    """Сохраняет историю, обрезая старые сообщения (Sliding Window на 50 сообщений)"""
+async def save_chat_history(user_id: int, history: list[dict]) -> None:
+    if redis is None:
+        return
     try:
-        trimmed_history = history[-50:] # <--- ТЕПЕРЬ ОН ПОМНИТ 50 СООБЩЕНИЙ
-        redis.set(HISTORY_KEY, json.dumps(trimmed_history))
-    except Exception as e:
-        print(f"Ошибка записи памяти в Redis: {e}")
+        trimmed = history[-RECENT_HISTORY_MESSAGES:]
+        await redis.set(
+            _history_key(user_id),
+            json.dumps(trimmed, ensure_ascii=False),
+            ex=HISTORY_TTL_SECONDS,
+        )
+    except Exception:
+        logger.exception("Failed to save short-term chat history")
 
 
-async def parse_user_message(text: str, user_name: str, preferences: str | None, file_bytes: bytes = None,
-                             mime_type: str = None) -> dict:
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    user_text = text if text else "Проанализируй этот файл/фото или прослушай голосовое сообщение."
+def _system_prompt(user_name: str, preferences: str | None, memory_context: str) -> str:
+    now = datetime.now(settings.timezone).strftime("%Y-%m-%d %H:%M:%S %Z")
+    private_profile = _read_private_profile()
+    pieces = [
+        _read_prompt_file(),
+        f"\nCURRENT USER: {user_name}\nCURRENT LOCAL TIME: {now}",
+        f"\nLEGACY USER PREFERENCES:\n{preferences or 'None'}",
+        f"\nDURABLE DATABASE CONTEXT:\n{memory_context}",
+    ]
+    if private_profile:
+        pieces.append(f"\nPRIVATE LOCAL PROFILE:\n{private_profile}")
+    return "\n".join(pieces)
 
-    # 3. Вшитая личность и контекст
-    prompt = f"""Ты — Джарвис, высокоинтеллектуальный персональный ИИ-ассистент.
-    Твой стиль общения: лаконичный, сдержанный, но с долей иронии, в стиле ИИ Тони Старка.
-    Используй профессиональный IT-сленг. Твоя цель — помогать пользователю с оптимизацией кода, дисциплиной и тренировками.
 
-    ДОСЬЕ НА ПОЛЬЗОВАТЕЛЯ:
-    - Имя: {user_name} (Аллажар)
-    - Профиль: Студент 2 курса Software Engineering (Astana IT University).
-    - Стек и интересы: Backend-разработка (Python, C++, Java), алгоритмы, кибербезопасность.
-    - Спорт: Тяжелые тренировки (жим платформы, болгарские сплит-приседания).
-    - Динамические данные из базы: {preferences if preferences else "Дополнительной информации пока нет."}
+def _is_retryable(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        token in text
+        for token in (
+            "429",
+            "resource_exhausted",
+            "500",
+            "502",
+            "503",
+            "504",
+            "unavailable",
+            "timeout",
+            "timed out",
+            "connection reset",
+            "temporarily unavailable",
+        )
+    )
 
-    ВНИМАНИЕ! ТЕКУЩЕЕ ВРЕМЯ НА СЕРВЕРЕ: {current_time}.
 
-    🔴 КРИТИЧЕСКОЕ ПРАВИЛО ПО АУДИО: Ты современный мультимодальный ИИ. Если тебе присылают аудио — расшифруй его и выполни просьбу.
+async def parse_user_message(
+    *,
+    text: str,
+    user_id: int,
+    user_name: str,
+    preferences: str | None,
+    memory_context: str,
+    file_bytes: bytes | None = None,
+    mime_type: str | None = None,
+) -> dict:
+    user_text = text or "Проанализируй вложение и выполни запрос пользователя."
+    history = await get_chat_history(user_id)
+    contents: list[types.Content] = []
 
-    🔴 СТРОГИЙ СИНТАКСИС JSON:
-    Ты ОБЯЗАН возвращать ответ СТРОГО в формате JSON.
-    ЗАПРЕЩЕНО использовать двойные кавычки (") внутри текстовых значений! Если нужно выделить слово, используй только одинарные кавычки (').
+    for item in history:
+        role = item.get("role")
+        body = item.get("text")
+        if role in {"user", "model"} and isinstance(body, str) and body:
+            contents.append(types.Content(role=role, parts=[types.Part.from_text(text=body)]))
 
-    Обязательные ключи:
-    1. "reply": Твой текстовый ответ (в образе Джарвиса).
-    2. "extracted_data": Массив объектов [{{"type": "workout"|"habit", "name": "название", "notes": "инфо"}}]. Иначе [].
-    3. "new_preferences": Если юзер просит что-то запомнить, напиши это здесь. Иначе null.
-    4. "reminders": Массив объектов [{{"text": "текст", "remind_at": "YYYY-MM-DD HH:MM:SS"}}]. Иначе [].
-    5. "system_command": "lock", "sleep", "shutdown" или null.
-    """
-
-    # 4. Сборка контекста из памяти
-    raw_history = get_chat_history()
-    contents = []
-
-    # Загружаем старые сообщения в формат Gemini
-    for msg in raw_history:
-        contents.append(types.Content(role=msg["role"], parts=[types.Part.from_text(text=msg["text"])]))
-
-    # Формируем текущий запрос (с файлами, если есть)
-    current_parts = []
+    current_parts: list[types.Part] = []
     if file_bytes and mime_type:
         current_parts.append(types.Part.from_bytes(data=file_bytes, mime_type=mime_type))
     current_parts.append(types.Part.from_text(text=user_text))
-
     contents.append(types.Content(role="user", parts=current_parts))
 
-    # 5. Маршрутизация по пулу ключей (Fallback)
-    for index, api_key in enumerate(VALID_KEYS):
+    client = genai.Client(api_key=settings.gemini_api_key)
+    errors: list[str] = []
+
+    for attempt in range(3):
         try:
-            client = genai.Client(api_key=api_key)
             response = await client.aio.models.generate_content(
-                model='gemini-3.6-flash',
+                model=settings.gemini_model,
                 contents=contents,
                 config=types.GenerateContentConfig(
-                    system_instruction=prompt,
-                    temperature=0.2,
-                    response_mime_type="application/json"
-                )
+                    system_instruction=_system_prompt(user_name, preferences, memory_context),
+                    response_mime_type="application/json",
+                    response_json_schema=JarvisResponse.model_json_schema(),
+                ),
             )
+            if not response.text:
+                raise ValueError("Gemini returned an empty response")
 
-            raw_text = response.text.strip()
-            match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-            if match:
-                raw_text = match.group(0)
+            parsed = JarvisResponse.model_validate_json(response.text)
+            history.append({"role": "user", "text": user_text})
+            history.append({"role": "model", "text": parsed.reply})
+            await save_chat_history(user_id, history)
+            return parsed.model_dump()
 
-            parsed_json = json.loads(raw_text)
+        except (ValidationError, json.JSONDecodeError, ValueError) as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+            logger.warning("Structured LLM response invalid on attempt %s: %s", attempt + 1, exc)
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+            logger.exception("Gemini request failed on attempt %s", attempt + 1)
+            if not _is_retryable(exc):
+                break
 
-            # 6. Сохраняем успешный диалог в память Redis
-            raw_history.append({"role": "user", "text": user_text})
-            # Сохраняем только текстовый reply бота, чтобы не забивать контекст системными JSON-данными
-            raw_history.append({"role": "model", "text": parsed_json.get("reply", "")})
-            save_chat_history(raw_history)
+        if attempt < 2:
+            await asyncio.sleep(0.6 * (2**attempt))
 
-            return parsed_json
-
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                print(f"Ключ {index + 1} словил лимит 429. Переключаюсь на следующий...")
-                continue
-
-            print(f"КРИТИЧЕСКАЯ ОШИБКА ПАРСИНГА LLM (Ключ {index + 1}): {e}")
-            return {
-                "reply": "Сэр, произошла ошибка в моих вычислительных узлах. Данные повреждены.",
-                "extracted_data": [],
-                "new_preferences": None,
-                "reminders": [],
-                "system_command": None
-            }
-
-    print("ВЕСЬ ПУЛ ИЗ 5 КЛЮЧЕЙ ИСЧЕРПАН.")
-    return {
-        "reply": "Сэр, все каналы связи с серверами Google перегружены. Ожидайте сброса лимитов.",
-        "extracted_data": [],
-        "new_preferences": None,
-        "reminders": [],
-        "system_command": None
-    }
+    debug_id = uuid.uuid4().hex[:8]
+    logger.error("Jarvis LLM pipeline failed [%s]: %s", debug_id, " | ".join(errors))
+    return JarvisResponse(
+        reply=f"LLM-канал временно не ответил корректно. Код сбоя: {debug_id}."
+    ).model_dump()

@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#071117">
+  <title>Jarvis Console</title>
+  <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">PRIVATE SYSTEM</div>
+        <h1>JARVIS <span>CONSOLE</span></h1>
+      </div>
+      <div id="statusDot" class="status-dot" title="connection status"></div>
+    </header>
+
+    <nav class="tabs" aria-label="Sections">
+      <button class="tab active" data-view="dashboard">Today</button>
+      <button class="tab" data-view="workout">Workout</button>
+      <button class="tab" data-view="reflection">Reflect</button>
+      <button class="tab" data-view="memory">Memory</button>
+    </nav>
+
+    <main>
+      <section id="view-dashboard" class="view active">
+        <div class="hero card">
+          <div>
+            <div class="label">CURRENT PROTOCOL</div>
+            <div id="dayKind" class="hero-title">—</div>
+            <div id="serverTime" class="muted">Syncing…</div>
+          </div>
+          <button id="refreshBtn" class="icon-button" aria-label="Refresh">↻</button>
+        </div>
+
+        <div class="metric-grid">
+          <article class="metric card">
+            <div class="label">GTG TODAY</div>
+            <div><strong id="gtgToday">0</strong> reps</div>
+            <small id="gtgTodaySets">0 sets</small>
+          </article>
+          <article class="metric card">
+            <div class="label">GTG WEEK</div>
+            <div><strong id="gtgWeek">0</strong> reps</div>
+            <small id="gtgWeekSets">0 sets</small>
+          </article>
+        </div>
+
+        <section class="card quick-gtg">
+          <div class="section-head">
+            <div>
+              <div class="label">GREASE THE GROOVE</div>
+              <h2>Quick set</h2>
+            </div>
+            <span class="pill">submax</span>
+          </div>
+          <div class="button-row">
+            <button class="primary gtg-btn" data-reps="5">+5</button>
+            <button class="primary gtg-btn" data-reps="8">+8</button>
+            <button class="primary gtg-btn" data-reps="10">+10</button>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="section-head">
+            <div>
+              <div class="label">TIMELINE</div>
+              <h2>Today</h2>
+            </div>
+          </div>
+          <div id="scheduleList" class="timeline"></div>
+        </section>
+
+        <section class="card">
+          <div class="section-head">
+            <div>
+              <div class="label">LOAD CONTROL</div>
+              <h2>Double progression</h2>
+            </div>
+          </div>
+          <div id="progressionList" class="stack-list"></div>
+        </section>
+      </section>
+
+      <section id="view-workout" class="view">
+        <section class="card">
+          <div class="section-head">
+            <div>
+              <div class="label">STRUCTURED LOG</div>
+              <h2>New workout</h2>
+            </div>
+          </div>
+          <form id="workoutForm">
+            <label>
+              Session
+              <input id="workoutTitle" maxlength="120" value="Strength session" required>
+            </label>
+            <div id="setRows" class="set-rows"></div>
+            <button type="button" id="addSetBtn" class="secondary full">+ Add set</button>
+            <label>
+              Notes
+              <textarea id="workoutNotes" rows="3" placeholder="Technique, pain, tempo, context…"></textarea>
+            </label>
+            <button type="submit" class="primary full">Save workout</button>
+          </form>
+        </section>
+
+        <section class="card">
+          <div class="section-head">
+            <div>
+              <div class="label">HISTORY</div>
+              <h2>Recent sessions</h2>
+            </div>
+          </div>
+          <div id="workoutHistory" class="stack-list"></div>
+        </section>
+      </section>
+
+      <section id="view-reflection" class="view">
+        <section class="card">
+          <div class="section-head">
+            <div>
+              <div class="label">22:30 PROTOCOL</div>
+              <h2>Daily reflection</h2>
+            </div>
+          </div>
+          <form id="reflectionForm">
+            <label>
+              Deep Work, hours
+              <input id="deepWorkHours" type="number" min="0" max="24" step="0.25" placeholder="3.5">
+            </label>
+            <div class="check-grid">
+              <label class="check"><input id="proteinHit" type="checkbox"> Protein closed</label>
+              <label class="check"><input id="caloriesHit" type="checkbox"> Calories closed</label>
+              <label class="check"><input id="rirRespected" type="checkbox"> RIR respected</label>
+            </div>
+            <div class="two-col">
+              <label>
+                Mood 1–5
+                <input id="mood" type="number" min="1" max="5" step="1">
+              </label>
+              <label>
+                Energy 1–5
+                <input id="energy" type="number" min="1" max="5" step="1">
+              </label>
+            </div>
+            <label>
+              Notes
+              <textarea id="reflectionNotes" rows="5" placeholder="Что сработало, что мешало, что изменить завтра?"></textarea>
+            </label>
+            <button type="submit" class="primary full">Commit reflection</button>
+          </form>
+        </section>
+      </section>
+
+      <section id="view-memory" class="view">
+        <section class="card">
+          <div class="section-head">
+            <div>
+              <div class="label">PERSISTENT CONTEXT</div>
+              <h2>Durable memory</h2>
+            </div>
+            <span class="pill">SQL</span>
+          </div>
+          <p class="muted compact">Это не последние сообщения чата. Эти факты сохраняются отдельно и не исчезают из-за sliding window.</p>
+          <div id="memoryList" class="stack-list"></div>
+        </section>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  </div>
+
+  <template id="setRowTemplate">
+    <div class="set-row">
+      <input class="exercise" placeholder="Exercise" required>
+      <input class="weight" type="number" min="0" step="0.5" placeholder="kg">
+      <input class="reps" type="number" min="0" step="1" placeholder="reps">
+      <input class="rir" type="number" min="0" max="10" step="0.5" placeholder="RIR">
+      <label class="technique"><input class="technique-ok" type="checkbox" checked> form</label>
+      <button type="button" class="remove-set" aria-label="Remove set">×</button>
+    </div>
+  </template>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

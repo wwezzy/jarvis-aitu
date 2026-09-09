@@ -1,0 +1,8 @@
+.git
+.env
+profile.local.md
+*.db
+.venv
+.idea
+__pycache__
+.pytest_cache

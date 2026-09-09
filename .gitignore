@@ -1,5 +1,16 @@
 .env
+.env.*
+!.env.example
+profile.local.md
 *.db
+*.db-shm
+*.db-wal
 .venv/
+venv/
 .idea/
 __pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+*.log
+.DS_Store
