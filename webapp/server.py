@@ -9,18 +9,13 @@ from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import get_settings
+from services.assignments import list_upcoming_assignments, lms_status, mark_assignment_done, sync_lms_ical
 from services.gtg import add_gtg_set, gtg_stats
 from services.memory import list_memory_facts
 from services.progression import double_progression_recommendation
 from services.reflections import latest_reflection, upsert_reflection
-from services.schedule import (
-    delete_schedule_entry,
-    reset_schedule,
-    today_schedule,
-    upsert_schedule_entry,
-    week_schedule,
-)
-from services.scheduler import sync_schedule_jobs
+from services.schedule import delete_schedule_entry, reset_schedule, today_schedule, upsert_schedule_entry, week_schedule
+from services.scheduler import sync_assignment_jobs, sync_schedule_jobs
 from services.telegram_auth import TelegramAuthError, TelegramWebAppUser, validate_init_data
 from services.users import ensure_user
 from services.workouts import log_workout, recent_workouts
@@ -48,12 +43,7 @@ async def _authorized_user(request: web.Request) -> TelegramWebAppUser:
     init_data = _extract_init_data(request)
     if not init_data and settings.miniapp_dev_mode:
         return TelegramWebAppUser(id=settings.admin_id, first_name="Jarvis Dev")
-
-    user = validate_init_data(
-        init_data,
-        settings.bot_token,
-        max_age_seconds=settings.miniapp_auth_max_age_seconds,
-    )
+    user = validate_init_data(init_data, settings.bot_token, max_age_seconds=settings.miniapp_auth_max_age_seconds)
     if user.id != settings.admin_id:
         raise web.HTTPForbidden(text="Jarvis is in private mode")
     await ensure_user(user.id, " ".join(part for part in [user.first_name, user.last_name] if part).strip() or "User")
@@ -76,13 +66,7 @@ def _progression_for(workout: dict | None) -> list[dict]:
     grouped: dict[str, list[dict]] = {}
     for item in workout.get("sets", []):
         grouped.setdefault(item["exercise_name"], []).append(item)
-    return [
-        {
-            "exercise_name": exercise,
-            **double_progression_recommendation(sets),
-        }
-        for exercise, sets in grouped.items()
-    ]
+    return [{"exercise_name": exercise, **double_progression_recommendation(sets)} for exercise, sets in grouped.items()]
 
 
 async def _resync_schedule_notifications(request: web.Request, user_id: int) -> None:
@@ -91,6 +75,14 @@ async def _resync_schedule_notifications(request: web.Request, user_id: int) -> 
     if scheduler is not None and bot is not None and settings.enable_master_schedule:
         count = await sync_schedule_jobs(scheduler, bot, user_id)
         logger.info("Schedule edited; %s block notifications reloaded", count)
+
+
+async def _resync_assignment_notifications(request: web.Request, user_id: int) -> None:
+    scheduler: AsyncIOScheduler | None = request.app.get("scheduler")
+    bot: Bot | None = request.app.get("bot")
+    if scheduler is not None and bot is not None:
+        count = await sync_assignment_jobs(scheduler, bot, user_id)
+        logger.info("Assignments edited; %s deadline notifications reloaded", count)
 
 
 async def health(_: web.Request) -> web.Response:
@@ -105,17 +97,13 @@ async def dashboard(request: web.Request) -> web.Response:
     user = await _authorized_user(request)
     now = datetime.now(settings.timezone)
     workouts = await recent_workouts(user.id, limit=6)
-    today = await today_schedule(user.id, now)
-    week = await week_schedule(user.id)
     data = {
-        "user": {
-            "id": user.id,
-            "first_name": user.first_name,
-            "username": user.username,
-        },
+        "user": {"id": user.id, "first_name": user.first_name, "username": user.username},
         "server_time": now.isoformat(),
-        "schedule": today,
-        "schedule_week": week,
+        "schedule": await today_schedule(user.id, now),
+        "schedule_week": await week_schedule(user.id),
+        "assignments": await list_upcoming_assignments(user.id, now=now, days=30, include_unknown=True, limit=30),
+        "lms": await lms_status(user.id),
         "gtg": await gtg_stats(user.id, now),
         "workouts": workouts,
         "progression": _progression_for(workouts[0] if workouts else None),
@@ -154,6 +142,26 @@ async def reset_schedule_to_default(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "count": count, "schedule_week": await week_schedule(user.id)})
 
 
+async def sync_lms_now(request: web.Request) -> web.Response:
+    user = await _authorized_user(request)
+    if not settings.lms_ical_url:
+        raise web.HTTPBadRequest(text="LMS_ICAL_URL is not configured")
+    result = await sync_lms_ical(user.id)
+    await _resync_assignment_notifications(request, user.id)
+    return web.json_response({"ok": True, "sync": result, "lms": await lms_status(user.id), "assignments": await list_upcoming_assignments(user.id, days=30, limit=30)})
+
+
+async def complete_assignment(request: web.Request) -> web.Response:
+    user = await _authorized_user(request)
+    try:
+        assignment_id = int(request.match_info["assignment_id"])
+        row = await mark_assignment_done(user.id, assignment_id)
+    except (TypeError, ValueError) as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+    await _resync_assignment_notifications(request, user.id)
+    return web.json_response({"ok": True, "assignment": row, "assignments": await list_upcoming_assignments(user.id, days=30, limit=30)})
+
+
 async def create_gtg(request: web.Request) -> web.Response:
     user = await _authorized_user(request)
     payload = await _json_body(request)
@@ -173,14 +181,7 @@ async def create_workout(request: web.Request) -> web.Response:
     if not isinstance(sets, list):
         raise web.HTTPBadRequest(text="sets must be an array")
     try:
-        row = await log_workout(
-            user.id,
-            title,
-            sets,
-            notes=str(payload.get("notes") or "") or None,
-            source="miniapp",
-            started_at=datetime.now(settings.timezone).replace(tzinfo=None),
-        )
+        row = await log_workout(user.id, title, sets, notes=str(payload.get("notes") or "") or None, source="miniapp", started_at=datetime.now(settings.timezone).replace(tzinfo=None))
     except (TypeError, ValueError) as exc:
         raise web.HTTPBadRequest(text=str(exc)) from exc
     return web.json_response({"ok": True, "workout_id": row.id})
@@ -225,11 +226,7 @@ async def api_error_middleware(request: web.Request, handler):
         raise web.HTTPInternalServerError(text="Internal server error")
 
 
-def create_web_app(
-    *,
-    bot: Bot | None = None,
-    scheduler: AsyncIOScheduler | None = None,
-) -> web.Application:
+def create_web_app(*, bot: Bot | None = None, scheduler: AsyncIOScheduler | None = None) -> web.Application:
     app = web.Application(middlewares=[api_error_middleware, security_headers])
     app["bot"] = bot
     app["scheduler"] = scheduler
@@ -240,6 +237,8 @@ def create_web_app(
     app.router.add_post("/api/schedule", save_schedule_block)
     app.router.add_delete("/api/schedule/{entry_id:\\d+}", remove_schedule_block)
     app.router.add_post("/api/schedule/reset", reset_schedule_to_default)
+    app.router.add_post("/api/lms/sync", sync_lms_now)
+    app.router.add_post("/api/assignments/{assignment_id:\\d+}/done", complete_assignment)
     app.router.add_post("/api/gtg", create_gtg)
     app.router.add_post("/api/workouts", create_workout)
     app.router.add_post("/api/reflection", save_reflection)

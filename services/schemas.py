@@ -40,6 +40,17 @@ class ReminderPayload(BaseModel):
     remind_at: str = Field(description="Local datetime in YYYY-MM-DD HH:MM:SS")
 
 
+class AssignmentPayload(BaseModel):
+    title: str = Field(description="Concrete assignment/task title")
+    course: str | None = Field(default=None, description="Course name if known")
+    due_at: str | None = Field(
+        default=None,
+        description="Local deadline in YYYY-MM-DD HH:MM:SS. Null when the user did not give enough information.",
+    )
+    url: str | None = None
+    notes: str | None = None
+
+
 class MemoryUpdate(BaseModel):
     category: Literal["profile", "preference", "project", "training", "schedule", "other"] = "other"
     key: str = Field(description="Stable concise identifier")
@@ -54,4 +65,5 @@ class JarvisResponse(BaseModel):
     reflection: ReflectionPayload | None = None
     memory_updates: list[MemoryUpdate] = Field(default_factory=list)
     reminders: list[ReminderPayload] = Field(default_factory=list)
+    assignments: list[AssignmentPayload] = Field(default_factory=list)
     system_command: Literal["lock", "sleep", "shutdown", "restart"] | None = None

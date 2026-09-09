@@ -79,6 +79,18 @@
         <section class="card">
           <div class="section-head">
             <div>
+              <div class="label">DEADLINES</div>
+              <h2>Assignments</h2>
+            </div>
+            <button id="syncLmsBtn" class="secondary small" type="button">Sync LMS</button>
+          </div>
+          <div id="lmsStatusText" class="muted compact">LMS status…</div>
+          <div id="assignmentList" class="stack-list"></div>
+        </section>
+
+        <section class="card">
+          <div class="section-head">
+            <div>
               <div class="label">LOAD CONTROL</div>
               <h2>Double progression</h2>
             </div>
@@ -271,7 +283,7 @@
             </div>
             <span class="pill">SQL</span>
           </div>
-          <p class="muted compact">Это не последние сообщения чата. Факты, тренировки и теперь расписание хранятся отдельно от sliding window.</p>
+          <p class="muted compact">Это не последние сообщения чата. Факты, тренировки, задания и расписание хранятся отдельно от sliding window.</p>
           <div id="memoryList" class="stack-list"></div>
         </section>
       </section>
@@ -292,5 +304,6 @@
   </template>
 
   <script src="/static/app.js" defer></script>
+  <script src="/static/deadlines.js" defer></script>
 </body>
 </html>

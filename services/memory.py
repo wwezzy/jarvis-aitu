@@ -3,16 +3,34 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import selectinload
 
 from database.engine import async_session_factory
-from database.models import DailyReflection, GTGSet, MemoryFact, ScheduleEntry, Workout, WorkoutSession
+from database.models import (
+    Assignment,
+    DailyReflection,
+    GTGSet,
+    MemoryFact,
+    ScheduleEntry,
+    Workout,
+    WorkoutSession,
+)
 
 _STOP = {
     "что", "как", "когда", "какой", "какая", "какие", "мне", "мой", "моя", "мои", "это", "там",
     "было", "был", "была", "the", "and", "was", "were", "what", "when", "with", "from", "this", "that",
 }
+
+_DAY_NAMES = (
+    "Понедельник",
+    "Вторник",
+    "Среда",
+    "Четверг",
+    "Пятница",
+    "Суббота",
+    "Воскресенье",
+)
 
 
 def _tokens(text: str) -> set[str]:
@@ -87,7 +105,9 @@ async def list_memory_facts(user_id: int, limit: int = 30) -> list[dict]:
 
 async def build_memory_context(user_id: int, query: str, now: datetime) -> str:
     query_tokens = _tokens(query)
-    week_start = now.replace(tzinfo=None) - timedelta(days=7)
+    local_now = now.replace(tzinfo=None)
+    week_start = local_now - timedelta(days=7)
+    assignment_horizon = local_now + timedelta(days=30)
 
     async with async_session_factory() as db:
         memory_result = await db.execute(
@@ -134,12 +154,34 @@ async def build_memory_context(user_id: int, query: str, now: datetime) -> str:
             select(ScheduleEntry)
             .where(
                 ScheduleEntry.user_id == user_id,
-                ScheduleEntry.weekday == now.weekday(),
                 ScheduleEntry.enabled.is_(True),
             )
-            .order_by(ScheduleEntry.start.asc(), ScheduleEntry.sort_order.asc())
+            .order_by(
+                ScheduleEntry.weekday.asc(),
+                ScheduleEntry.start.asc(),
+                ScheduleEntry.sort_order.asc(),
+            )
         )
-        schedule_rows = schedule_result.scalars().all()
+        schedule_rows = list(schedule_result.scalars().all())
+
+        assignment_result = await db.execute(
+            select(Assignment)
+            .where(
+                Assignment.user_id == user_id,
+                Assignment.status == "pending",
+                or_(
+                    Assignment.due_at.is_(None),
+                    Assignment.due_at >= local_now - timedelta(days=1),
+                ),
+            )
+            .order_by(Assignment.due_at.asc(), Assignment.id.asc())
+            .limit(60)
+        )
+        assignment_rows = [
+            row
+            for row in assignment_result.scalars().all()
+            if row.due_at is None or row.due_at <= assignment_horizon
+        ]
 
     ranked_memories = sorted(
         memory_rows,
@@ -149,7 +191,8 @@ async def build_memory_context(user_id: int, query: str, now: datetime) -> str:
 
     def session_text(row: WorkoutSession) -> str:
         details = " | ".join(
-            f"{s.exercise_name}: {s.weight_kg if s.weight_kg is not None else '-'}kg x {s.reps if s.reps is not None else '-'} @RIR {s.rir if s.rir is not None else '-'}"
+            f"{s.exercise_name}: {s.weight_kg if s.weight_kg is not None else '-'}kg x "
+            f"{s.reps if s.reps is not None else '-'} @RIR {s.rir if s.rir is not None else '-'}"
             for s in row.sets
         )
         return f"{row.started_at.date()} {row.title}: {details}"
@@ -164,33 +207,67 @@ async def build_memory_context(user_id: int, query: str, now: datetime) -> str:
     selected_sessions = newest + [row for row in relevant if row not in newest]
 
     parts: list[str] = []
+
     if schedule_rows:
-        parts.append(
-            "TODAY PLAN:\n"
-            + "\n".join(f"- {row.start}-{row.end} {row.title} ({row.block_type})" for row in schedule_rows)
-        )
+        by_weekday: dict[int, list[ScheduleEntry]] = {weekday: [] for weekday in range(7)}
+        for row in schedule_rows:
+            by_weekday[row.weekday].append(row)
+
+        day_sections: list[str] = []
+        for offset in range(7):
+            target = local_now.date() + timedelta(days=offset)
+            rows = by_weekday[target.weekday()]
+            label = f"{target.isoformat()} {_DAY_NAMES[target.weekday()]}"
+            block_lines = [
+                f"  - {row.start}-{row.end} {row.title} ({row.block_type}/{row.category})"
+                for row in rows
+            ]
+            day_sections.append(label + ("\n" + "\n".join(block_lines) if block_lines else "\n  - no blocks"))
+        parts.append("UPCOMING 7-DAY SCHEDULE:\n" + "\n".join(day_sections))
+
+    if assignment_rows:
+        deadline_lines: list[str] = []
+        for row in assignment_rows:
+            due = row.due_at.strftime("%Y-%m-%d %H:%M") if row.due_at else "deadline unknown"
+            course = f"[{row.course}] " if row.course else ""
+            deadline_lines.append(
+                f"- #{row.id} {due} {course}{row.title} (source={row.source})"
+            )
+        parts.append("UPCOMING ASSIGNMENTS / DEADLINES:\n" + "\n".join(deadline_lines))
 
     if ranked_memories:
-        parts.append("PERSISTENT FACTS:\n" + "\n".join(
-            f"- [{row.category}] {row.key}: {row.value}" for row in ranked_memories
-        ))
+        parts.append(
+            "PERSISTENT FACTS:\n"
+            + "\n".join(f"- [{row.category}] {row.key}: {row.value}" for row in ranked_memories)
+        )
 
     if selected_sessions:
-        parts.append("STRUCTURED WORKOUT HISTORY:\n" + "\n".join(f"- {session_text(row)}" for row in selected_sessions))
+        parts.append(
+            "STRUCTURED WORKOUT HISTORY:\n"
+            + "\n".join(f"- {session_text(row)}" for row in selected_sessions)
+        )
     elif legacy_rows:
-        parts.append("LEGACY WORKOUT NOTES:\n" + "\n".join(
-            f"- {row.workout_date} {row.workout_type}: {row.notes or 'no notes'}" for row in legacy_rows
-        ))
+        parts.append(
+            "LEGACY WORKOUT NOTES:\n"
+            + "\n".join(
+                f"- {row.workout_date} {row.workout_type}: {row.notes or 'no notes'}"
+                for row in legacy_rows
+            )
+        )
 
     if gtg_rows:
         week_reps = sum(row.reps for row in gtg_rows)
         parts.append(f"GTG LAST 7 DAYS: {week_reps} pull-up reps across {len(gtg_rows)} sets.")
 
     if reflection_rows:
-        parts.append("RECENT REFLECTIONS:\n" + "\n".join(
-            f"- {row.reflection_date}: deep_work={row.deep_work_hours}h, protein={row.protein_hit}, "
-            f"calories={row.calories_hit}, RIR={row.rir_respected}, mood={row.mood}, energy={row.energy}, notes={row.notes or '-'}"
-            for row in reflection_rows
-        ))
+        parts.append(
+            "RECENT REFLECTIONS:\n"
+            + "\n".join(
+                f"- {row.reflection_date}: deep_work={row.deep_work_hours}h, protein={row.protein_hit}, "
+                f"calories={row.calories_hit}, RIR={row.rir_respected}, mood={row.mood}, "
+                f"energy={row.energy}, notes={row.notes or '-'}"
+                for row in reflection_rows
+            )
+        )
 
     return "\n\n".join(parts) if parts else "No durable user data stored yet."
