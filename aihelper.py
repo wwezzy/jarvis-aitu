@@ -16,7 +16,9 @@ from handlers.gtg import router as gtg_router
 from handlers.memory import router as memory_router
 from handlers.start import router as start_router
 from handlers.workouts import router as workouts_router
+from services.schedule import ensure_default_schedule
 from services.scheduler import register_master_schedule, restore_pending_reminders
+from services.users import ensure_user
 from webapp.server import create_web_app
 
 settings = get_settings()
@@ -64,7 +66,7 @@ async def configure_bot_ui() -> None:
 
 
 async def start_http_server() -> web.AppRunner:
-    app = create_web_app()
+    app = create_web_app(bot=bot, scheduler=scheduler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, settings.webapp_host, settings.webapp_port)
@@ -76,11 +78,17 @@ async def start_http_server() -> web.AppRunner:
 async def main() -> None:
     logger.info("Initializing Jarvis database")
     await init_db()
-
-    register_master_schedule(scheduler, bot, settings.admin_id)
+    await ensure_user(settings.admin_id, "Аллажар")
+    seeded = await ensure_default_schedule(settings.admin_id)
+    schedule_jobs = await register_master_schedule(scheduler, bot, settings.admin_id)
     restored = await restore_pending_reminders(scheduler, bot)
     scheduler.start()
-    logger.info("Scheduler active; %s pending reminders restored", restored)
+    logger.info(
+        "Scheduler active; %s schedule blocks available, %s notifications registered, %s pending reminders restored",
+        seeded,
+        schedule_jobs,
+        restored,
+    )
 
     http_runner = await start_http_server()
 

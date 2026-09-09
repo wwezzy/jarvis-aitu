@@ -20,6 +20,7 @@
 
     <nav class="tabs" aria-label="Sections">
       <button class="tab active" data-view="dashboard">Today</button>
+      <button class="tab" data-view="schedule">Week</button>
       <button class="tab" data-view="workout">Workout</button>
       <button class="tab" data-view="reflection">Reflect</button>
       <button class="tab" data-view="memory">Memory</button>
@@ -29,7 +30,7 @@
       <section id="view-dashboard" class="view active">
         <div class="hero card">
           <div>
-            <div class="label">CURRENT PROTOCOL</div>
+            <div id="dayName" class="label">TODAY</div>
             <div id="dayKind" class="hero-title">—</div>
             <div id="serverTime" class="muted">Syncing…</div>
           </div>
@@ -70,6 +71,7 @@
               <div class="label">TIMELINE</div>
               <h2>Today</h2>
             </div>
+            <button class="text-button" data-open-view="schedule">Edit week</button>
           </div>
           <div id="scheduleList" class="timeline"></div>
         </section>
@@ -82,6 +84,110 @@
             </div>
           </div>
           <div id="progressionList" class="stack-list"></div>
+        </section>
+      </section>
+
+      <section id="view-schedule" class="view">
+        <section class="card">
+          <div class="section-head">
+            <div>
+              <div class="label">WEEK SYSTEM</div>
+              <h2>Schedule</h2>
+            </div>
+            <button id="newBlockBtn" class="secondary small">+ Block</button>
+          </div>
+          <p class="muted compact">🔒 Fixed — пары. 🎯 Planned — зал, Deep Work, блог. ↔ Flex — онлайн-лекции и блоки, которые можно двигать.</p>
+          <div id="dayPicker" class="day-picker"></div>
+          <div class="week-day-head">
+            <div>
+              <div id="weekDayName" class="list-title">—</div>
+              <div id="weekDayFocus" class="list-meta">—</div>
+            </div>
+          </div>
+          <div id="weekBlocks" class="schedule-blocks"></div>
+        </section>
+
+        <section id="scheduleEditorCard" class="card">
+          <div class="section-head">
+            <div>
+              <div class="label">EDITOR</div>
+              <h2 id="scheduleEditorTitle">New block</h2>
+            </div>
+            <button id="cancelEditBtn" type="button" class="text-button">Clear</button>
+          </div>
+          <form id="scheduleForm">
+            <input id="scheduleId" type="hidden">
+            <label>
+              Day
+              <select id="scheduleWeekday">
+                <option value="0">Понедельник</option>
+                <option value="1">Вторник</option>
+                <option value="2">Среда</option>
+                <option value="3">Четверг</option>
+                <option value="4">Пятница</option>
+                <option value="5">Суббота</option>
+                <option value="6">Воскресенье</option>
+              </select>
+            </label>
+            <div class="two-col">
+              <label>Start<input id="scheduleStart" type="time" required></label>
+              <label>End<input id="scheduleEnd" type="time" required></label>
+            </div>
+            <label>
+              Block
+              <input id="scheduleTitle" maxlength="180" placeholder="Deep Work — backend" required>
+            </label>
+            <div class="two-col">
+              <label>
+                Type
+                <select id="scheduleType">
+                  <option value="fixed">🔒 Fixed</option>
+                  <option value="planned" selected>🎯 Planned</option>
+                  <option value="flex">↔ Flex</option>
+                </select>
+              </label>
+              <label>
+                Category
+                <select id="scheduleCategory">
+                  <option value="study">Study</option>
+                  <option value="deep_work">Deep Work</option>
+                  <option value="training">Training</option>
+                  <option value="recovery">Recovery</option>
+                  <option value="content">Blog / Content</option>
+                  <option value="chores">Chores</option>
+                  <option value="weekly_review">Weekly Review</option>
+                  <option value="nutrition">Nutrition</option>
+                  <option value="commute">Commute</option>
+                  <option value="rest">Rest</option>
+                  <option value="routine">Routine</option>
+                  <option value="reflection">Reflection</option>
+                  <option value="sleep">Sleep</option>
+                  <option value="flex">Other / Flex</option>
+                </select>
+              </label>
+            </div>
+            <label>
+              Telegram notice
+              <select id="scheduleNotify">
+                <option value="">Off</option>
+                <option value="10">10 min before</option>
+                <option value="30" selected>30 min before</option>
+                <option value="60">60 min before</option>
+              </select>
+            </label>
+            <button type="submit" class="primary full">Save block</button>
+          </form>
+        </section>
+
+        <section class="card danger-zone">
+          <div class="section-head">
+            <div>
+              <div class="label">RECOVERY</div>
+              <h2>Default plan</h2>
+            </div>
+          </div>
+          <p class="muted compact">Вернуть недельный план Jarvis v2.1: реальные пары AITU, A/B/C, бассейн, async-лекции и Sunday Reset.</p>
+          <button id="resetScheduleBtn" class="secondary full">Reset to Jarvis default</button>
         </section>
       </section>
 
@@ -165,7 +271,7 @@
             </div>
             <span class="pill">SQL</span>
           </div>
-          <p class="muted compact">Это не последние сообщения чата. Эти факты сохраняются отдельно и не исчезают из-за sliding window.</p>
+          <p class="muted compact">Это не последние сообщения чата. Факты, тренировки и теперь расписание хранятся отдельно от sliding window.</p>
           <div id="memoryList" class="stack-list"></div>
         </section>
       </section>

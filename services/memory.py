@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from database.engine import async_session_factory
-from database.models import DailyReflection, GTGSet, MemoryFact, Workout, WorkoutSession
+from database.models import DailyReflection, GTGSet, MemoryFact, ScheduleEntry, Workout, WorkoutSession
 
 _STOP = {
     "что", "как", "когда", "какой", "какая", "какие", "мне", "мой", "моя", "мои", "это", "там",
@@ -130,6 +130,17 @@ async def build_memory_context(user_id: int, query: str, now: datetime) -> str:
         )
         gtg_rows = gtg_result.scalars().all()
 
+        schedule_result = await db.execute(
+            select(ScheduleEntry)
+            .where(
+                ScheduleEntry.user_id == user_id,
+                ScheduleEntry.weekday == now.weekday(),
+                ScheduleEntry.enabled.is_(True),
+            )
+            .order_by(ScheduleEntry.start.asc(), ScheduleEntry.sort_order.asc())
+        )
+        schedule_rows = schedule_result.scalars().all()
+
     ranked_memories = sorted(
         memory_rows,
         key=lambda row: (_lexical_score(query_tokens, f"{row.category} {row.key} {row.value}"), row.importance),
@@ -153,6 +164,12 @@ async def build_memory_context(user_id: int, query: str, now: datetime) -> str:
     selected_sessions = newest + [row for row in relevant if row not in newest]
 
     parts: list[str] = []
+    if schedule_rows:
+        parts.append(
+            "TODAY PLAN:\n"
+            + "\n".join(f"- {row.start}-{row.end} {row.title} ({row.block_type})" for row in schedule_rows)
+        )
+
     if ranked_memories:
         parts.append("PERSISTENT FACTS:\n" + "\n".join(
             f"- [{row.category}] {row.key}: {row.value}" for row in ranked_memories

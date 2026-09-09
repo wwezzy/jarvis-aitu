@@ -10,18 +10,29 @@ from sqlalchemy import select
 from config import get_settings
 from database.engine import async_session_factory
 from database.models import Reminder
-from services.schedule import DAY_A, DAY_B
+from services.schedule import list_schedule_entries
 
 settings = get_settings()
 
-
-def _minus_30(time_str: str) -> tuple[int, int]:
-    value = datetime.strptime(time_str, "%H:%M") - timedelta(minutes=30)
-    return value.hour, value.minute
+_DOW = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 
-async def send_schedule_notice(bot: Bot, user_id: int, start: str, title: str) -> None:
-    await bot.send_message(user_id, f"⏱ Через 30 минут\n{start} — {title}")
+def _notification_trigger(weekday: int, start: str, minutes_before: int) -> tuple[str, int, int]:
+    # 2026-01-05 is a Monday. Using a reference week makes previous-day rollover safe.
+    base = datetime(2026, 1, 5) + timedelta(days=weekday)
+    hour, minute = [int(part) for part in start.split(":", 1)]
+    run_at = base.replace(hour=hour, minute=minute) - timedelta(minutes=minutes_before)
+    return _DOW[run_at.weekday()], run_at.hour, run_at.minute
+
+
+async def send_schedule_notice(
+    bot: Bot,
+    user_id: int,
+    start: str,
+    title: str,
+    minutes_before: int,
+) -> None:
+    await bot.send_message(user_id, f"⏱ Через {minutes_before} мин\n{start} — {title}")
 
 
 async def send_gtg_prompt(bot: Bot, user_id: int) -> None:
@@ -89,39 +100,46 @@ async def restore_pending_reminders(scheduler: AsyncIOScheduler, bot: Bot) -> in
     return len(rows)
 
 
-def _register_block_notices(
-    scheduler: AsyncIOScheduler,
-    bot: Bot,
-    user_id: int,
-    *,
-    weekdays: str,
-    label: str,
-    blocks,
-) -> None:
-    for index, block in enumerate(blocks):
-        if block.category == "sleep":
+def _clear_dynamic_schedule_jobs(scheduler: AsyncIOScheduler) -> None:
+    for job in scheduler.get_jobs():
+        if job.id.startswith("schedule:block:"):
+            scheduler.remove_job(job.id)
+
+
+async def sync_schedule_jobs(scheduler: AsyncIOScheduler, bot: Bot, user_id: int) -> int:
+    """Rebuild block notifications from the SQL schedule after every edit."""
+    _clear_dynamic_schedule_jobs(scheduler)
+    rows = await list_schedule_entries(user_id)
+    count = 0
+    for row in rows:
+        if row.notify_before_min is None:
             continue
-        hour, minute = _minus_30(block.start)
+        # Dedicated jobs handle these to avoid duplicate messages.
+        if row.category in {"reflection", "sleep"}:
+            continue
+        dow, hour, minute = _notification_trigger(row.weekday, row.start, row.notify_before_min)
         scheduler.add_job(
             send_schedule_notice,
             "cron",
-            day_of_week=weekdays,
+            day_of_week=dow,
             hour=hour,
             minute=minute,
-            args=[bot, user_id, block.start, block.title],
-            id=f"schedule:{label}:{index}",
+            args=[bot, user_id, row.start, row.title, row.notify_before_min],
+            id=f"schedule:block:{row.id}",
             replace_existing=True,
             misfire_grace_time=600,
         )
+        count += 1
+    return count
 
 
-def register_master_schedule(scheduler: AsyncIOScheduler, bot: Bot, user_id: int) -> None:
+async def register_master_schedule(scheduler: AsyncIOScheduler, bot: Bot, user_id: int) -> int:
     if not settings.enable_master_schedule:
-        return
+        return 0
 
-    _register_block_notices(scheduler, bot, user_id, weekdays="tue,thu", label="A", blocks=DAY_A)
-    _register_block_notices(scheduler, bot, user_id, weekdays="mon,wed", label="B", blocks=DAY_B)
+    block_jobs = await sync_schedule_jobs(scheduler, bot, user_id)
 
+    # GtG remains deliberately separate from the daily calendar.
     scheduler.add_job(
         send_gtg_prompt,
         "cron",
@@ -153,3 +171,4 @@ def register_master_schedule(scheduler: AsyncIOScheduler, bot: Bot, user_id: int
         replace_existing=True,
         misfire_grace_time=600,
     )
+    return block_jobs

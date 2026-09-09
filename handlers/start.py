@@ -59,9 +59,8 @@ async def app_command(message: Message) -> None:
 async def today_command(message: Message) -> None:
     if not message.from_user or message.from_user.id != settings.admin_id:
         return
-    schedule = today_schedule()
-    label = {"A": "День A", "B": "День B", "FLEX": "Flexible"}[schedule["kind"]]
-    lines = [f"{schedule['date']} · {label}"]
+    schedule = await today_schedule(message.from_user.id)
+    lines = [f"{schedule['date']} · {schedule['weekday_name']} · {schedule['focus']}"]
     for block in schedule["blocks"]:
         marker = "▶" if block["status"] == "current" else "·"
         lines.append(f"{marker} {block['start']}–{block['end']}  {block['title']}")

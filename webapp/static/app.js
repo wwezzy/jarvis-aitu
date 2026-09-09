@@ -7,7 +7,7 @@
     tg.expand();
   }
 
-  const state = { dashboard: null };
+  const state = { dashboard: null, selectedWeekday: null };
   const $ = (id) => document.getElementById(id);
   const statusDot = $("statusDot");
   const toast = $("toast");
@@ -17,7 +17,7 @@
     toast.classList.toggle("error", isError);
     toast.classList.add("show");
     clearTimeout(showToast.timer);
-    showToast.timer = setTimeout(() => toast.classList.remove("show"), 2200);
+    showToast.timer = setTimeout(() => toast.classList.remove("show"), 2400);
   }
 
   function haptic(type = "light") {
@@ -50,16 +50,25 @@
   }
 
   document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => setView(tab.dataset.view)));
+  document.querySelectorAll("[data-open-view]").forEach((button) => button.addEventListener("click", () => setView(button.dataset.openView)));
+
+  function typeLabel(type) {
+    return { fixed: "🔒 Fixed", planned: "🎯 Planned", flex: "↔ Flex" }[type] || type;
+  }
 
   function renderSchedule(schedule) {
     const target = $("scheduleList");
     target.replaceChildren();
+    if (!schedule.blocks.length) {
+      target.append(node("div", "muted", "На сегодня блоков нет."));
+      return;
+    }
     for (const block of schedule.blocks) {
-      const row = node("div", `timeline-item ${block.status}`);
+      const row = node("div", `timeline-item ${block.status} type-${block.block_type}`);
       row.append(node("div", "timeline-time", block.start));
       const detail = node("div");
       detail.append(node("div", "timeline-title", block.title));
-      detail.append(node("div", "list-meta", `${block.end} · ${block.category}`));
+      detail.append(node("div", "list-meta", `${block.end} · ${typeLabel(block.block_type)} · ${block.category}`));
       row.append(detail);
       target.append(row);
     }
@@ -136,14 +145,109 @@
     $("reflectionNotes").value = reflection.notes ?? "";
   }
 
-  async function loadDashboard() {
+  function getDay(weekday) {
+    return state.dashboard?.schedule_week?.days?.find((day) => day.weekday === Number(weekday));
+  }
+
+  function renderDayPicker() {
+    const target = $("dayPicker");
+    target.replaceChildren();
+    const days = state.dashboard?.schedule_week?.days || [];
+    for (const day of days) {
+      const button = node("button", `day-chip ${day.weekday === state.selectedWeekday ? "active" : ""}`, day.name.slice(0, 2));
+      button.type = "button";
+      button.title = day.name;
+      button.addEventListener("click", () => {
+        state.selectedWeekday = day.weekday;
+        $("scheduleWeekday").value = String(day.weekday);
+        renderWeekEditor();
+      });
+      target.append(button);
+    }
+  }
+
+  function renderWeekEditor() {
+    renderDayPicker();
+    const day = getDay(state.selectedWeekday);
+    if (!day) return;
+    $("weekDayName").textContent = day.name;
+    $("weekDayFocus").textContent = day.focus;
+    const target = $("weekBlocks");
+    target.replaceChildren();
+    if (!day.blocks.length) {
+      target.append(node("div", "muted", "Пустой день. Добавьте блок."));
+      return;
+    }
+    for (const block of day.blocks) {
+      const box = node("div", `schedule-block type-${block.block_type}`);
+      const main = node("div", "schedule-block-main");
+      const time = node("div", "schedule-time", `${block.start}–${block.end}`);
+      const title = node("div", "schedule-title", block.title);
+      const meta = node(
+        "div",
+        "schedule-meta",
+        `${typeLabel(block.block_type)} · ${block.category}${block.notify_before_min === null ? "" : ` · 🔔 ${block.notify_before_min}m`}`
+      );
+      main.append(time, title, meta);
+      const actions = node("div", "schedule-actions");
+      const edit = node("button", "schedule-action", "Edit");
+      edit.type = "button";
+      edit.addEventListener("click", () => editScheduleBlock(block));
+      const remove = node("button", "schedule-action danger", "Delete");
+      remove.type = "button";
+      remove.addEventListener("click", () => deleteScheduleBlock(block));
+      actions.append(edit, remove);
+      box.append(main, actions);
+      target.append(box);
+    }
+  }
+
+  function clearScheduleEditor() {
+    $("scheduleId").value = "";
+    $("scheduleEditorTitle").textContent = "New block";
+    $("scheduleWeekday").value = String(state.selectedWeekday ?? 0);
+    $("scheduleStart").value = "";
+    $("scheduleEnd").value = "";
+    $("scheduleTitle").value = "";
+    $("scheduleType").value = "planned";
+    $("scheduleCategory").value = "study";
+    $("scheduleNotify").value = "30";
+  }
+
+  function editScheduleBlock(block) {
+    $("scheduleId").value = block.id;
+    $("scheduleEditorTitle").textContent = "Edit block";
+    $("scheduleWeekday").value = String(block.weekday);
+    $("scheduleStart").value = block.start;
+    $("scheduleEnd").value = block.end;
+    $("scheduleTitle").value = block.title;
+    $("scheduleType").value = block.block_type;
+    $("scheduleCategory").value = block.category;
+    $("scheduleNotify").value = block.notify_before_min ?? "";
+    $("scheduleEditorCard").scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  async function deleteScheduleBlock(block) {
+    if (!window.confirm(`Удалить ${block.start} — ${block.title}?`)) return;
+    try {
+      await api(`/api/schedule/${block.id}`, { method: "DELETE" });
+      haptic("medium");
+      showToast("Block deleted · scheduler reloaded");
+      await loadDashboard(false);
+    } catch (error) {
+      showToast(error.message, true);
+    }
+  }
+
+  async function loadDashboard(preserveEditor = true) {
     statusDot.className = "status-dot";
     try {
       const data = await api("/api/dashboard");
       state.dashboard = data;
+      if (state.selectedWeekday === null) state.selectedWeekday = data.schedule.weekday;
       statusDot.className = "status-dot online";
-      const kind = data.schedule.kind === "FLEX" ? "FLEX DAY" : `DAY ${data.schedule.kind}`;
-      $("dayKind").textContent = kind;
+      $("dayName").textContent = data.schedule.weekday_name.toUpperCase();
+      $("dayKind").textContent = data.schedule.focus;
       $("serverTime").textContent = new Date(data.server_time).toLocaleString();
       renderSchedule(data.schedule);
       renderGTG(data.gtg);
@@ -151,6 +255,8 @@
       renderWorkouts(data.workouts || []);
       renderMemory(data.memory || []);
       fillReflection(data.reflection);
+      renderWeekEditor();
+      if (!preserveEditor) clearScheduleEditor();
     } catch (error) {
       statusDot.className = "status-dot error";
       showToast(`Auth/API: ${error.message}`, true);
@@ -172,6 +278,63 @@
         button.disabled = false;
       }
     });
+  });
+
+  $("scheduleForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const submit = event.submitter;
+    submit.disabled = true;
+    const weekday = Number($("scheduleWeekday").value);
+    try {
+      await api("/api/schedule", {
+        method: "POST",
+        body: JSON.stringify({
+          id: $("scheduleId").value || null,
+          weekday,
+          start: $("scheduleStart").value,
+          end: $("scheduleEnd").value,
+          title: $("scheduleTitle").value.trim(),
+          block_type: $("scheduleType").value,
+          category: $("scheduleCategory").value,
+          notify_before_min: $("scheduleNotify").value || null,
+        }),
+      });
+      state.selectedWeekday = weekday;
+      haptic("heavy");
+      showToast("Schedule committed · notifications reloaded");
+      await loadDashboard(false);
+    } catch (error) {
+      showToast(error.message, true);
+    } finally {
+      submit.disabled = false;
+    }
+  });
+
+  $("newBlockBtn").addEventListener("click", () => {
+    clearScheduleEditor();
+    $("scheduleEditorCard").scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+  $("cancelEditBtn").addEventListener("click", clearScheduleEditor);
+  $("scheduleWeekday").addEventListener("change", (event) => {
+    if (!$("scheduleId").value) {
+      state.selectedWeekday = Number(event.target.value);
+      renderWeekEditor();
+    }
+  });
+
+  $("resetScheduleBtn").addEventListener("click", async () => {
+    if (!window.confirm("Вернуть Jarvis default week и удалить текущие изменения расписания?")) return;
+    $("resetScheduleBtn").disabled = true;
+    try {
+      await api("/api/schedule/reset", { method: "POST", body: "{}" });
+      haptic("heavy");
+      showToast("Default week restored");
+      await loadDashboard(false);
+    } catch (error) {
+      showToast(error.message, true);
+    } finally {
+      $("resetScheduleBtn").disabled = false;
+    }
   });
 
   function addSetRow(prefill = {}) {
@@ -262,9 +425,9 @@
     }
   });
 
-  $("refreshBtn").addEventListener("click", loadDashboard);
+  $("refreshBtn").addEventListener("click", () => loadDashboard());
 
   const initial = location.hash.replace("#", "");
-  if (["dashboard", "workout", "reflection", "memory"].includes(initial)) setView(initial);
-  loadDashboard();
+  if (["dashboard", "schedule", "workout", "reflection", "memory"].includes(initial)) setView(initial);
+  loadDashboard(false);
 })();

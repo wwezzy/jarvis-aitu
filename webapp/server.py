@@ -5,15 +5,24 @@ from datetime import datetime
 from pathlib import Path
 
 from aiohttp import web
+from aiogram import Bot
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import get_settings
 from services.gtg import add_gtg_set, gtg_stats
 from services.memory import list_memory_facts
+from services.progression import double_progression_recommendation
 from services.reflections import latest_reflection, upsert_reflection
-from services.schedule import today_schedule
+from services.schedule import (
+    delete_schedule_entry,
+    reset_schedule,
+    today_schedule,
+    upsert_schedule_entry,
+    week_schedule,
+)
+from services.scheduler import sync_schedule_jobs
 from services.telegram_auth import TelegramAuthError, TelegramWebAppUser, validate_init_data
 from services.users import ensure_user
-from services.progression import double_progression_recommendation
 from services.workouts import log_workout, recent_workouts
 
 logger = logging.getLogger(__name__)
@@ -76,6 +85,14 @@ def _progression_for(workout: dict | None) -> list[dict]:
     ]
 
 
+async def _resync_schedule_notifications(request: web.Request, user_id: int) -> None:
+    scheduler: AsyncIOScheduler | None = request.app.get("scheduler")
+    bot: Bot | None = request.app.get("bot")
+    if scheduler is not None and bot is not None and settings.enable_master_schedule:
+        count = await sync_schedule_jobs(scheduler, bot, user_id)
+        logger.info("Schedule edited; %s block notifications reloaded", count)
+
+
 async def health(_: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "service": "jarvis"})
 
@@ -88,6 +105,8 @@ async def dashboard(request: web.Request) -> web.Response:
     user = await _authorized_user(request)
     now = datetime.now(settings.timezone)
     workouts = await recent_workouts(user.id, limit=6)
+    today = await today_schedule(user.id, now)
+    week = await week_schedule(user.id)
     data = {
         "user": {
             "id": user.id,
@@ -95,7 +114,8 @@ async def dashboard(request: web.Request) -> web.Response:
             "username": user.username,
         },
         "server_time": now.isoformat(),
-        "schedule": today_schedule(now),
+        "schedule": today,
+        "schedule_week": week,
         "gtg": await gtg_stats(user.id, now),
         "workouts": workouts,
         "progression": _progression_for(workouts[0] if workouts else None),
@@ -103,6 +123,35 @@ async def dashboard(request: web.Request) -> web.Response:
         "memory": await list_memory_facts(user.id, limit=12),
     }
     return web.json_response(data)
+
+
+async def save_schedule_block(request: web.Request) -> web.Response:
+    user = await _authorized_user(request)
+    payload = await _json_body(request)
+    try:
+        row = await upsert_schedule_entry(user.id, payload)
+    except (TypeError, ValueError) as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+    await _resync_schedule_notifications(request, user.id)
+    return web.json_response({"ok": True, "block": row, "schedule_week": await week_schedule(user.id)})
+
+
+async def remove_schedule_block(request: web.Request) -> web.Response:
+    user = await _authorized_user(request)
+    try:
+        entry_id = int(request.match_info["entry_id"])
+        await delete_schedule_entry(user.id, entry_id)
+    except (TypeError, ValueError) as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+    await _resync_schedule_notifications(request, user.id)
+    return web.json_response({"ok": True, "schedule_week": await week_schedule(user.id)})
+
+
+async def reset_schedule_to_default(request: web.Request) -> web.Response:
+    user = await _authorized_user(request)
+    count = await reset_schedule(user.id)
+    await _resync_schedule_notifications(request, user.id)
+    return web.json_response({"ok": True, "count": count, "schedule_week": await week_schedule(user.id)})
 
 
 async def create_gtg(request: web.Request) -> web.Response:
@@ -176,12 +225,21 @@ async def api_error_middleware(request: web.Request, handler):
         raise web.HTTPInternalServerError(text="Internal server error")
 
 
-def create_web_app() -> web.Application:
+def create_web_app(
+    *,
+    bot: Bot | None = None,
+    scheduler: AsyncIOScheduler | None = None,
+) -> web.Application:
     app = web.Application(middlewares=[api_error_middleware, security_headers])
+    app["bot"] = bot
+    app["scheduler"] = scheduler
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
     app.router.add_get("/app", miniapp_index)
     app.router.add_get("/api/dashboard", dashboard)
+    app.router.add_post("/api/schedule", save_schedule_block)
+    app.router.add_delete("/api/schedule/{entry_id:\\d+}", remove_schedule_block)
+    app.router.add_post("/api/schedule/reset", reset_schedule_to_default)
     app.router.add_post("/api/gtg", create_gtg)
     app.router.add_post("/api/workouts", create_workout)
     app.router.add_post("/api/reflection", save_reflection)

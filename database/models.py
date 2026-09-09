@@ -44,6 +44,9 @@ class User(Base):
     reflections: Mapped[List["DailyReflection"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    schedule_entries: Mapped[List["ScheduleEntry"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 # Legacy table kept so existing databases continue to open without destructive migration.
@@ -214,3 +217,33 @@ class DailyReflection(Base):
     )
 
     user: Mapped["User"] = relationship(back_populates="reflections")
+
+
+class ScheduleEntry(Base):
+    __tablename__ = "schedule_entries"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.telegram_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    weekday: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    start: Mapped[str] = mapped_column(String(5), nullable=False)
+    end: Mapped[str] = mapped_column(String(5), nullable=False)
+    title: Mapped[str] = mapped_column(String(180), nullable=False)
+    category: Mapped[str] = mapped_column(String(40), nullable=False, default="flex")
+    block_type: Mapped[str] = mapped_column(String(20), nullable=False, default="planned")
+    notify_before_min: Mapped[int | None] = mapped_column(Integer, nullable=True, default=30)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.current_timestamp())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
+    )
+
+    user: Mapped["User"] = relationship(back_populates="schedule_entries")
