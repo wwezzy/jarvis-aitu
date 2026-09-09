@@ -3,20 +3,21 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from aiogram import F, Bot, Router
+from aiogram import Bot, F, Router
 from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sqlalchemy import select
 from upstash_redis.asyncio import Redis as AsyncRedis
 
 from config import get_settings
 from database.engine import async_session_factory
-from database.models import Habit, Reminder, User
+from database.models import Habit, Reminder
+from services.assignments import upsert_assignment_payloads
+from services.direct_intents import try_direct_answer
 from services.llm import parse_user_message
 from services.memory import build_memory_context, upsert_memory_updates
 from services.pc_agent import build_signed_command
 from services.reflections import upsert_reflection
-from services.scheduler import send_saved_reminder
+from services.scheduler import send_saved_reminder, sync_assignment_jobs
 from services.users import ensure_user
 from services.workouts import log_workout
 
@@ -71,6 +72,13 @@ async def assistant_message(
         user = await ensure_user(message.from_user.id, message.from_user.full_name)
         text, file_bytes, mime_type = await _download_attachment(message, bot)
         now = _local_now()
+
+        if file_bytes is None:
+            direct_reply = await try_direct_answer(message.from_user.id, text, now)
+            if direct_reply:
+                await status.edit_text(direct_reply[:4096])
+                return
+
         memory_context = await build_memory_context(message.from_user.id, text, now)
 
         data = await parse_user_message(
@@ -126,6 +134,17 @@ async def assistant_message(
         if memory_updates:
             await upsert_memory_updates(message.from_user.id, memory_updates)
             reply += "\n🧠 Long-term memory updated."
+
+        assignments = data.get("assignments") or []
+        if assignments:
+            saved = await upsert_assignment_payloads(
+                message.from_user.id,
+                assignments,
+                source="telegram_llm",
+            )
+            if saved:
+                await sync_assignment_jobs(scheduler, bot, message.from_user.id)
+                reply += f"\n📚 Assignments updated: {len(saved)}."
 
         reminders = data.get("reminders") or []
         for payload in reminders[:20]:

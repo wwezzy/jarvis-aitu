@@ -11,13 +11,15 @@ from upstash_redis.asyncio import Redis as AsyncRedis
 
 from config import get_settings
 from database.engine import init_db
+from handlers.assignments import router as assignments_router
 from handlers.assistant import router as assistant_router
 from handlers.gtg import router as gtg_router
 from handlers.memory import router as memory_router
 from handlers.start import router as start_router
 from handlers.workouts import router as workouts_router
+from services.assignments import sync_lms_ical
 from services.schedule import ensure_default_schedule
-from services.scheduler import register_master_schedule, restore_pending_reminders
+from services.scheduler import register_master_schedule, restore_pending_reminders, sync_assignment_jobs
 from services.users import ensure_user
 from webapp.server import create_web_app
 
@@ -34,7 +36,8 @@ dp.include_router(start_router)
 dp.include_router(gtg_router)
 dp.include_router(workouts_router)
 dp.include_router(memory_router)
-dp.include_router(assistant_router)  # catch-all must stay last
+dp.include_router(assignments_router)
+dp.include_router(assistant_router)
 
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 pc_redis: AsyncRedis | None = None
@@ -46,6 +49,9 @@ async def configure_bot_ui() -> None:
     await bot.set_my_commands(
         [
             BotCommand(command="today", description="Today's protocol"),
+            BotCommand(command="deadlines", description="Upcoming assignments and deadlines"),
+            BotCommand(command="lms_sync", description="Sync Moodle/LMS calendar"),
+            BotCommand(command="diag", description="Jarvis diagnostics"),
             BotCommand(command="gtg", description="Log pull-up GTG set"),
             BotCommand(command="workouts", description="Recent structured workouts"),
             BotCommand(command="memory", description="Durable memory"),
@@ -80,13 +86,28 @@ async def main() -> None:
     await init_db()
     await ensure_user(settings.admin_id, "Аллажар")
     seeded = await ensure_default_schedule(settings.admin_id)
+
+    if settings.lms_ical_url:
+        try:
+            result = await sync_lms_ical(settings.admin_id)
+            logger.info(
+                "Initial LMS sync: created=%s updated=%s events=%s",
+                result.get("created"),
+                result.get("updated"),
+                result.get("events_seen"),
+            )
+        except Exception:
+            logger.exception("Initial LMS sync failed; Jarvis will continue without blocking startup")
+
     schedule_jobs = await register_master_schedule(scheduler, bot, settings.admin_id)
     restored = await restore_pending_reminders(scheduler, bot)
+    deadline_jobs = await sync_assignment_jobs(scheduler, bot, settings.admin_id)
     scheduler.start()
     logger.info(
-        "Scheduler active; %s schedule blocks available, %s notifications registered, %s pending reminders restored",
+        "Scheduler active; %s schedule blocks available, %s notifications registered, %s deadline notices registered, %s pending reminders restored",
         seeded,
         schedule_jobs,
+        deadline_jobs,
         restored,
     )
 
@@ -95,7 +116,11 @@ async def main() -> None:
     try:
         await configure_bot_ui()
         await bot.delete_webhook(drop_pending_updates=False)
-        logger.info("Jarvis online. Starting Telegram long polling")
+        logger.info(
+            "Jarvis online. Starting Telegram long polling; Gemini projects=%s LMS=%s",
+            len(settings.gemini_api_keys),
+            "configured" if settings.lms_ical_url else "not-configured",
+        )
         await dp.start_polling(bot, scheduler=scheduler, pc_redis=pc_redis)
     finally:
         scheduler.shutdown(wait=False)

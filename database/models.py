@@ -47,6 +47,12 @@ class User(Base):
     schedule_entries: Mapped[List["ScheduleEntry"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    assignments: Mapped[List["Assignment"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    lms_sync_state: Mapped["LmsSyncState | None"] = relationship(
+        back_populates="user", cascade="all, delete-orphan", uselist=False
+    )
 
 
 # Legacy table kept so existing databases continue to open without destructive migration.
@@ -247,3 +253,53 @@ class ScheduleEntry(Base):
     )
 
     user: Mapped["User"] = relationship(back_populates="schedule_entries")
+
+
+class Assignment(Base):
+    __tablename__ = "assignments"
+    __table_args__ = (
+        UniqueConstraint("user_id", "source", "external_id", name="uq_assignment_source_external"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.telegram_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual", index=True)
+    external_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    course: Mapped[str | None] = mapped_column(String(180), nullable=True, index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending", index=True)
+    url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.current_timestamp())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
+    )
+
+    user: Mapped["User"] = relationship(back_populates="assignments")
+
+
+class LmsSyncState(Base):
+    __tablename__ = "lms_sync_state"
+
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.telegram_id", ondelete="CASCADE"),
+        primary_key=True,
+        autoincrement=False,
+    )
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_created: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_updated: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    user: Mapped["User"] = relationship(back_populates="lms_sync_state")

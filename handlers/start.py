@@ -15,16 +15,7 @@ settings = get_settings()
 def miniapp_keyboard() -> InlineKeyboardMarkup | None:
     if not settings.webapp_url:
         return None
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⚡ Open Jarvis Console",
-                    web_app=WebAppInfo(url=f"{settings.webapp_url}/app"),
-                )
-            ]
-        ]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚡ Open Jarvis Console", web_app=WebAppInfo(url=f"{settings.webapp_url}/app"))]])
 
 
 @router.message(CommandStart())
@@ -32,11 +23,13 @@ async def start_command(message: Message) -> None:
     if not message.from_user or message.from_user.id != settings.admin_id:
         await message.answer("🔒 Access denied. Jarvis is in private mode.")
         return
-
     await ensure_user(message.from_user.id, message.from_user.full_name)
     text = (
         "JARVIS ONLINE\n\n"
         "/today — текущий протокол\n"
+        "/deadlines — задания и дедлайны\n"
+        "/lms_sync — синхронизация Moodle/LMS\n"
+        "/diag — диагностика Gemini/DB/LMS\n"
         "/gtg — быстрые подходы\n"
         "/workouts — последние тренировки\n"
         "/memory — долговременная память\n"
