@@ -12,6 +12,7 @@ from config import get_settings
 from database.engine import async_session_factory
 from database.models import Habit, Reminder
 from services.assignments import upsert_assignment_payloads
+from services.attachments import AttachmentError, ensure_size, transcribe_telegram_voice
 from services.direct_intents import try_direct_answer
 from services.llm import extract_actions, generate_reply
 from services.memory import build_memory_context, upsert_memory_updates
@@ -30,30 +31,51 @@ def _local_now() -> datetime:
     return datetime.now(settings.timezone)
 
 
-async def _download_attachment(message: Message, bot: Bot) -> tuple[str, bytes | None, str | None]:
+async def _download_attachment(
+    message: Message,
+    bot: Bot,
+) -> tuple[str, bytes | None, str | None, str | None]:
     text = message.text or message.caption or ""
     file_bytes: bytes | None = None
     mime_type: str | None = None
+    filename: str | None = None
 
     if message.photo:
-        file_info = await bot.get_file(message.photo[-1].file_id)
+        photo = message.photo[-1]
+        ensure_size(photo.file_size)
+        file_info = await bot.get_file(photo.file_id)
         downloaded = await bot.download_file(file_info.file_path)
         file_bytes = downloaded.read()
         mime_type = "image/jpeg"
+        filename = "photo.jpg"
+        if not text:
+            text = "Проанализируй изображение и выполни запрос пользователя."
+
     elif message.document:
+        ensure_size(message.document.file_size)
         file_info = await bot.get_file(message.document.file_id)
         downloaded = await bot.download_file(file_info.file_path)
         file_bytes = downloaded.read()
         mime_type = message.document.mime_type or "application/octet-stream"
+        filename = message.document.file_name or "document"
+        if not text:
+            text = f"Проанализируй файл {filename} и выдели главное, важные требования и действия."
+
     elif message.voice:
+        ensure_size(message.voice.file_size, audio=True)
         file_info = await bot.get_file(message.voice.file_id)
         downloaded = await bot.download_file(file_info.file_path)
-        file_bytes = downloaded.read()
-        mime_type = "audio/ogg"
-        if not text:
-            text = "Прослушай голосовое сообщение и выполни просьбу пользователя."
+        transcript = await transcribe_telegram_voice(downloaded.read())
+        text = (
+            f"{text}\n\n[Расшифровка голосового]\n{transcript}".strip()
+            if text
+            else transcript
+        )
+        # Voice is normalized to text before routing. This allows deterministic
+        # schedule/deadline intents and text-only fallback providers to work too.
+        return text, None, None, None
 
-    return text, file_bytes, mime_type
+    return text, file_bytes, mime_type, filename
 
 
 async def _apply_actions(
@@ -174,7 +196,11 @@ async def assistant_message(
 
     try:
         user = await ensure_user(message.from_user.id, message.from_user.full_name)
-        text, file_bytes, mime_type = await _download_attachment(message, bot)
+        try:
+            text, file_bytes, mime_type, filename = await _download_attachment(message, bot)
+        except AttachmentError as exc:
+            await status.edit_text(str(exc))
+            return
         now = _local_now()
 
         if file_bytes is None:
@@ -205,6 +231,7 @@ async def assistant_message(
             memory_context=memory_context,
             file_bytes=file_bytes,
             mime_type=mime_type,
+            filename=filename,
         )
 
         # Critical v3 rule: the user sees the reply before any structured extraction.
