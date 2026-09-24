@@ -124,3 +124,55 @@ async def test_deleted_lms_event_stops_being_pending(db, feed):
     await assignments.sync_lms_ical(42, "offline-feed")
     async with db() as session:
         assert (await session.scalar(select(Assignment))).status == "cancelled"
+
+
+def test_lms_event_classifier():
+    assert assignments.classify_lms_event("Attendance (Group SE-2515)") == "attendance"
+    assert assignments.classify_lms_event("MCQ Quiz #1 - Adapter Pattern opens") == "quiz_open"
+    assert assignments.classify_lms_event("MCQ Quiz #1 - Adapter Pattern closes") == "quiz_close"
+    assert assignments.classify_lms_event("Assignment 3 is due") == "assignment_due"
+
+
+async def test_attendance_is_not_imported_as_deadline(db, feed):
+    feed.read.return_value = calendar(
+        event(uid="attendance-1", title="Attendance (Group SE-2515)"),
+        event(uid="deadline-1", title="Assignment 3 is due"),
+    )
+    result = await assignments.sync_lms_ical(42, "offline-feed")
+    assert result["created"] == 1
+    async with db() as session:
+        rows = (await session.scalars(select(Assignment))).all()
+        assert [row.title for row in rows] == ["Assignment 3 is due"]
+
+
+async def test_quiz_open_is_not_deadline_but_quiz_close_is(db, feed):
+    feed.read.return_value = calendar(
+        event(uid="quiz-open", title="MCQ Quiz #1 - Adapter Pattern opens"),
+        event(uid="quiz-close", title="MCQ Quiz #1 - Adapter Pattern closes"),
+    )
+    await assignments.sync_lms_ical(42, "offline-feed")
+    async with db() as session:
+        rows = (await session.scalars(select(Assignment))).all()
+        assert [row.title for row in rows] == ["MCQ Quiz #1 - Adapter Pattern closes"]
+
+
+async def test_existing_attendance_row_is_cancelled_on_resync(db, feed):
+    async with db() as session:
+        session.add(
+            Assignment(
+                user_id=42,
+                source="lms_ical",
+                external_id="attendance-1",
+                title="Attendance (Group SE-2515)",
+                due_at=datetime(2099, 1, 8, 15),
+                status="pending",
+            )
+        )
+        await session.commit()
+    feed.read.return_value = calendar(
+        event(uid="attendance-1", title="Attendance (Group SE-2515)")
+    )
+    await assignments.sync_lms_ical(42, "offline-feed")
+    async with db() as session:
+        row = await session.scalar(select(Assignment))
+        assert row.status == "cancelled"
