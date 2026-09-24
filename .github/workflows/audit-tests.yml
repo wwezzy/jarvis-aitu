@@ -1,7 +1,7 @@
 name: Jarvis audit tests
 on:
   push:
-    branches: [feat/jarvis-v3, codex/jarvis-v3-audit]
+    branches: [feat/jarvis-v3, codex/jarvis-v3-audit, codex/jarvis-ultimate-v4]
   pull_request:
     branches: [feat/jarvis-v3]
 
@@ -11,6 +11,7 @@ permissions:
 jobs:
   offline:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}

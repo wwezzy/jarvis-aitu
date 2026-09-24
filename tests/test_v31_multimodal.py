@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -53,6 +54,10 @@ def test_attachment_size_guard():
 
 
 async def test_transcription_uses_gpt_transcribe(monkeypatch):
+    monkeypatch.setattr(attachments, "settings", replace(
+        attachments.settings, openai_api_key="offline-transcription-test",
+        openai_transcribe_model="gpt-transcribe",
+    ))
     monkeypatch.setattr(
         attachments,
         "convert_telegram_voice",

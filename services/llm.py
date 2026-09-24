@@ -257,7 +257,7 @@ async def _openai_reply(
     system_instruction: str,
     file_bytes: bytes | None,
     mime_type: str | None,
-    filename: str | None,
+    filename: str | None = None,
 ) -> tuple[str, str]:
     if not settings.openai_api_key:
         raise RuntimeError("OpenAI is not configured")
