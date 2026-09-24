@@ -7,6 +7,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import selectinload
 
 from database.engine import async_session_factory
+from database.time import aware
 from database.models import (
     Assignment,
     DailyReflection,
@@ -105,7 +106,7 @@ async def list_memory_facts(user_id: int, limit: int = 30) -> list[dict]:
 
 async def build_memory_context(user_id: int, query: str, now: datetime) -> str:
     query_tokens = _tokens(query)
-    local_now = now.replace(tzinfo=None)
+    local_now = aware(now)
     week_start = local_now - timedelta(days=7)
     assignment_horizon = local_now + timedelta(days=30)
 

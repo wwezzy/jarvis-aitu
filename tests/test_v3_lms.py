@@ -5,6 +5,7 @@ import pytest
 from sqlalchemy import select
 
 from database.models import Assignment, LmsSyncState
+from database.time import aware
 from services import assignments
 
 
@@ -35,9 +36,9 @@ def feed(monkeypatch):
 
 def test_ical_timezone_and_all_day_deadline():
     parsed = assignments.parse_ical_events(calendar(event()))
-    assert parsed[0]["due_at"] == datetime(2099, 1, 8, 15)
+    assert parsed[0]["due_at"] == aware(datetime(2099, 1, 8, 15))
     all_day = event().replace("DTSTART:20990108T100000Z", "DTSTART;VALUE=DATE:20990108")
-    assert assignments.parse_ical_events(calendar(all_day))[0]["due_at"] == datetime(2099, 1, 8, 23, 59)
+    assert assignments.parse_ical_events(calendar(all_day))[0]["due_at"] == aware(datetime(2099, 1, 8, 23, 59))
 
 
 async def test_lms_import_update_idempotency_and_completion_preserved(db, feed):
@@ -54,7 +55,7 @@ async def test_lms_import_update_idempotency_and_completion_preserved(db, feed):
         rows = (await session.scalars(select(Assignment))).all()
         assert len(rows) == 1 and rows[0].status == "done"
         assert rows[0].title == "Revised assignment" and rows[0].course == "New semester subject"
-        assert rows[0].due_at == datetime(2099, 1, 9, 15)
+        assert rows[0].due_at == aware(datetime(2099, 1, 9, 15))
 
 
 async def test_duplicate_feed_uids_do_not_duplicate_assignments(db, feed):

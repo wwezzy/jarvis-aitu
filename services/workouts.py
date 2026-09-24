@@ -9,6 +9,7 @@ from sqlalchemy.orm import selectinload
 
 from database.engine import async_session_factory
 from database.models import ExerciseSet, WorkoutSession
+from database.time import aware, utcnow
 
 
 def _clean_float(value: Any, *, minimum: float | None = None, maximum: float | None = None) -> float | None:
@@ -51,8 +52,8 @@ async def log_workout(
     session_row = WorkoutSession(
         user_id=user_id,
         title=clean_title,
-        started_at=started_at or datetime.now(),
-        completed_at=datetime.now(),
+        started_at=aware(started_at) if started_at else utcnow(),
+        completed_at=utcnow(),
         notes=(notes or "").strip()[:4000] or None,
         source=source[:32],
     )

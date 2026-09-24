@@ -12,6 +12,7 @@ from sqlalchemy import or_, select
 from config import get_settings
 from database.engine import async_session_factory
 from database.models import Assignment, LmsSyncState
+from database.time import aware
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -21,17 +22,15 @@ _URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 
 def _local_naive(value: date | datetime) -> datetime:
     if isinstance(value, datetime):
-        if value.tzinfo is None:
-            return value
-        return value.astimezone(settings.timezone).replace(tzinfo=None)
-    return datetime.combine(value, time(23, 59))
+        return aware(value)
+    return aware(datetime.combine(value, time(23, 59)))
 
 
 def _parse_local_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.strptime(str(value).strip(), "%Y-%m-%d %H:%M:%S")
+        return aware(datetime.fromisoformat(str(value).strip()))
     except ValueError:
         return None
 
@@ -252,7 +251,7 @@ async def _update_lms_state(
     created: int = 0,
     updated: int = 0,
 ) -> None:
-    now = datetime.now(settings.timezone).replace(tzinfo=None)
+    now = datetime.now(settings.timezone)
     async with async_session_factory() as db:
         result = await db.execute(select(LmsSyncState).where(LmsSyncState.user_id == user_id))
         row = result.scalar_one_or_none()
@@ -293,7 +292,7 @@ async def sync_lms_ical(user_id: int, url: str | None = None) -> dict:
                 raw = await response.read()
 
         parsed = parse_ical_events(raw)
-        now = datetime.now(settings.timezone).replace(tzinfo=None)
+        now = datetime.now(settings.timezone)
         lower_bound = now - timedelta(days=2)
 
         created = 0

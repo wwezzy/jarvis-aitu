@@ -10,6 +10,7 @@ from sqlalchemy import select
 from config import get_settings
 from database.engine import async_session_factory
 from database.models import Assignment, Reminder, ScheduleEntry
+from database.time import aware
 from services.assignments import list_upcoming_assignments, sync_lms_ical
 from services.notifications import claim_notification, is_dnd, notify_once
 from services.schedule import list_schedule_entries, today_schedule, week_schedule
@@ -66,7 +67,7 @@ async def send_saved_reminder(bot: Bot, user_id: int, text: str, reminder_id: in
 
 
 async def restore_pending_reminders(scheduler: AsyncIOScheduler, bot: Bot) -> int:
-    now = datetime.now(settings.timezone).replace(tzinfo=None)
+    now = datetime.now(settings.timezone)
     async with async_session_factory() as db:
         result = await db.execute(
             select(Reminder).where(
@@ -200,10 +201,10 @@ async def send_assignment_notice(
     async with async_session_factory() as db:
         row = await db.get(Assignment, assignment_id)
         if (row is None or row.user_id != user_id or row.status != "pending"
-                or row.due_at is None or row.due_at.isoformat() != due_at):
+                or row.due_at is None or row.due_at != aware(datetime.fromisoformat(due_at))):
             return
         title, course = row.title, row.course
-    event_key = f"deadline:{assignment_id}:{due_at}:{minutes_before}"
+    event_key = f"deadline:{assignment_id}:{aware(datetime.fromisoformat(due_at)).isoformat()}:{minutes_before}"
     course_text = f"[{course}] " if course else ""
     if minutes_before >= 1440:
         days = minutes_before // 1440
@@ -227,7 +228,7 @@ async def sync_assignment_jobs(
     user_id: int,
 ) -> int:
     _clear_assignment_jobs(scheduler, user_id)
-    now = datetime.now(settings.timezone).replace(tzinfo=None)
+    now = datetime.now(settings.timezone)
     items = await list_upcoming_assignments(
         user_id,
         now=now.replace(tzinfo=settings.timezone),
@@ -242,7 +243,7 @@ async def sync_assignment_jobs(
         if not due_text:
             continue
         try:
-            due_at = datetime.fromisoformat(due_text)
+            due_at = aware(datetime.fromisoformat(due_text))
         except ValueError:
             continue
 

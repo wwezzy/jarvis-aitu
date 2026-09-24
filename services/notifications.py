@@ -11,6 +11,7 @@ from sqlalchemy.exc import IntegrityError
 
 from database.engine import async_session_factory
 from database.notification_models import NotificationLog
+from database.time import utcnow
 
 
 settings = get_settings()
@@ -46,7 +47,7 @@ async def claim_notification(
                 event_key=event_key[:255],
                 kind=kind[:40],
                 message=(message or "")[:4000] or None,
-                sent_at=datetime.now(),
+                sent_at=utcnow(),
             )
         )
         try:

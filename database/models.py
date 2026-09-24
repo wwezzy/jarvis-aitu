@@ -7,7 +7,6 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     Date,
-    DateTime,
     Float,
     ForeignKey,
     Integer,
@@ -17,6 +16,7 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from database.time import UTCDateTime as DateTime, utcnow
 
 
 class Base(DeclarativeBase):
@@ -84,7 +84,7 @@ class WorkoutSession(Base):
         index=True,
     )
     title: Mapped[str] = mapped_column(String(120), nullable=False, default="Workout")
-    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.now, index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow, index=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="telegram")
@@ -165,6 +165,10 @@ class MemoryFact(Base):
     key: Mapped[str] = mapped_column(String(120), nullable=False)
     value: Mapped[str] = mapped_column(Text, nullable=False)
     importance: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0, server_default="1")
+    provenance: Mapped[str] = mapped_column(String(120), nullable=False, default="user", server_default="legacy")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.current_timestamp()
     )
@@ -189,7 +193,7 @@ class GTGSet(Base):
         index=True,
     )
     reps: Mapped[int] = mapped_column(Integer, nullable=False)
-    logged_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.now, index=True)
+    logged_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow, index=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="button")
 
     user: Mapped["User"] = relationship(back_populates="gtg_sets")
@@ -244,6 +248,11 @@ class ScheduleEntry(Base):
     notify_before_min: Mapped[int | None] = mapped_column(Integer, nullable=True, default=30)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    location: Mapped[str | None] = mapped_column(String(255))
+    commute_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    preparation_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    importance: Mapped[int] = mapped_column(Integer, nullable=False, default=5, server_default="5")
+    provenance: Mapped[str] = mapped_column(String(120), nullable=False, default="user", server_default="legacy")
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.current_timestamp())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
@@ -276,6 +285,16 @@ class Assignment(Base):
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending", index=True)
     url: Mapped[str | None] = mapped_column(Text, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    estimated_minutes: Mapped[int | None] = mapped_column(Integer)
+    progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    importance: Mapped[int] = mapped_column(Integer, nullable=False, default=5, server_default="5")
+    risk: Mapped[float] = mapped_column(Float, nullable=False, default=0, server_default="0")
+    consequence: Mapped[int] = mapped_column(Integer, nullable=False, default=5, server_default="5")
+    preparation_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    testing_buffer_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60, server_default="60")
+    provenance: Mapped[str] = mapped_column(String(120), nullable=False, default="user", server_default="legacy")
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0, server_default="1")
+    deadline_overridden: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.current_timestamp())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
