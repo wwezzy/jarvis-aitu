@@ -184,7 +184,7 @@ async def build_memory_context(user_id: int, query: str, now: datetime) -> str:
         ]
 
     ranked_memories = sorted(
-        memory_rows,
+        [row for row in memory_rows if _lexical_score(query_tokens, f"{row.category} {row.key} {row.value}") > 0],
         key=lambda row: (_lexical_score(query_tokens, f"{row.category} {row.key} {row.value}"), row.importance),
         reverse=True,
     )[:18]

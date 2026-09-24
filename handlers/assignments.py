@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+from sqlalchemy import text
+
 from aiogram import Bot, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import get_settings
-from database.engine import DATABASE_URL
+from database.engine import DATABASE_URL, async_session_factory
 from services.assignments import (
     assignment_counts,
     format_deadlines,
@@ -84,42 +87,38 @@ async def lms_sync_command(message: Message, bot: Bot, scheduler: AsyncIOSchedul
 async def diag_command(message: Message, scheduler: AsyncIOScheduler) -> None:
     if not _authorized(message):
         return
-
     llm = get_llm_diagnostics()
-    lms = await lms_status(message.from_user.id)
-    counts = await assignment_counts(message.from_user.id)
     db_kind = "PostgreSQL" if DATABASE_URL.startswith("postgresql") else "SQLite"
-
-    providers = llm.get("providers") or {}
-    models = llm.get("models") or {}
+    try:
+        async with asyncio.timeout(5):
+            async with async_session_factory() as db:
+                await db.execute(text("SELECT 1"))
+            lms = await lms_status(message.from_user.id)
+            counts = await assignment_counts(message.from_user.id)
+        database_status = "reachable"
+    except Exception as exc:
+        database_status = f"unavailable ({type(exc).__name__})"
+        lms, counts = None, None
     lines = [
-        "🧪 JARVIS V3 DIAGNOSTICS",
-        f"Telegram/Scheduler: ✅ · jobs={len(scheduler.get_jobs())}",
-        (
-            "AI providers: "
-            f"OpenAI={'✅' if providers.get('openai') else '—'} · "
-            f"NVIDIA={'✅' if providers.get('nvidia') else '—'} · "
-            f"Gemini={'✅' if providers.get('gemini') else '—'}"
-        ),
-        f"Last AI: {llm.get('last_provider') or '-'} / {llm.get('last_model') or '-'} / {llm.get('last_mode') or '-'}",
-        f"OpenAI default/planner: {models.get('openai_default') or '-'} / {models.get('openai_planner') or '-'}",
-        f"Provider cooldowns: {llm.get('cooldowns_seconds') or 'none'}",
-        f"Redis: {'✅' if settings.redis_url and settings.redis_token else '⚠️ not configured'}",
-        f"Database: {db_kind}{'' if db_kind == 'PostgreSQL' else ' ⚠️ ephemeral on Render'}",
-        f"LMS iCal: {'✅ configured' if lms['configured'] else '⚪ not configured'}",
-        f"LMS last success: {lms.get('last_success_at') or '-'}",
-        f"Assignments: {counts['pending']} pending · {counts['unknown_deadline']} without exact date",
+        "🧪 JARVIS DIAGNOSTICS",
+        f"Scheduler: jobs={len(scheduler.get_jobs())}",
+        f"Database: {db_kind} · {database_status}",
+        f"Redis: {'configured (not probed)' if settings.redis_url and settings.redis_token else 'not configured'}",
+        "PC agent: heartbeat unavailable; connectivity cannot be verified",
     ]
-
-    if lms.get("last_error"):
-        lines.append(
-            f"LMS last error: {str(lms['last_error']).replace(chr(10), ' ')[:300]}"
-        )
-    if llm.get("last_error"):
-        lines.append(
-            f"AI last error: {str(llm['last_error']).replace(chr(10), ' ')[:300]}"
-        )
-    if llm.get("last_debug_id"):
-        lines.append(f"AI debug id: {llm['last_debug_id']}")
-
+    for name, configured in llm["providers"].items():
+        cooldown = llm["cooldowns_seconds"].get(name, 0)
+        lines.append(f"Provider {name}: {'configured' if configured else 'not configured'} · cooldown={cooldown}s")
+    lines.append(f"Last AI: {llm.get('last_provider') or '-'} / {llm.get('last_mode') or '-'}")
+    if db_kind == "SQLite":
+        lines.append("SQLite: local storage requires a persistent volume across redeploys")
+    if lms is None:
+        lines.append("LMS: status unavailable (database check failed)")
+    else:
+        lines.append(f"LMS: {'configured' if lms['configured'] else 'not configured'} · last success={lms.get('last_success_at') or '-'}")
+        if lms.get("last_error"):
+            # Older database rows may contain raw exception messages with credentials.
+            lines.append("LMS: last sync failed; check configuration and retry")
+    if counts:
+        lines.append(f"Assignments: {counts['pending']} pending")
     await message.answer("\n".join(lines)[:4096])

@@ -91,11 +91,6 @@ def get_settings() -> Settings:
     nvidia_api_key = os.getenv("NVIDIA_API_KEY", "").strip() or None
     gemini_api_keys = _collect_gemini_api_keys()
 
-    if not (openai_api_key or nvidia_api_key or gemini_api_keys):
-        raise RuntimeError(
-            "No AI provider configured. Set OPENAI_API_KEY, NVIDIA_API_KEY, or GEMINI_API_KEY."
-        )
-
     webapp_url = os.getenv("WEBAPP_URL", "").strip() or None
     fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite").strip() or None
 

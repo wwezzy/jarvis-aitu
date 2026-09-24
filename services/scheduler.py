@@ -9,9 +9,9 @@ from sqlalchemy import select
 
 from config import get_settings
 from database.engine import async_session_factory
-from database.models import Reminder
-from services.assignments import format_deadlines, list_upcoming_assignments, sync_lms_ical
-from services.notifications import claim_notification
+from database.models import Assignment, Reminder, ScheduleEntry
+from services.assignments import list_upcoming_assignments, sync_lms_ical
+from services.notifications import claim_notification, is_dnd, notify_once
 from services.schedule import list_schedule_entries, today_schedule, week_schedule
 
 logger = logging.getLogger(__name__)
@@ -28,15 +28,7 @@ def _notification_trigger(weekday: int, start: str, minutes_before: int) -> tupl
 
 
 async def _in_dnd(user_id: int, now: datetime | None = None) -> bool:
-    local = now or datetime.now(settings.timezone)
-    schedule = await today_schedule(user_id, local)
-    current = next((item for item in schedule["blocks"] if item.get("status") == "current"), None)
-    if not current:
-        return False
-    return (
-        current.get("block_type") == "fixed"
-        or current.get("category") in {"training", "deep_work", "sleep"}
-    )
+    return await is_dnd(user_id, now or datetime.now(settings.timezone))
 
 
 async def send_schedule_notice(
@@ -49,36 +41,26 @@ async def send_schedule_notice(
     minutes_before: int,
 ) -> None:
     local = datetime.now(settings.timezone)
-    event_key = f"schedule:{entry_id}:{local.date().isoformat()}:{minutes_before}"
-    message = (
-        f"⏱ Через {minutes_before // 60} ч\n{start} — {title}"
-        if minutes_before >= 60
-        else f"⏱ Через {minutes_before} мин\n{start} — {title}"
-    )
+    occurrence = local + timedelta(minutes=minutes_before)
+    async with async_session_factory() as db:
+        row = await db.get(ScheduleEntry, entry_id)
+        if (row is None or row.user_id != user_id or not row.enabled or row.start != start
+                or row.title != title or row.category != category
+                or row.weekday != occurrence.weekday() or _smart_schedule_lead(row) != minutes_before):
+            return
+    event_key = f"schedule:{entry_id}:{occurrence.date()}:{start}:{minutes_before}"
+    message = f"⏱ Через {minutes_before} мин\n{start} — {title}"
     if category == "training":
         message += "\nПодготовь форму, воду и оставь время на разминку."
-    if not await claim_notification(
-        user_id, event_key=event_key, kind="schedule", message=message
-    ):
-        return
-    await bot.send_message(user_id, message)
+    await notify_once(bot, user_id, event_key, message, now=local)
 
 
 async def send_saved_reminder(bot: Bot, user_id: int, text: str, reminder_id: int) -> None:
-    event_key = f"reminder:{reminder_id}"
-    if not await claim_notification(
-        user_id,
-        event_key=event_key,
-        kind="reminder",
-        message=text,
-    ):
-        return
-
-    await bot.send_message(user_id, f"🔔 Напоминание\n{text}")
     async with async_session_factory() as db:
-        result = await db.execute(select(Reminder).where(Reminder.id == reminder_id))
-        row = result.scalar_one_or_none()
-        if row is not None:
+        row = await db.get(Reminder, reminder_id)
+        if row is None or row.user_id != user_id or row.is_sent:
+            return
+        if await notify_once(bot, user_id, f"reminder:{reminder_id}", f"🔔 Напоминание\n{row.text}"):
             row.is_sent = True
             await db.commit()
 
@@ -107,22 +89,24 @@ async def restore_pending_reminders(scheduler: AsyncIOScheduler, bot: Bot) -> in
     return len(rows)
 
 
-def _clear_dynamic_schedule_jobs(scheduler: AsyncIOScheduler) -> None:
+def _clear_dynamic_schedule_jobs(scheduler: AsyncIOScheduler, user_id: int) -> None:
     for job in scheduler.get_jobs():
-        if job.id.startswith("schedule:block:"):
+        if job.id.startswith(f"schedule:block:{user_id}:"):
             scheduler.remove_job(job.id)
 
 
 def _smart_schedule_lead(row) -> int | None:
+    if row.notify_before_min is None:
+        return None
     # v3 deliberately does NOT notify for every planned block.
     if row.block_type == "fixed" and row.category == "study":
-        return 60
+        return 60 if row.notify_before_min == 30 else row.notify_before_min
     if row.category == "training" and row.block_type != "flex":
-        return 60
+        return 60 if row.notify_before_min == 30 else row.notify_before_min
 
     # Preserve explicit user-created notifications for genuinely important non-routine blocks,
     # but suppress the old default 30-minute spam for ordinary study/flex/routine blocks.
-    if row.notify_before_min and row.notify_before_min != 30 and row.category not in {
+    if row.notify_before_min is not None and row.notify_before_min != 30 and row.category not in {
         "routine",
         "recovery",
         "nutrition",
@@ -141,7 +125,7 @@ async def sync_schedule_jobs(
     bot: Bot,
     user_id: int,
 ) -> int:
-    _clear_dynamic_schedule_jobs(scheduler)
+    _clear_dynamic_schedule_jobs(scheduler, user_id)
     rows = await list_schedule_entries(user_id)
     count = 0
 
@@ -170,7 +154,7 @@ async def sync_schedule_jobs(
                 row.category,
                 minutes_before,
             ],
-            id=f"schedule:block:{row.id}",
+            id=f"schedule:block:{user_id}:{row.id}",
             replace_existing=True,
             misfire_grace_time=900,
         )
@@ -178,9 +162,9 @@ async def sync_schedule_jobs(
     return count
 
 
-def _clear_assignment_jobs(scheduler: AsyncIOScheduler) -> None:
+def _clear_assignment_jobs(scheduler: AsyncIOScheduler, user_id: int) -> None:
     for job in scheduler.get_jobs():
-        if job.id.startswith("deadline:item:"):
+        if job.id.startswith(f"deadline:item:{user_id}:"):
             scheduler.remove_job(job.id)
 
 
@@ -213,15 +197,13 @@ async def send_assignment_notice(
     due_at: str,
     minutes_before: int,
 ) -> None:
+    async with async_session_factory() as db:
+        row = await db.get(Assignment, assignment_id)
+        if (row is None or row.user_id != user_id or row.status != "pending"
+                or row.due_at is None or row.due_at.isoformat() != due_at):
+            return
+        title, course = row.title, row.course
     event_key = f"deadline:{assignment_id}:{due_at}:{minutes_before}"
-    if not await claim_notification(
-        user_id,
-        event_key=event_key,
-        kind="deadline",
-        message=title,
-    ):
-        return
-
     course_text = f"[{course}] " if course else ""
     if minutes_before >= 1440:
         days = minutes_before // 1440
@@ -231,8 +213,8 @@ async def send_assignment_notice(
     else:
         lead = f"через {minutes_before} мин"
 
-    await bot.send_message(
-        user_id,
+    await notify_once(
+        bot, user_id, event_key,
         f"📚 Дедлайн {lead}\n"
         f"#{assignment_id} · {course_text}{title}\n"
         f"Сдать до {due_at}",
@@ -244,7 +226,7 @@ async def sync_assignment_jobs(
     bot: Bot,
     user_id: int,
 ) -> int:
-    _clear_assignment_jobs(scheduler)
+    _clear_assignment_jobs(scheduler, user_id)
     now = datetime.now(settings.timezone).replace(tzinfo=None)
     items = await list_upcoming_assignments(
         user_id,
@@ -278,10 +260,10 @@ async def sync_assignment_jobs(
                     item["id"],
                     item["title"],
                     item.get("course"),
-                    due_at.strftime("%d.%m %H:%M"),
+                    due_at.isoformat(),
                     minutes_before,
                 ],
-                id=f"deadline:item:{item['id']}:{minutes_before}",
+                id=f"deadline:item:{user_id}:{item['id']}:{minutes_before}",
                 replace_existing=True,
                 misfire_grace_time=1800,
             )

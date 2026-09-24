@@ -7,9 +7,14 @@ from database.models import Base
 import database.notification_models  # noqa: F401  # register v3 notification tables
 
 settings = get_settings()
-DATABASE_URL = settings.database_url
-if DATABASE_URL.startswith("postgresql://"):
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+def normalize_database_url(url: str) -> str:
+    for prefix in ("postgres://", "postgresql://"):
+        if url.startswith(prefix):
+            return "postgresql+asyncpg://" + url[len(prefix):]
+    return url
+
+
+DATABASE_URL = normalize_database_url(settings.database_url)
 
 engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 async_session_factory = async_sessionmaker(engine, expire_on_commit=False)

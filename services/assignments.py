@@ -108,6 +108,7 @@ def parse_ical_events(raw: bytes | str) -> list[dict]:
                 "due_at": due_at,
                 "url": url,
                 "notes": description[:8000] if description else None,
+                "cancelled": str(component.get("status") or "").upper() == "CANCELLED",
             }
         )
 
@@ -184,13 +185,14 @@ async def list_upcoming_assignments(
     include_unknown: bool = True,
     limit: int = 50,
 ) -> list[dict]:
-    local_now = (now or datetime.now(settings.timezone)).replace(tzinfo=None)
+    local_now = _local_naive(now or datetime.now(settings.timezone))
     horizon = local_now + timedelta(days=max(1, days))
 
     async with async_session_factory() as db:
         conditions = [
             Assignment.user_id == user_id,
             Assignment.status == "pending",
+            or_(Assignment.due_at.is_(None), Assignment.due_at <= horizon),
         ]
         if include_unknown:
             conditions.append(or_(Assignment.due_at.is_(None), Assignment.due_at >= local_now - timedelta(days=1)))
@@ -201,7 +203,7 @@ async def list_upcoming_assignments(
         result = await db.execute(
             select(Assignment)
             .where(*conditions)
-            .order_by(Assignment.due_at.asc(), Assignment.id.asc())
+            .order_by(Assignment.due_at.asc().nulls_last(), Assignment.id.asc())
             .limit(max(1, min(limit, 200)))
         )
         rows = list(result.scalars().all())
@@ -322,7 +324,7 @@ async def sync_lms_ical(user_id: int, url: str | None = None) -> dict:
                         course=item["course"],
                         title=item["title"],
                         due_at=due_at,
-                        status="pending",
+                        status="cancelled" if item["cancelled"] else "pending",
                         url=item["url"],
                         notes=item["notes"],
                     )
@@ -338,18 +340,22 @@ async def sync_lms_ical(user_id: int, url: str | None = None) -> dict:
                     row.due_at,
                     row.url,
                     row.notes,
+                    row.status,
                 )
                 row.course = item["course"]
                 row.title = item["title"]
                 row.due_at = due_at
                 row.url = item["url"]
                 row.notes = item["notes"]
+                if item["cancelled"] and row.status != "done":
+                    row.status = "cancelled"
                 after = (
                     row.course,
                     row.title,
                     row.due_at,
                     row.url,
                     row.notes,
+                    row.status,
                 )
                 if before != after:
                     updated += 1
@@ -374,9 +380,9 @@ async def sync_lms_ical(user_id: int, url: str | None = None) -> dict:
             "events_seen": len(parsed),
         }
     except Exception as exc:
-        logger.exception("LMS iCal sync failed")
-        await _update_lms_state(user_id, success=False, error=f"{type(exc).__name__}: {exc}")
-        raise
+        logger.warning("LMS iCal sync failed error=%s", type(exc).__name__)
+        await _update_lms_state(user_id, success=False, error=type(exc).__name__)
+        raise RuntimeError("LMS sync failed; check diagnostics") from None
 
 
 async def lms_status(user_id: int) -> dict:
