@@ -19,7 +19,6 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def _collect_gemini_api_keys() -> tuple[str, ...]:
     values: list[str] = []
-
     primary = os.getenv("GEMINI_API_KEY", "").strip()
     if primary:
         values.append(primary)
@@ -46,10 +45,21 @@ def _collect_gemini_api_keys() -> tuple[str, ...]:
 class Settings:
     bot_token: str
     admin_id: int
-    gemini_api_key: str
+
+    openai_api_key: str | None
+    openai_default_model: str
+    openai_planner_model: str
+    openai_premium_model: str
+    openai_reasoning_effort: str
+
+    nvidia_api_key: str | None
+    nvidia_base_url: str
+    nvidia_model: str
+
     gemini_api_keys: tuple[str, ...]
     gemini_model: str
     gemini_fallback_model: str | None
+
     llm_timeout_seconds: float
     redis_url: str | None
     redis_token: str | None
@@ -70,16 +80,21 @@ class Settings:
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     bot_token = os.getenv("BOT_TOKEN", "").strip()
-    gemini_api_keys = _collect_gemini_api_keys()
-
     if not bot_token:
         raise RuntimeError("BOT_TOKEN is missing")
-    if not gemini_api_keys:
-        raise RuntimeError("At least one Gemini API key is required")
 
     admin_id = int(os.getenv("ADMIN_ID", "0"))
     if admin_id <= 0:
         raise RuntimeError("ADMIN_ID is missing or invalid")
+
+    openai_api_key = os.getenv("OPENAI_API_KEY", "").strip() or None
+    nvidia_api_key = os.getenv("NVIDIA_API_KEY", "").strip() or None
+    gemini_api_keys = _collect_gemini_api_keys()
+
+    if not (openai_api_key or nvidia_api_key or gemini_api_keys):
+        raise RuntimeError(
+            "No AI provider configured. Set OPENAI_API_KEY, NVIDIA_API_KEY, or GEMINI_API_KEY."
+        )
 
     webapp_url = os.getenv("WEBAPP_URL", "").strip() or None
     fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite").strip() or None
@@ -87,7 +102,18 @@ def get_settings() -> Settings:
     return Settings(
         bot_token=bot_token,
         admin_id=admin_id,
-        gemini_api_key=gemini_api_keys[0],
+        openai_api_key=openai_api_key,
+        openai_default_model=os.getenv("OPENAI_DEFAULT_MODEL", "gpt-5.6-luna").strip(),
+        openai_planner_model=os.getenv("OPENAI_PLANNER_MODEL", "gpt-5.6-terra").strip(),
+        openai_premium_model=os.getenv("OPENAI_PREMIUM_MODEL", "gpt-5.6-sol").strip(),
+        openai_reasoning_effort=os.getenv("OPENAI_REASONING_EFFORT", "low").strip(),
+        nvidia_api_key=nvidia_api_key,
+        nvidia_base_url=os.getenv(
+            "NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"
+        ).strip().rstrip("/"),
+        nvidia_model=os.getenv(
+            "NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b"
+        ).strip(),
         gemini_api_keys=gemini_api_keys,
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip(),
         gemini_fallback_model=fallback_model,
