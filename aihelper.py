@@ -5,6 +5,7 @@ import logging
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import BotCommand, MenuButtonWebApp, WebAppInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from upstash_redis.asyncio import Redis as AsyncRedis
@@ -60,13 +61,22 @@ async def configure_bot_ui() -> None:
     )
 
     if settings.webapp_url and settings.webapp_url.startswith("https://"):
-        await bot.set_chat_menu_button(
-            chat_id=settings.admin_id,
-            menu_button=MenuButtonWebApp(
-                text="Jarvis Console",
-                web_app=WebAppInfo(url=f"{settings.webapp_url}/app"),
-            ),
-        )
+        try:
+            await bot.set_chat_menu_button(
+                chat_id=settings.admin_id,
+                menu_button=MenuButtonWebApp(
+                    text="Jarvis Console",
+                    web_app=WebAppInfo(url=f"{settings.webapp_url}/app"),
+                ),
+            )
+        except TelegramBadRequest as exc:
+            # A brand-new staging bot cannot address the admin until the user opens
+            # the chat and presses /start. This must never crash the whole service.
+            logger.warning(
+                "Could not set per-user Telegram menu button yet: %s. "
+                "Open the staging bot and press /start; the bot itself can still run.",
+                exc,
+            )
     elif settings.webapp_url:
         logger.warning("WEBAPP_URL is not HTTPS; Telegram menu button was not configured")
 
