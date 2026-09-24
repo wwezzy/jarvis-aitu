@@ -23,6 +23,7 @@ _PLANNING_WORDS = {
 _SCHEDULE_WORDS = {
     "расписан",
     "что сейчас",
+    "что у меня сейчас",
     "что дальше",
     "следующая пара",
     "следующий блок",
@@ -148,6 +149,8 @@ async def try_direct_answer(user_id: int, text: str, now: datetime | None = None
 
     lowered = text.lower().strip()
     local = now or datetime.now(settings.timezone)
+    if local.tzinfo is not None:
+        local = local.astimezone(settings.timezone)
 
     if any(word in lowered for word in _SLEEP_WORDS):
         return await _sleep_answer(user_id, local)

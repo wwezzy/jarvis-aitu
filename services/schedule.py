@@ -194,7 +194,7 @@ def _validate_clock(value: str, field: str) -> str:
         datetime.strptime(value, "%H:%M")
     except ValueError as exc:
         raise ValueError(f"{field} must use HH:MM") from exc
-    return value
+    return datetime.strptime(value, "%H:%M").strftime("%H:%M")
 
 
 def _validate_entry_payload(payload: dict) -> dict:
@@ -223,7 +223,7 @@ def _validate_entry_payload(payload: dict) -> dict:
         raise ValueError("unsupported block_type")
 
     notify_raw = payload.get("notify_before_min")
-    if notify_raw in (None, "", False):
+    if notify_raw is None or notify_raw == "" or notify_raw is False:
         notify_before_min = None
     else:
         try:

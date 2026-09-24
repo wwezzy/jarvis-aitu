@@ -1,11 +1,12 @@
 import ctypes
 import os
 import time
+from pathlib import Path
 
 from dotenv import load_dotenv
 from upstash_redis import Redis
 
-from services.pc_agent import verify_signed_command
+from services.pc_agent import ReplayGuard, consume_command
 
 load_dotenv()
 
@@ -34,20 +35,19 @@ def start_agent() -> None:
 
     print("Initializing Jarvis Windows agent...")
     redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
+    state_dir = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "Jarvis"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    guard = ReplayGuard(state_dir / "agent-replay.db")
+    backoff = 2
 
     while True:
         try:
-            payload = redis.get(COMMAND_KEY)
-            if payload:
-                redis.delete(COMMAND_KEY)
-                cmd = verify_signed_command(payload, int(ADMIN_ID), PC_AGENT_SECRET)
-                if cmd:
-                    execute_command(cmd)
-                else:
-                    print("Rejected invalid or expired PC command")
+            consume_command(redis, COMMAND_KEY, int(ADMIN_ID), PC_AGENT_SECRET, guard, execute_command)
+            backoff = 2
         except Exception as exc:
             print(f"Agent connection error: {type(exc).__name__}")
-        time.sleep(2)
+            backoff = min(backoff * 2, 60)
+        time.sleep(backoff)
 
 
 if __name__ == "__main__":

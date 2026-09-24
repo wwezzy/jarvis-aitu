@@ -15,7 +15,7 @@ from services.assignments import upsert_assignment_payloads
 from services.direct_intents import try_direct_answer
 from services.llm import extract_actions, generate_reply
 from services.memory import build_memory_context, upsert_memory_updates
-from services.pc_agent import build_signed_command
+from services.pc_agent import build_signed_command, explicit_pc_command
 from services.reflections import upsert_reflection
 from services.scheduler import send_saved_reminder, sync_assignment_jobs
 from services.users import ensure_user
@@ -126,7 +126,7 @@ async def _apply_actions(
         try:
             remind_at = datetime.strptime(payload["remind_at"], "%Y-%m-%d %H:%M:%S")
         except (KeyError, TypeError, ValueError):
-            logger.warning("Skipping invalid reminder payload: %r", payload)
+            logger.warning("Skipping invalid reminder payload")
             continue
 
         text_value = str(payload.get("text") or "Напоминание")[:255]
@@ -155,22 +155,7 @@ async def _apply_actions(
     if created_reminders:
         confirmations.append(f"напоминаний создано: {created_reminders}")
 
-    system_command = actions.get("system_command")
-    if system_command in {"lock", "sleep", "shutdown", "restart"}:
-        if pc_redis is None or not settings.pc_agent_secret:
-            confirmations.append("PC-agent недоступен")
-        else:
-            signed_payload = build_signed_command(
-                system_command,
-                settings.admin_id,
-                settings.pc_agent_secret,
-            )
-            await pc_redis.set(
-                f"jarvis:pc_command:{settings.admin_id}",
-                signed_payload,
-                ex=90,
-            )
-            confirmations.append(f"PC-команда отправлена: {system_command}")
+    # Model output is not authorization to operate the PC.
 
     return confirmations
 
@@ -193,6 +178,18 @@ async def assistant_message(
         now = _local_now()
 
         if file_bytes is None:
+            command = explicit_pc_command(text)
+            if command:
+                if pc_redis is None or not settings.pc_agent_secret:
+                    await status.edit_text("PC-agent unavailable: Redis/PC_AGENT_SECRET is not configured.")
+                else:
+                    await pc_redis.set(
+                        f"jarvis:pc_command:{settings.admin_id}",
+                        build_signed_command(command, settings.admin_id, settings.pc_agent_secret),
+                        ex=90,
+                    )
+                    await status.edit_text(f"Signed PC command queued: {command}.")
+                return
             direct_reply = await try_direct_answer(message.from_user.id, text, now)
             if direct_reply:
                 await status.edit_text(direct_reply[:4096])
@@ -230,12 +227,12 @@ async def assistant_message(
             )
             if confirmations:
                 await message.answer("✅ " + " · ".join(confirmations)[:3900])
-        except Exception:
-            # Side-effect extraction/persistence is intentionally non-fatal in v3.
-            logger.exception("Post-reply action pipeline failed")
+        except Exception as exc:
+            logger.warning("Post-reply action pipeline failed error=%s", type(exc).__name__)
+            await message.answer("Не удалось сохранить все действия. Проверь журнал перед повтором.")
 
     except Exception as exc:
-        logger.exception("Message reply pipeline failed")
+        logger.error("Message reply pipeline failed error=%s", type(exc).__name__)
         await status.edit_text(
             f"Jarvis не смог обработать запрос: {type(exc).__name__}. "
             "Расписание и дедлайны доступны через /today и /deadlines."

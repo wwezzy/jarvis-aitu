@@ -10,3 +10,4 @@ aiosqlite>=0.20
 asyncpg>=0.29
 pydantic>=2.8,<3
 icalendar>=6.1,<7
+tzdata>=2024.1
