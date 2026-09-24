@@ -45,7 +45,7 @@ class AssignmentPayload(BaseModel):
     course: str | None = Field(default=None, description="Course name if known")
     due_at: str | None = Field(
         default=None,
-        description="Local deadline in YYYY-MM-DD HH:MM:SS. Null when the user did not give enough information.",
+        description="Local deadline in YYYY-MM-DD HH:MM:SS. Null when uncertain.",
     )
     url: str | None = None
     notes: str | None = None
@@ -58,8 +58,7 @@ class MemoryUpdate(BaseModel):
     importance: int = Field(default=5, ge=1, le=10)
 
 
-class JarvisResponse(BaseModel):
-    reply: str
+class JarvisActions(BaseModel):
     workout_log: WorkoutLogPayload | None = None
     habit_logs: list[HabitLog] = Field(default_factory=list)
     reflection: ReflectionPayload | None = None
@@ -67,3 +66,8 @@ class JarvisResponse(BaseModel):
     reminders: list[ReminderPayload] = Field(default_factory=list)
     assignments: list[AssignmentPayload] = Field(default_factory=list)
     system_command: Literal["lock", "sleep", "shutdown", "restart"] | None = None
+
+
+class JarvisResponse(JarvisActions):
+    """Legacy compatibility schema. v3 separates user reply from action extraction."""
+    reply: str
