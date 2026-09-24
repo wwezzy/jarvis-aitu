@@ -65,6 +65,9 @@ async def route_command(user_id, text, now):
     lowered = raw.lower()
     command, _, body = raw.partition(" ")
     command = command.split("@")[0].lower()
+    if command == "/study":
+        from services.study import study_command
+        return await study_command(user_id, body, now)
     if command == "/task":
         row = await save_task(user_id, parse_task_command(raw))
         return f"Сохранено задание #{row['id']}: {row['title']}"

@@ -128,8 +128,9 @@ async def _apply_actions(
 
     memory_updates = actions.get("memory_updates") or []
     if memory_updates:
-        await upsert_memory_updates(message.from_user.id, memory_updates)
-        confirmations.append("память обновлена")
+        saved = await upsert_memory_updates(message.from_user.id, memory_updates)
+        if saved:
+            confirmations.append(f"память обновлена: {saved}")
 
     assignments = actions.get("assignments") or []
     if assignments:
@@ -204,7 +205,7 @@ async def assistant_message(
         now = _local_now()
 
         if file_bytes is None:
-            command = explicit_pc_command(text)
+            command = explicit_pc_command(message.text or "")
             if command:
                 if pc_redis is None or not settings.pc_agent_secret:
                     await status.edit_text("PC-agent unavailable: Redis/PC_AGENT_SECRET is not configured.")
@@ -219,7 +220,7 @@ async def assistant_message(
             direct_reply = await try_direct_answer(message.from_user.id, text, now)
             if direct_reply:
                 await status.edit_text(direct_reply[:4096])
-                if text.startswith(("/task ", "/remind ", "/schedule ", "/override ")) or direct_reply.startswith("Сохранено только"):
+                if text.startswith(("/task ", "/remind ", "/schedule ", "/override ", "/study timer")) or direct_reply.startswith("Сохранено только"):
                     await sync_assignment_jobs(scheduler, bot, message.from_user.id)
                     await sync_schedule_jobs(scheduler, bot, message.from_user.id)
                     await restore_pending_reminders(scheduler, bot)
