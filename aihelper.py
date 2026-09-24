@@ -16,6 +16,7 @@ from handlers.assignments import router as assignments_router
 from handlers.assistant import router as assistant_router
 from handlers.gtg import router as gtg_router
 from handlers.memory import router as memory_router
+from handlers.notifications import router as notifications_router
 from handlers.start import router as start_router
 from handlers.workouts import router as workouts_router
 from services.assignments import sync_lms_ical
@@ -38,6 +39,7 @@ dp.include_router(gtg_router)
 dp.include_router(workouts_router)
 dp.include_router(memory_router)
 dp.include_router(assignments_router)
+dp.include_router(notifications_router)
 dp.include_router(assistant_router)
 
 scheduler = AsyncIOScheduler(timezone=settings.timezone)

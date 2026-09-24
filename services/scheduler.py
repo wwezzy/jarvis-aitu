@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from types import SimpleNamespace
 
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -12,8 +13,8 @@ from database.engine import async_session_factory
 from database.models import Assignment, Reminder, ScheduleEntry
 from database.time import aware
 from services.assignments import list_upcoming_assignments, sync_lms_ical
-from services.notifications import claim_notification, is_dnd, notify_once
-from services.schedule import list_schedule_entries, today_schedule, week_schedule
+from services.notifications import is_dnd, notify_once, flush_queued
+from services.schedule import list_schedule_entries, today_schedule, resolve_day
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -43,6 +44,9 @@ async def send_schedule_notice(
 ) -> None:
     local = datetime.now(settings.timezone)
     occurrence = local + timedelta(minutes=minutes_before)
+    effective = await resolve_day(user_id, occurrence.date())
+    if not any(b["id"] == entry_id and b["start"] == start and b["title"] == title for b in effective):
+        return
     async with async_session_factory() as db:
         row = await db.get(ScheduleEntry, entry_id)
         if (row is None or row.user_id != user_id or not row.enabled or row.start != start
@@ -53,7 +57,7 @@ async def send_schedule_notice(
     message = f"⏱ Через {minutes_before} мин\n{start} — {title}"
     if category == "training":
         message += "\nПодготовь форму, воду и оставь время на разминку."
-    await notify_once(bot, user_id, event_key, message, now=local)
+    await notify_once(bot, user_id, event_key, message, now=local, expires_at=occurrence)
 
 
 async def send_saved_reminder(bot: Bot, user_id: int, text: str, reminder_id: int) -> None:
@@ -92,7 +96,7 @@ async def restore_pending_reminders(scheduler: AsyncIOScheduler, bot: Bot) -> in
 
 def _clear_dynamic_schedule_jobs(scheduler: AsyncIOScheduler, user_id: int) -> None:
     for job in scheduler.get_jobs():
-        if job.id.startswith(f"schedule:block:{user_id}:"):
+        if job.id.startswith((f"schedule:block:{user_id}:", f"schedule:dated:{user_id}:")):
             scheduler.remove_job(job.id)
 
 
@@ -160,7 +164,35 @@ async def sync_schedule_jobs(
             misfire_grace_time=900,
         )
         count += 1
+    local = datetime.now(settings.timezone)
+    for offset in range(8):
+        day = local.date() + timedelta(days=offset)
+        for block in await resolve_day(user_id, day):
+            if not block.get("override_id") and isinstance(block["id"], int):
+                continue
+            lead = _smart_schedule_lead(SimpleNamespace(**block))
+            if lead is None:
+                continue
+            occurrence = aware(datetime.combine(day, datetime.strptime(block["start"], "%H:%M").time()))
+            run_at = occurrence - timedelta(minutes=lead)
+            if run_at <= local:
+                continue
+            scheduler.add_job(send_dated_notice, "date", run_date=run_at,
+                args=[bot, user_id, day.isoformat(), block["id"], block["start"], lead],
+                id=f"schedule:dated:{user_id}:{day}:{block['id']}", replace_existing=True, misfire_grace_time=300)
+            count += 1
     return count
+
+
+async def send_dated_notice(bot, user_id, on_date, block_id, start, lead):
+    day = date.fromisoformat(on_date)
+    blocks = await resolve_day(user_id, day)
+    block = next((b for b in blocks if b["id"] == block_id and b["start"] == start), None)
+    if not block or _smart_schedule_lead(SimpleNamespace(**block)) != lead:
+        return
+    occurrence = aware(datetime.combine(day, datetime.strptime(start, "%H:%M").time()))
+    key = f"schedule:{str(block_id).replace(':', '@')}:{day}:{start}:{lead}"
+    await notify_once(bot, user_id, key, f"⏱ Через {lead} мин\n{start} — {block['title']}", expires_at=occurrence)
 
 
 def _clear_assignment_jobs(scheduler: AsyncIOScheduler, user_id: int) -> None:
@@ -218,7 +250,8 @@ async def send_assignment_notice(
         bot, user_id, event_key,
         f"📚 Дедлайн {lead}\n"
         f"#{assignment_id} · {course_text}{title}\n"
-        f"Сдать до {due_at}",
+        f"Сдать до {due_at}", expires_at=aware(datetime.fromisoformat(due_at)),
+        critical=minutes_before <= 180 and row.importance >= 9,
     )
 
 
@@ -273,7 +306,8 @@ async def sync_assignment_jobs(
 
 
 async def send_morning_brief(bot: Bot, user_id: int) -> None:
-    if await _in_dnd(user_id):
+    from services.preferences import get_preferences
+    if not (await get_preferences(user_id)).morning_brief:
         return
 
     local = datetime.now(settings.timezone)
@@ -316,27 +350,17 @@ async def send_morning_brief(bot: Bot, user_id: int) -> None:
 
     event_key = f"brief:morning:{local.date().isoformat()}"
     message = "\n".join(lines)
-    if await claim_notification(
-        user_id,
-        event_key=event_key,
-        kind="morning_brief",
-        message=message,
-    ):
-        await bot.send_message(user_id, message[:4096])
+    await notify_once(bot, user_id, event_key, message)
 
 
 async def send_evening_brief(bot: Bot, user_id: int) -> None:
-    if await _in_dnd(user_id):
+    from services.preferences import get_preferences
+    if not (await get_preferences(user_id)).evening_brief:
         return
 
     local = datetime.now(settings.timezone)
     tomorrow = local.date() + timedelta(days=1)
-    week = await week_schedule(user_id)
-    day = next(
-        (item for item in week["days"] if item["weekday"] == tomorrow.weekday()),
-        None,
-    )
-    blocks = (day or {}).get("blocks") or []
+    blocks = await resolve_day(user_id, tomorrow)
     fixed = [block for block in blocks if block.get("block_type") == "fixed"]
     training = [block for block in blocks if block.get("category") == "training" and block.get("block_type") != "flex"]
 
@@ -361,13 +385,7 @@ async def send_evening_brief(bot: Bot, user_id: int) -> None:
 
     event_key = f"brief:evening:{local.date().isoformat()}"
     message = "\n".join(lines)
-    if await claim_notification(
-        user_id,
-        event_key=event_key,
-        kind="evening_brief",
-        message=message,
-    ):
-        await bot.send_message(user_id, message)
+    await notify_once(bot, user_id, event_key, message)
 
 
 async def sync_lms_and_notify(
@@ -397,6 +415,10 @@ async def register_master_schedule(
     bot: Bot,
     user_id: int,
 ) -> int:
+    scheduler.add_job(flush_queued, "interval", seconds=60, args=[bot, user_id],
+        id=f"notifications:flush:{user_id}", replace_existing=True, max_instances=1, coalesce=True)
+    scheduler.add_job(sync_schedule_jobs, "interval", hours=6, args=[scheduler, bot, user_id],
+        id=f"schedule:refresh:{user_id}", replace_existing=True, max_instances=1, coalesce=True)
     block_jobs = 0
     if settings.enable_master_schedule:
         block_jobs = await sync_schedule_jobs(scheduler, bot, user_id)

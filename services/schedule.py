@@ -418,7 +418,9 @@ async def save_override(user_id: int, on_date: date, entry_id: int | None, chang
         if entry_id and (not entry or entry.user_id != user_id or entry.weekday != on_date.weekday()):
             raise ValueError("Schedule occurrence not found")
         if not cancelled:
-            _validate_entry_payload({**(_row_to_dict(entry) if entry else {}), **changes, "weekday": on_date.weekday()})
+            normalized = _validate_entry_payload({**(_row_to_dict(entry) if entry else {}), **changes, "weekday": on_date.weekday()})
+            if entry is None:
+                changes = normalized
         row = await db.scalar(select(ScheduleOverride).where(ScheduleOverride.user_id == user_id,
             ScheduleOverride.entry_id == entry_id, ScheduleOverride.on_date == on_date)) if entry_id else None
         if row is None:
