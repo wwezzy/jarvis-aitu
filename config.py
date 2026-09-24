@@ -50,6 +50,7 @@ class Settings:
     openai_default_model: str
     openai_planner_model: str
     openai_premium_model: str
+    openai_transcribe_model: str
     openai_reasoning_effort: str
 
     nvidia_api_key: str | None
@@ -101,6 +102,7 @@ def get_settings() -> Settings:
         openai_default_model=os.getenv("OPENAI_DEFAULT_MODEL", "gpt-5.6-luna").strip(),
         openai_planner_model=os.getenv("OPENAI_PLANNER_MODEL", "gpt-5.6-terra").strip(),
         openai_premium_model=os.getenv("OPENAI_PREMIUM_MODEL", "gpt-5.6-sol").strip(),
+        openai_transcribe_model=os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-transcribe").strip(),
         openai_reasoning_effort=os.getenv("OPENAI_REASONING_EFFORT", "low").strip(),
         nvidia_api_key=nvidia_api_key,
         nvidia_base_url=os.getenv(
