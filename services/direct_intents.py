@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 
 from config import get_settings
 from services.assignments import format_deadlines, list_upcoming_assignments
-from services.schedule import DAY_FOCUS, DAY_NAMES_RU, today_schedule, week_schedule
+from services.schedule import DAY_FOCUS, DAY_NAMES_RU, today_schedule
 
 settings = get_settings()
 
@@ -87,63 +87,19 @@ def _clock_text(total_minutes: int) -> str:
 
 
 async def _sleep_answer(user_id: int, local: datetime) -> str:
-    week = await week_schedule(user_id)
-    target_date = local.date() + timedelta(days=1)
-    weekday = target_date.weekday()
-    day = next((item for item in week["days"] if item["weekday"] == weekday), None)
-    blocks = (day or {}).get("blocks") or []
-
-    fixed = [
-        block for block in blocks
-        if block.get("block_type") == "fixed"
-    ]
-    first_fixed = min(fixed, key=lambda item: item["start"]) if fixed else None
-
-    # Prefer a commute block that ends shortly before the first fixed event.
-    commute = None
-    if first_fixed:
-        fixed_start = _minutes(first_fixed["start"])
-        candidates = [
-            block for block in blocks
-            if block.get("category") == "commute"
-            and _minutes(block["end"]) <= fixed_start
-        ]
-        if candidates:
-            commute = max(candidates, key=lambda item: _minutes(item["end"]))
-
-    if first_fixed:
-        anchor = _minutes(commute["start"]) if commute else _minutes(first_fixed["start"]) - 45
-        latest_wake = max(0, anchor - 60)
-        recommended_wake = max(0, latest_wake - 30)
-        event_text = f"{first_fixed['start']} — {first_fixed['title']}"
-    else:
-        # No hard morning constraint: recommend a stable wake window, not an arbitrary cycle target.
-        recommended_wake = 8 * 60 + 30
-        latest_wake = 9 * 60
-        event_text = "жёстких утренних событий нет"
-
-    now_minutes = local.hour * 60 + local.minute
-    sleep_if_recommended = (recommended_wake + 24 * 60 - now_minutes) % (24 * 60)
-    sleep_hours = sleep_if_recommended / 60
-
-    if sleep_hours < 6:
-        note = "До этого времени сна мало; лучше лечь сразу и сократить необязательные утренние дела."
-    elif sleep_hours < 7.5:
-        note = "Сна получится меньше оптимального диапазона; лучше не затягивать отход ко сну."
-    else:
-        note = "Так получится нормальный запас на сон и спокойное утро."
-
-    return (
-        "🌙 На завтра:\n"
-        f"Первое обязательное событие: {event_text}.\n"
-        f"Рекомендованный подъём: около {_clock_text(recommended_wake)} "
-        f"(крайний комфортный — {_clock_text(latest_wake)}).\n"
-        f"{note}\n"
-        "На 90-минутные «циклы» лучше не ориентироваться как на точную формулу — важнее общая длительность сна."
-    )
+    from services.planner import sleep_plan
+    plan = await sleep_plan(user_id, local)
+    event = plan['first_fixed']
+    return (f"На завтра: {event['title'] if event else 'нет обязательных событий'}\n"
+            f"Подъём: {plan['wake_at']}\nЛечь к: {plan['bedtime']}\n"
+            f"Цель сна: {plan['target_hours']} ч; если лечь сейчас: {plan['available_hours']} ч.")
 
 
 async def try_direct_answer(user_id: int, text: str, now: datetime | None = None) -> str | None:
+    from services.commands import route_command
+    routed = await route_command(user_id, text or "", now or datetime.now(settings.timezone))
+    if routed is not None:
+        return routed
     if not text or not _simple_query(text):
         return None
 
@@ -165,12 +121,8 @@ async def try_direct_answer(user_id: int, text: str, now: datetime | None = None
         return None
 
     if "завтра" in lowered:
-        week = await week_schedule(user_id)
         target_date = local.date() + timedelta(days=1)
-        weekday = target_date.weekday()
-        day = next((item for item in week["days"] if item["weekday"] == weekday), None)
-        if day is None:
-            return "На завтра расписание не найдено."
+        day = await today_schedule(user_id, local + timedelta(days=1))
         return _format_day(day, target_date.strftime("%d.%m.%Y"))
 
     today = await today_schedule(user_id, local)

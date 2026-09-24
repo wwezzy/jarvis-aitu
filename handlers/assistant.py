@@ -18,7 +18,7 @@ from services.llm import extract_actions, generate_reply
 from services.memory import build_memory_context, upsert_memory_updates
 from services.pc_agent import build_signed_command, explicit_pc_command
 from services.reflections import upsert_reflection
-from services.scheduler import send_saved_reminder, sync_assignment_jobs
+from services.scheduler import send_saved_reminder, sync_assignment_jobs, sync_schedule_jobs, restore_pending_reminders
 from services.users import ensure_user
 from services.workouts import log_workout
 
@@ -219,6 +219,10 @@ async def assistant_message(
             direct_reply = await try_direct_answer(message.from_user.id, text, now)
             if direct_reply:
                 await status.edit_text(direct_reply[:4096])
+                if text.startswith(("/task ", "/remind ", "/schedule ", "/override ")) or direct_reply.startswith("Сохранено только"):
+                    await sync_assignment_jobs(scheduler, bot, message.from_user.id)
+                    await sync_schedule_jobs(scheduler, bot, message.from_user.id)
+                    await restore_pending_reminders(scheduler, bot)
                 return
 
         memory_context = await build_memory_context(message.from_user.id, text, now)

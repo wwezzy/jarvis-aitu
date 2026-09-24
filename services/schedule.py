@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 from sqlalchemy import delete, func, select
 
 from config import get_settings
 from database.engine import async_session_factory
 from database.models import ScheduleEntry
+from database.time import aware
+from database.v4_models import LmsEvent, PersonalCalendarEvent, ScheduleOverride
 
 settings = get_settings()
 
@@ -233,6 +235,11 @@ def _validate_entry_payload(payload: dict) -> dict:
         if not 0 <= notify_before_min <= 180:
             raise ValueError("notify_before_min must be 0..180")
 
+    extras = {}
+    for key, low, high, default in (("commute_minutes", 0, 240, 0), ("preparation_minutes", 0, 240, 0), ("importance", 1, 10, 5)):
+        extras[key] = int(payload.get(key, default))
+        if not low <= extras[key] <= high:
+            raise ValueError(f"Invalid {key}")
     return {
         "weekday": weekday,
         "start": start,
@@ -241,6 +248,8 @@ def _validate_entry_payload(payload: dict) -> dict:
         "category": category,
         "block_type": block_type,
         "notify_before_min": notify_before_min,
+        "location": str(payload.get("location") or "").strip()[:255] or None,
+        **extras,
     }
 
 
@@ -256,6 +265,11 @@ def _row_to_dict(row: ScheduleEntry, now: datetime | None = None) -> dict:
         "notify_before_min": row.notify_before_min,
         "enabled": row.enabled,
         "sort_order": row.sort_order,
+        "location": row.location,
+        "commute_minutes": row.commute_minutes,
+        "preparation_minutes": row.preparation_minutes,
+        "importance": row.importance,
+        "provenance": row.provenance,
     }
     if now is not None and row.weekday == now.weekday():
         current_time = now.time().replace(tzinfo=None)
@@ -342,8 +356,82 @@ async def today_schedule(user_id: int, now: datetime | None = None) -> dict:
         "weekday": local.weekday(),
         "weekday_name": DAY_NAMES_RU[local.weekday()],
         "focus": DAY_FOCUS[local.weekday()],
-        "blocks": [_row_to_dict(row, local) for row in rows],
+        "blocks": await resolve_day(user_id, local.date(), rows=rows, now=local),
     }
+
+
+async def resolve_day(user_id: int, on_date: date, *, rows=None, now=None) -> list[dict]:
+    rows = rows if rows is not None else await list_schedule_entries(user_id, on_date.weekday())
+    blocks = {row.id: _row_to_dict(row) for row in rows}
+    left = aware(datetime.combine(on_date, time.min))
+    right = left + timedelta(days=1)
+    async with async_session_factory() as db:
+        overrides = list(await db.scalars(select(ScheduleOverride).where(
+            ScheduleOverride.user_id == user_id, ScheduleOverride.on_date == on_date)))
+        lms_events = list(await db.scalars(select(LmsEvent).where(
+            LmsEvent.user_id == user_id, LmsEvent.event_type.in_(["class_event", "attendance"]),
+            LmsEvent.status == "active", LmsEvent.starts_at >= left, LmsEvent.starts_at < right)))
+        personal = list(await db.scalars(select(PersonalCalendarEvent).where(
+            PersonalCalendarEvent.user_id == user_id, PersonalCalendarEvent.starts_at < right,
+            PersonalCalendarEvent.ends_at > left)))
+    for override in overrides:
+        if override.entry_id is not None:
+            if override.cancelled:
+                blocks.pop(override.entry_id, None)
+            elif override.entry_id in blocks:
+                blocks[override.entry_id].update(override.changes, override_id=override.id,
+                                                  provenance=override.provenance)
+        elif not override.cancelled:
+            blocks[f"dated:{override.id}"] = dict(override.changes, id=f"dated:{override.id}",
+                override_id=override.id, provenance=override.provenance)
+    for row in lms_events + personal:
+        start = max(left, row.starts_at)
+        # Unknown class duration remains explicit; use a one-hour planning reserve.
+        end = min(right - timedelta(minutes=1), row.ends_at or start + timedelta(hours=1))
+        identity = f"lms:{row.id}" if isinstance(row, LmsEvent) else f"google:{row.id}"
+        if any(b["title"] == row.title and b["start"] == start.strftime("%H:%M") for b in blocks.values()):
+            continue
+        blocks[identity] = dict(id=identity, start=start.strftime("%H:%M"), end=end.strftime("%H:%M"),
+            title=row.title, category="study" if isinstance(row, LmsEvent) else "flex", block_type="fixed",
+            notify_before_min=60, commute_minutes=0, preparation_minutes=0, importance=5,
+            provenance="LMS" if isinstance(row, LmsEvent) else "Google Calendar",
+            duration_estimated=row.ends_at is None, enabled=True)
+    result = sorted(blocks.values(), key=lambda b: (b["start"], str(b["id"])))
+    for block in result:
+        block["date"] = on_date.isoformat()
+        block["weekday"] = on_date.weekday()
+        block["status"] = "idle"
+        if now and aware(now).date() == on_date:
+            clock = aware(now).strftime("%H:%M")
+            block["status"] = "current" if block["start"] <= clock < block["end"] else "upcoming" if clock < block["start"] else "elapsed"
+    return result
+
+
+async def save_override(user_id: int, on_date: date, entry_id: int | None, changes: dict, *, cancelled=False):
+    if not isinstance(on_date, date):
+        raise ValueError("Invalid override date")
+    allowed = {"start", "end", "title", "category", "block_type", "notify_before_min", "location", "commute_minutes", "preparation_minutes", "importance"}
+    if set(changes) - allowed:
+        raise ValueError("Unsupported override fields")
+    async with async_session_factory() as db:
+        entry = await db.get(ScheduleEntry, entry_id) if entry_id else None
+        if entry_id and (not entry or entry.user_id != user_id or entry.weekday != on_date.weekday()):
+            raise ValueError("Schedule occurrence not found")
+        if not cancelled:
+            _validate_entry_payload({**(_row_to_dict(entry) if entry else {}), **changes, "weekday": on_date.weekday()})
+        row = await db.scalar(select(ScheduleOverride).where(ScheduleOverride.user_id == user_id,
+            ScheduleOverride.entry_id == entry_id, ScheduleOverride.on_date == on_date)) if entry_id else None
+        if row is None:
+            row = ScheduleOverride(user_id=user_id, entry_id=entry_id, on_date=on_date)
+            db.add(row)
+        row.changes, row.cancelled = changes, bool(cancelled)
+        await db.commit()
+        return {"id": row.id, "date": on_date.isoformat(), "entry_id": entry_id, "cancelled": row.cancelled}
+
+
+async def resolved_week(user_id: int, start: date) -> list[dict]:
+    return [{"date": (start + timedelta(days=n)).isoformat(),
+             "blocks": await resolve_day(user_id, start + timedelta(days=n))} for n in range(7)]
 
 
 async def upsert_schedule_entry(user_id: int, payload: dict) -> dict:

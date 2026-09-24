@@ -54,6 +54,7 @@ def no_external_network(monkeypatch):
 
 @pytest_asyncio.fixture
 async def db(monkeypatch, tmp_path):
+    from database import engine as database_engine
     from database.models import Base, User
     from services import assignments, memory, notifications, schedule, scheduler
     from handlers import assistant
@@ -65,6 +66,7 @@ async def db(monkeypatch, tmp_path):
         connection.execute("PRAGMA foreign_keys=ON")
 
     factory = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database_engine, "async_session_factory", factory)
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     async with factory() as session:
