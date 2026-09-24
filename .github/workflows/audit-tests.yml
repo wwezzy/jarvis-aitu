@@ -1,7 +1,7 @@
 name: Jarvis audit tests
 on:
   push:
-    branches: [codex/jarvis-v3-audit]
+    branches: [feat/jarvis-v3, codex/jarvis-v3-audit]
   pull_request:
     branches: [feat/jarvis-v3]
 
