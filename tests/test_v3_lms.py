@@ -24,6 +24,10 @@ def feed(monkeypatch):
     response = Mock()
     response.raise_for_status = Mock()
     response.read = AsyncMock(return_value=calendar(event()))
+    response.content_length = None
+    async def chunks(_):
+        yield await response.read()
+    response.content.iter_chunked = chunks
     response_context = AsyncMock()
     response_context.__aenter__.return_value = response
     session = Mock()
@@ -117,11 +121,10 @@ async def test_deadline_query_converts_utc_to_local(db):
     assert result == []
 
 
-@pytest.mark.acceptance_gap
-@pytest.mark.xfail(strict=True, reason="Issue #3: feed disappearance has no deletion reconciliation/window contract")
 async def test_deleted_lms_event_stops_being_pending(db, feed):
     await assignments.sync_lms_ical(42, "offline-feed")
-    feed.read.return_value = calendar()
-    await assignments.sync_lms_ical(42, "offline-feed")
+    feed.read.return_value = calendar().replace(b"VERSION:2.0", b"VERSION:2.0\r\nX-JARVIS-WINDOW-START:2099-01-01T00:00:00+05:00\r\nX-JARVIS-WINDOW-END:2099-02-01T00:00:00+05:00")
+    for _ in range(3):
+        await assignments.sync_lms_ical(42, "offline-feed")
     async with db() as session:
         assert (await session.scalar(select(Assignment))).status == "cancelled"

@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import hashlib
 import logging
-import re
 from datetime import date, datetime, time, timedelta
 
 import aiohttp
-from icalendar import Calendar
 from sqlalchemy import or_, select
 
 from config import get_settings
@@ -17,7 +14,6 @@ from database.time import aware
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-_URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 
 
 def _local_naive(value: date | datetime) -> datetime:
@@ -46,73 +42,24 @@ def _serialize(row: Assignment) -> dict:
         "status": row.status,
         "url": row.url,
         "notes": row.notes,
+        "details": row.notes,
+        "estimated_minutes": row.estimated_minutes,
+        "progress": row.progress,
+        "importance": row.importance,
+        "risk": row.risk,
+        "consequence": row.consequence,
+        "preparation_minutes": row.preparation_minutes,
+        "testing_buffer_minutes": row.testing_buffer_minutes,
+        "provenance": row.provenance,
+        "confidence": row.confidence,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }
 
 
 def parse_ical_events(raw: bytes | str) -> list[dict]:
-    """Parse a Moodle-compatible iCal feed into normalized upcoming calendar events."""
-    calendar = Calendar.from_ical(raw)
-    events: list[dict] = []
-
-    for component in calendar.walk():
-        if component.name != "VEVENT":
-            continue
-
-        summary = str(component.get("summary") or "").strip()
-        if not summary:
-            continue
-
-        dt_value: date | datetime | None = None
-        for key in ("dtstart", "dtend"):
-            prop = component.get(key)
-            if prop is not None:
-                try:
-                    candidate = prop.dt
-                except AttributeError:
-                    candidate = None
-                if candidate is not None:
-                    dt_value = candidate
-                    if key == "dtstart":
-                        break
-        if dt_value is None:
-            continue
-
-        due_at = _local_naive(dt_value)
-        uid = str(component.get("uid") or "").strip()
-        if not uid:
-            uid = hashlib.sha256(f"{summary}|{due_at.isoformat()}".encode("utf-8")).hexdigest()
-
-        categories = component.get("categories")
-        course: str | None = None
-        if categories is not None:
-            cats = getattr(categories, "cats", None)
-            if cats:
-                course = ", ".join(str(item) for item in cats if str(item).strip()) or None
-            else:
-                text = str(categories).strip()
-                course = text or None
-
-        description = str(component.get("description") or "").strip()
-        url = str(component.get("url") or "").strip() or None
-        if not url and description:
-            match = _URL_RE.search(description)
-            if match:
-                url = match.group(0).rstrip(").,;")
-
-        events.append(
-            {
-                "external_id": uid[:255],
-                "course": course[:180] if course else None,
-                "title": summary[:255],
-                "due_at": due_at,
-                "url": url,
-                "notes": description[:8000] if description else None,
-                "cancelled": str(component.get("status") or "").upper() == "CANCELLED",
-            }
-        )
-
-    events.sort(key=lambda item: item["due_at"])
-    return events
+    from services.lms import snapshot
+    return snapshot(raw)[0]
 
 
 async def upsert_assignment_payloads(
@@ -227,6 +174,15 @@ async def mark_assignment_done(user_id: int, assignment_id: int) -> dict:
         if row is None:
             raise ValueError("assignment not found")
         row.status = "done"
+        row.progress = 100
+        from sqlalchemy import update
+        from database.v4_models import NotificationDelivery, LmsEvent
+        await db.execute(update(NotificationDelivery).where(
+            NotificationDelivery.task_id == row.id, NotificationDelivery.user_id == user_id,
+            NotificationDelivery.status == "queued").values(status="cancelled"))
+        if row.source == "lms_ical":
+            await db.execute(update(LmsEvent).where(LmsEvent.user_id == user_id,
+                LmsEvent.external_uid == row.external_id).values(status="done"))
         await db.commit()
         await db.refresh(row)
         return _serialize(row)
@@ -289,95 +245,30 @@ async def sync_lms_ical(user_id: int, url: str | None = None) -> dict:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(feed_url, allow_redirects=True) as response:
                 response.raise_for_status()
-                raw = await response.read()
+                from services.lms import MAX_FEED_BYTES
+                if response.content_length and response.content_length > MAX_FEED_BYTES:
+                    raise ValueError("LMS feed exceeds limit")
+                raw = bytearray()
+                async for chunk in response.content.iter_chunked(65536):
+                    raw.extend(chunk)
+                    if len(raw) > MAX_FEED_BYTES:
+                        raise ValueError("LMS feed exceeds limit")
+                raw = bytes(raw)
 
-        parsed = parse_ical_events(raw)
+        from services.lms import snapshot, reconcile
+        parsed, window = snapshot(raw)
         now = datetime.now(settings.timezone)
-        lower_bound = now - timedelta(days=2)
-
-        created = 0
-        updated = 0
-        unchanged = 0
-        changed: list[dict] = []
-
         async with async_session_factory() as db:
-            for item in parsed:
-                due_at = item["due_at"]
-                if due_at < lower_bound:
-                    continue
-
-                result = await db.execute(
-                    select(Assignment).where(
-                        Assignment.user_id == user_id,
-                        Assignment.source == "lms_ical",
-                        Assignment.external_id == item["external_id"],
-                    )
-                )
-                row = result.scalar_one_or_none()
-
-                if row is None:
-                    row = Assignment(
-                        user_id=user_id,
-                        source="lms_ical",
-                        external_id=item["external_id"],
-                        course=item["course"],
-                        title=item["title"],
-                        due_at=due_at,
-                        status="cancelled" if item["cancelled"] else "pending",
-                        url=item["url"],
-                        notes=item["notes"],
-                    )
-                    db.add(row)
-                    await db.flush()
-                    created += 1
-                    changed.append(_serialize(row))
-                    continue
-
-                before = (
-                    row.course,
-                    row.title,
-                    row.due_at,
-                    row.url,
-                    row.notes,
-                    row.status,
-                )
-                row.course = item["course"]
-                row.title = item["title"]
-                row.due_at = due_at
-                row.url = item["url"]
-                row.notes = item["notes"]
-                if item["cancelled"] and row.status != "done":
-                    row.status = "cancelled"
-                after = (
-                    row.course,
-                    row.title,
-                    row.due_at,
-                    row.url,
-                    row.notes,
-                    row.status,
-                )
-                if before != after:
-                    updated += 1
-                    changed.append(_serialize(row))
-                else:
-                    unchanged += 1
-
+            result = await reconcile(db, user_id, parsed, window, now, _serialize)
+            state = await db.get(LmsSyncState, user_id)
+            if state is None:
+                state = LmsSyncState(user_id=user_id)
+                db.add(state)
+            state.last_attempt_at = state.last_success_at = now
+            state.last_error = None
+            state.last_created, state.last_updated = result['created'], result['updated']
             await db.commit()
-
-        await _update_lms_state(
-            user_id,
-            success=True,
-            created=created,
-            updated=updated,
-        )
-        return {
-            "configured": True,
-            "created": created,
-            "updated": updated,
-            "unchanged": unchanged,
-            "changed": changed[:20],
-            "events_seen": len(parsed),
-        }
+        return result
     except Exception as exc:
         logger.warning("LMS iCal sync failed error=%s", type(exc).__name__)
         await _update_lms_state(user_id, success=False, error=type(exc).__name__)
