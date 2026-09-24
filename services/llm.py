@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from upstash_redis.asyncio import Redis
 
 from config import get_settings
+from services.attachments import UnsupportedAttachment, openai_file_supported
 from services.schemas import JarvisActions
 
 logger = logging.getLogger(__name__)
@@ -202,7 +203,13 @@ def _choose_openai_model(text: str) -> tuple[str, str]:
     return settings.openai_default_model, settings.openai_reasoning_effort
 
 
-def _openai_input(history: list[dict], user_text: str, file_bytes: bytes | None, mime_type: str | None) -> list[dict]:
+def _openai_input(
+    history: list[dict],
+    user_text: str,
+    file_bytes: bytes | None,
+    mime_type: str | None,
+    filename: str | None,
+) -> list[dict]:
     items: list[dict] = []
     for item in history[-RECENT_HISTORY_MESSAGES:]:
         role = item.get("role")
@@ -210,22 +217,36 @@ def _openai_input(history: list[dict], user_text: str, file_bytes: bytes | None,
         if role in {"user", "assistant"} and isinstance(body, str) and body:
             items.append({"role": role, "content": body})
 
-    if file_bytes and mime_type and mime_type.startswith("image/"):
-        encoded = base64.b64encode(file_bytes).decode("ascii")
-        items.append(
+    if not file_bytes:
+        items.append({"role": "user", "content": user_text})
+        return items
+
+    mime = mime_type or "application/octet-stream"
+    encoded = base64.b64encode(file_bytes).decode("ascii")
+    content: list[dict] = [{"type": "input_text", "text": user_text}]
+
+    if mime.startswith("image/"):
+        content.append(
             {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": user_text},
-                    {
-                        "type": "input_image",
-                        "image_url": f"data:{mime_type};base64,{encoded}",
-                    },
-                ],
+                "type": "input_image",
+                "image_url": f"data:{mime};base64,{encoded}",
             }
         )
+    elif openai_file_supported(mime, filename):
+        file_item: dict = {
+            "type": "input_file",
+            "filename": filename or "attachment",
+            "file_data": f"data:{mime};base64,{encoded}",
+        }
+        if mime == "application/pdf":
+            file_item["detail"] = "low"
+        content.append(file_item)
     else:
-        items.append({"role": "user", "content": user_text})
+        raise UnsupportedAttachment(
+            f"OpenAI file input does not support {mime or filename or 'this attachment'}"
+        )
+
+    items.append({"role": "user", "content": content})
     return items
 
 
@@ -236,12 +257,13 @@ async def _openai_reply(
     system_instruction: str,
     file_bytes: bytes | None,
     mime_type: str | None,
+    filename: str | None,
 ) -> tuple[str, str]:
     if not settings.openai_api_key:
         raise RuntimeError("OpenAI is not configured")
 
     model, effort = _choose_openai_model(user_text)
-    input_items = _openai_input(history, user_text, file_bytes, mime_type)
+    input_items = _openai_input(history, user_text, file_bytes, mime_type, filename)
     async with AsyncOpenAI(api_key=settings.openai_api_key, timeout=settings.llm_timeout_seconds,
                            max_retries=0) as client:
         response = await asyncio.wait_for(client.responses.create(
@@ -346,6 +368,7 @@ async def generate_reply(
     memory_context: str,
     file_bytes: bytes | None = None,
     mime_type: str | None = None,
+    filename: str | None = None,
 ) -> str:
     user_text = text or "Проанализируй вложение и выполни запрос пользователя."
     history = await get_chat_history(user_id)
@@ -361,7 +384,9 @@ async def generate_reply(
             break
         try:
             if provider == "openai" and settings.openai_api_key and (
-                not file_bytes or (mime_type or "").startswith("image/")
+                not file_bytes
+                or (mime_type or "").startswith("image/")
+                or openai_file_supported(mime_type, filename)
             ):
                 reply, model = await asyncio.wait_for(_openai_reply(
                     history=history,
@@ -369,6 +394,7 @@ async def generate_reply(
                     system_instruction=system_instruction,
                     file_bytes=file_bytes,
                     mime_type=mime_type,
+                    filename=filename,
                 ), timeout=min(settings.llm_timeout_seconds, max(0, deadline - time.monotonic())))
             elif provider == "nvidia" and settings.nvidia_api_key and not file_bytes:
                 reply, model = await asyncio.wait_for(_nvidia_reply(
