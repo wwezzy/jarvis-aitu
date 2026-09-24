@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from config import get_settings
 from database.models import Base
+import database.notification_models  # noqa: F401  # register v3 notification tables
 
 settings = get_settings()
 DATABASE_URL = settings.database_url
