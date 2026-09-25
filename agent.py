@@ -44,9 +44,10 @@ def execute_command(cmd):
     if cmd == "lock":
         if not ctypes.windll.user32.LockWorkStation():
             raise OSError("LockWorkStation failed")
-    elif cmd == "sleep":
-        if not ctypes.windll.PowrProf.SetSuspendState(0, 0, 0):
-            raise OSError("SetSuspendState failed")
+    elif cmd == "hibernate":
+        executable = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32" / "shutdown.exe"
+        subprocess.run([str(executable), "/h"],
+                       shell=False, check=True, timeout=15, capture_output=True)
     elif cmd in {"shutdown", "restart"}:
         executable = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32" / "shutdown.exe"
         subprocess.run([str(executable), "/s" if cmd == "shutdown" else "/r", "/t", "10"],
@@ -97,7 +98,7 @@ class Agent:
         self.publish()
         try:
             self.execute(command)
-            self.record(command, nonce, "scheduled" if command in {"shutdown", "restart"} else "completed")
+            self.record(command, nonce, "scheduled" if command in {"hibernate", "shutdown", "restart"} else "completed")
         except Exception as exc:
             self.record(command, nonce, "failed", type(exc).__name__)
         self.publish()
