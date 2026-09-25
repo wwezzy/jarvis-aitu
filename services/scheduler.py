@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from types import SimpleNamespace
 
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -10,9 +11,10 @@ from sqlalchemy import select
 from config import get_settings
 from database.engine import async_session_factory
 from database.models import Assignment, Reminder, ScheduleEntry
+from database.time import aware
 from services.assignments import list_upcoming_assignments, sync_lms_ical
-from services.notifications import claim_notification, is_dnd, notify_once
-from services.schedule import list_schedule_entries, today_schedule, week_schedule
+from services.notifications import is_dnd, notify_once, flush_queued
+from services.schedule import list_schedule_entries, today_schedule, resolve_day
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -42,6 +44,9 @@ async def send_schedule_notice(
 ) -> None:
     local = datetime.now(settings.timezone)
     occurrence = local + timedelta(minutes=minutes_before)
+    effective = await resolve_day(user_id, occurrence.date())
+    if not any(b["id"] == entry_id and b["start"] == start and b["title"] == title for b in effective):
+        return
     async with async_session_factory() as db:
         row = await db.get(ScheduleEntry, entry_id)
         if (row is None or row.user_id != user_id or not row.enabled or row.start != start
@@ -52,7 +57,7 @@ async def send_schedule_notice(
     message = f"⏱ Через {minutes_before} мин\n{start} — {title}"
     if category == "training":
         message += "\nПодготовь форму, воду и оставь время на разминку."
-    await notify_once(bot, user_id, event_key, message, now=local)
+    await notify_once(bot, user_id, event_key, message, now=local, expires_at=occurrence)
 
 
 async def send_saved_reminder(bot: Bot, user_id: int, text: str, reminder_id: int) -> None:
@@ -66,12 +71,12 @@ async def send_saved_reminder(bot: Bot, user_id: int, text: str, reminder_id: in
 
 
 async def restore_pending_reminders(scheduler: AsyncIOScheduler, bot: Bot) -> int:
-    now = datetime.now(settings.timezone).replace(tzinfo=None)
+    now = datetime.now(settings.timezone)
     async with async_session_factory() as db:
         result = await db.execute(
             select(Reminder).where(
                 Reminder.is_sent.is_(False),
-                Reminder.remind_at > now,
+                Reminder.remind_at > now - timedelta(days=1),
             )
         )
         rows = result.scalars().all()
@@ -80,7 +85,7 @@ async def restore_pending_reminders(scheduler: AsyncIOScheduler, bot: Bot) -> in
         scheduler.add_job(
             send_saved_reminder,
             "date",
-            run_date=row.remind_at,
+            run_date=max(row.remind_at, now + timedelta(seconds=1)),
             args=[bot, row.user_id, row.text, row.id],
             id=f"reminder:{row.id}",
             replace_existing=True,
@@ -91,12 +96,12 @@ async def restore_pending_reminders(scheduler: AsyncIOScheduler, bot: Bot) -> in
 
 def _clear_dynamic_schedule_jobs(scheduler: AsyncIOScheduler, user_id: int) -> None:
     for job in scheduler.get_jobs():
-        if job.id.startswith(f"schedule:block:{user_id}:"):
+        if job.id.startswith((f"schedule:block:{user_id}:", f"schedule:dated:{user_id}:")):
             scheduler.remove_job(job.id)
 
 
 def _smart_schedule_lead(row) -> int | None:
-    if row.notify_before_min is None:
+    if row.notify_before_min is None or row.block_type == "flex":
         return None
     # v3 deliberately does NOT notify for every planned block.
     if row.block_type == "fixed" and row.category == "study":
@@ -159,7 +164,35 @@ async def sync_schedule_jobs(
             misfire_grace_time=900,
         )
         count += 1
+    local = datetime.now(settings.timezone)
+    for offset in range(8):
+        day = local.date() + timedelta(days=offset)
+        for block in await resolve_day(user_id, day):
+            if not block.get("override_id") and isinstance(block["id"], int):
+                continue
+            lead = _smart_schedule_lead(SimpleNamespace(**block))
+            if lead is None:
+                continue
+            occurrence = aware(datetime.combine(day, datetime.strptime(block["start"], "%H:%M").time()))
+            run_at = occurrence - timedelta(minutes=lead)
+            if run_at <= local:
+                continue
+            scheduler.add_job(send_dated_notice, "date", run_date=run_at,
+                args=[bot, user_id, day.isoformat(), block["id"], block["start"], lead],
+                id=f"schedule:dated:{user_id}:{day}:{block['id']}", replace_existing=True, misfire_grace_time=300)
+            count += 1
     return count
+
+
+async def send_dated_notice(bot, user_id, on_date, block_id, start, lead):
+    day = date.fromisoformat(on_date)
+    blocks = await resolve_day(user_id, day)
+    block = next((b for b in blocks if b["id"] == block_id and b["start"] == start), None)
+    if not block or _smart_schedule_lead(SimpleNamespace(**block)) != lead:
+        return
+    occurrence = aware(datetime.combine(day, datetime.strptime(start, "%H:%M").time()))
+    key = f"schedule:{str(block_id).replace(':', '@')}:{day}:{start}:{lead}"
+    await notify_once(bot, user_id, key, f"⏱ Через {lead} мин\n{start} — {block['title']}", expires_at=occurrence)
 
 
 def _clear_assignment_jobs(scheduler: AsyncIOScheduler, user_id: int) -> None:
@@ -183,7 +216,7 @@ def _assignment_leads(item: dict) -> tuple[int, ...]:
         "сро",
         "бөж",
     )
-    if any(marker in title for marker in large_markers):
+    if item.get('risk', 0) >= 65 or item.get('importance', 5) >= 8 or any(marker in title for marker in large_markers):
         return (4320, 1440, 180)  # 3 days, 24h, 3h
     return (1440, 180)
 
@@ -200,10 +233,10 @@ async def send_assignment_notice(
     async with async_session_factory() as db:
         row = await db.get(Assignment, assignment_id)
         if (row is None or row.user_id != user_id or row.status != "pending"
-                or row.due_at is None or row.due_at.isoformat() != due_at):
+                or row.due_at is None or row.due_at != aware(datetime.fromisoformat(due_at))):
             return
         title, course = row.title, row.course
-    event_key = f"deadline:{assignment_id}:{due_at}:{minutes_before}"
+    event_key = f"deadline:{assignment_id}:{aware(datetime.fromisoformat(due_at)).isoformat()}:{minutes_before}"
     course_text = f"[{course}] " if course else ""
     if minutes_before >= 1440:
         days = minutes_before // 1440
@@ -217,7 +250,8 @@ async def send_assignment_notice(
         bot, user_id, event_key,
         f"📚 Дедлайн {lead}\n"
         f"#{assignment_id} · {course_text}{title}\n"
-        f"Сдать до {due_at}",
+        f"Сдать до {due_at}", expires_at=aware(datetime.fromisoformat(due_at)),
+        critical=minutes_before <= 180 and row.importance >= 9,
     )
 
 
@@ -227,7 +261,7 @@ async def sync_assignment_jobs(
     user_id: int,
 ) -> int:
     _clear_assignment_jobs(scheduler, user_id)
-    now = datetime.now(settings.timezone).replace(tzinfo=None)
+    now = datetime.now(settings.timezone)
     items = await list_upcoming_assignments(
         user_id,
         now=now.replace(tzinfo=settings.timezone),
@@ -242,7 +276,7 @@ async def sync_assignment_jobs(
         if not due_text:
             continue
         try:
-            due_at = datetime.fromisoformat(due_text)
+            due_at = aware(datetime.fromisoformat(due_text))
         except ValueError:
             continue
 
@@ -272,7 +306,8 @@ async def sync_assignment_jobs(
 
 
 async def send_morning_brief(bot: Bot, user_id: int) -> None:
-    if await _in_dnd(user_id):
+    from services.preferences import get_preferences
+    if not (await get_preferences(user_id)).morning_brief:
         return
 
     local = datetime.now(settings.timezone)
@@ -315,27 +350,17 @@ async def send_morning_brief(bot: Bot, user_id: int) -> None:
 
     event_key = f"brief:morning:{local.date().isoformat()}"
     message = "\n".join(lines)
-    if await claim_notification(
-        user_id,
-        event_key=event_key,
-        kind="morning_brief",
-        message=message,
-    ):
-        await bot.send_message(user_id, message[:4096])
+    await notify_once(bot, user_id, event_key, message)
 
 
 async def send_evening_brief(bot: Bot, user_id: int) -> None:
-    if await _in_dnd(user_id):
+    from services.preferences import get_preferences
+    if not (await get_preferences(user_id)).evening_brief:
         return
 
     local = datetime.now(settings.timezone)
     tomorrow = local.date() + timedelta(days=1)
-    week = await week_schedule(user_id)
-    day = next(
-        (item for item in week["days"] if item["weekday"] == tomorrow.weekday()),
-        None,
-    )
-    blocks = (day or {}).get("blocks") or []
+    blocks = await resolve_day(user_id, tomorrow)
     fixed = [block for block in blocks if block.get("block_type") == "fixed"]
     training = [block for block in blocks if block.get("category") == "training" and block.get("block_type") != "flex"]
 
@@ -360,13 +385,7 @@ async def send_evening_brief(bot: Bot, user_id: int) -> None:
 
     event_key = f"brief:evening:{local.date().isoformat()}"
     message = "\n".join(lines)
-    if await claim_notification(
-        user_id,
-        event_key=event_key,
-        kind="evening_brief",
-        message=message,
-    ):
-        await bot.send_message(user_id, message)
+    await notify_once(bot, user_id, event_key, message)
 
 
 async def sync_lms_and_notify(
@@ -379,6 +398,8 @@ async def sync_lms_and_notify(
     try:
         result = await sync_lms_ical(user_id)
         assignment_jobs = await sync_assignment_jobs(scheduler, bot, user_id)
+        if settings.enable_master_schedule:
+            await sync_schedule_jobs(scheduler, bot, user_id)
         logger.info(
             "LMS sync complete: created=%s updated=%s events=%s deadline_jobs=%s",
             result.get("created"),
@@ -396,8 +417,14 @@ async def register_master_schedule(
     bot: Bot,
     user_id: int,
 ) -> int:
+    scheduler.add_job(flush_queued, "interval", seconds=60, args=[bot, user_id],
+        id=f"notifications:flush:{user_id}", replace_existing=True, max_instances=1, coalesce=True)
+    scheduler.add_job(send_quiz_open_notices, 'interval', minutes=5, args=[bot, user_id],
+        id=f'quiz:open:{user_id}', replace_existing=True, max_instances=1, coalesce=True)
     block_jobs = 0
     if settings.enable_master_schedule:
+        scheduler.add_job(sync_schedule_jobs, "interval", hours=6, args=[scheduler, bot, user_id],
+            id=f"schedule:refresh:{user_id}", replace_existing=True, max_instances=1, coalesce=True)
         block_jobs = await sync_schedule_jobs(scheduler, bot, user_id)
 
         # Two useful summaries replace the old GTG/reflection/detox spam.
@@ -438,4 +465,34 @@ async def register_master_schedule(
             misfire_grace_time=600,
         )
 
+    from services.calendar import configured
+    if configured():
+        scheduler.add_job(sync_google_calendar, 'interval', minutes=30, args=[scheduler, bot, user_id],
+            id='google:sync', replace_existing=True, max_instances=1, coalesce=True)
+
     return block_jobs
+
+
+async def sync_google_calendar(scheduler, bot, user_id):
+    from services.calendar import sync_calendar
+    try:
+        await sync_calendar(user_id)
+        if settings.enable_master_schedule:
+            await sync_schedule_jobs(scheduler, bot, user_id)
+    except Exception as exc:
+        logger.warning('Calendar sync failed error=%s', type(exc).__name__)
+
+
+async def send_quiz_open_notices(bot, user_id):
+    from services.preferences import get_preferences
+    from database.v4_models import LmsEvent
+    if not (await get_preferences(user_id)).quiz_open_notices:
+        return
+    now = datetime.now(settings.timezone)
+    async with async_session_factory() as db:
+        rows = list(await db.scalars(select(LmsEvent).where(LmsEvent.user_id == user_id,
+            LmsEvent.event_type == 'quiz_open', LmsEvent.status == 'active',
+            LmsEvent.starts_at <= now, LmsEvent.starts_at > now - timedelta(hours=1)).limit(10)))
+    for row in rows:
+        await notify_once(bot, user_id, f'quizopen:{row.id}:{row.starts_at.isoformat()}',
+            f'Quiz открыт: {row.title}. Закрытие смотри в /deadlines.', expires_at=row.starts_at + timedelta(hours=1))

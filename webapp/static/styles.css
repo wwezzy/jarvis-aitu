@@ -183,3 +183,9 @@ textarea { resize: vertical; }
   .set-row .technique { grid-column: 1 / 4; }
   .set-row .remove-set { grid-column: 4; grid-row: 2; justify-self: end; }
 }
+
+.tabs { display: flex; overflow-x: auto; flex-wrap: nowrap; }
+.tab { flex: 1 0 auto; white-space: nowrap; padding: 10px 12px; }
+.diagnostics { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+#v4Week details > div { padding: 8px 0; display: flex; flex-wrap: wrap; gap: 8px; justify-content: space-between; }
+@media (max-width: 380px) { .two-col { grid-template-columns: 1fr; } }

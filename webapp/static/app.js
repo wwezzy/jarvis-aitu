@@ -33,7 +33,9 @@
       const text = await response.text();
       throw new Error(text || `HTTP ${response.status}`);
     }
-    return response.json();
+    const data = await response.json();
+    if (options.method && options.method !== "GET") window.dispatchEvent(new CustomEvent("jarvis:changed", {detail: {origin: "base"}}));
+    return data;
   }
 
   function node(tag, className, text) {
@@ -427,7 +429,8 @@
 
   $("refreshBtn").addEventListener("click", () => loadDashboard());
 
+  window.addEventListener("jarvis:changed", event => { if (event.detail?.origin !== "base") loadDashboard(); });
   const initial = location.hash.replace("#", "");
-  if (["dashboard", "schedule", "workout", "reflection", "memory"].includes(initial)) setView(initial);
+  if (["dashboard", "schedule", "workout", "reflection", "memory", "tasks", "settings"].includes(initial)) setView(initial);
   loadDashboard(false);
 })();

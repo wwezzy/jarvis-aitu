@@ -8,7 +8,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import BotCommand, MenuButtonWebApp, WebAppInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from upstash_redis.asyncio import Redis as AsyncRedis
+from services.redis_backend import create_redis
 
 from config import get_settings
 from database.engine import init_db
@@ -16,6 +16,7 @@ from handlers.assignments import router as assignments_router
 from handlers.assistant import router as assistant_router
 from handlers.gtg import router as gtg_router
 from handlers.memory import router as memory_router
+from handlers.notifications import router as notifications_router
 from handlers.start import router as start_router
 from handlers.workouts import router as workouts_router
 from services.assignments import sync_lms_ical
@@ -24,11 +25,10 @@ from services.scheduler import register_master_schedule, restore_pending_reminde
 from services.users import ensure_user
 from webapp.server import create_web_app
 
+from services.observability import configure_logging
+
 settings = get_settings()
-logging.basicConfig(
-    level=getattr(logging, settings.log_level, logging.INFO),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
+configure_logging(getattr(logging, settings.log_level, logging.INFO))
 logger = logging.getLogger("jarvis")
 
 bot = Bot(token=settings.bot_token)
@@ -38,13 +38,11 @@ dp.include_router(gtg_router)
 dp.include_router(workouts_router)
 dp.include_router(memory_router)
 dp.include_router(assignments_router)
+dp.include_router(notifications_router)
 dp.include_router(assistant_router)
 
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
-pc_redis: AsyncRedis | None = None
-if settings.redis_url and settings.redis_token:
-    pc_redis = AsyncRedis(url=settings.redis_url, token=settings.redis_token)
-
+pc_redis = create_redis()
 
 async def configure_bot_ui() -> None:
     await bot.set_my_commands(

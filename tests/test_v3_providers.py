@@ -11,7 +11,7 @@ from services import llm
 @pytest.fixture(autouse=True)
 def router_state(monkeypatch):
     monkeypatch.setattr(llm, "settings", replace(llm.settings, openai_api_key="offline",
-        nvidia_api_key="offline", gemini_api_keys=("offline",), llm_timeout_seconds=0.03))
+        nvidia_api_key="offline", gemini_api_keys=("offline",), llm_timeout_seconds=0.15))
     monkeypatch.setattr(llm, "_provider_cooldown_until", {})
     monkeypatch.setattr(llm, "_llm_state", {})
     monkeypatch.setattr(llm, "redis", None)

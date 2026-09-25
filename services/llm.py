@@ -14,10 +14,12 @@ from google import genai
 from google.genai import types as gemini_types
 from openai import AsyncOpenAI
 from pydantic import ValidationError
-from upstash_redis.asyncio import Redis
+from services.redis_backend import create_redis
 
 from config import get_settings
+from services.attachments import UnsupportedAttachment, openai_file_supported
 from services.schemas import JarvisActions
+from services.telemetry import observe, last_call
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -25,9 +27,7 @@ settings = get_settings()
 RECENT_HISTORY_MESSAGES = 20
 HISTORY_TTL_SECONDS = 60 * 60 * 24 * 30
 
-redis: Redis | None = None
-if settings.redis_url and settings.redis_token:
-    redis = Redis(url=settings.redis_url, token=settings.redis_token)
+redis = create_redis()
 
 _provider_cooldown_until: dict[str, float] = {}
 _llm_state: dict[str, object | None] = {
@@ -202,7 +202,21 @@ def _choose_openai_model(text: str) -> tuple[str, str]:
     return settings.openai_default_model, settings.openai_reasoning_effort
 
 
-def _openai_input(history: list[dict], user_text: str, file_bytes: bytes | None, mime_type: str | None) -> list[dict]:
+def _openai_input(
+    history: list[dict],
+    user_text: str,
+    file_bytes: bytes | None,
+    mime_type: str | None,
+    filename: str | None,
+    attachments: list | None = None,
+) -> list[dict]:
+    if attachments:
+        result = _openai_input(history, user_text, None, None, None)
+        content = [{"type": "input_text", "text": user_text}]
+        for file in attachments:
+            content.extend(_openai_input([], "", file.data, file.mime_type, file.filename)[-1]["content"][1:])
+        result[-1]["content"] = content
+        return result
     items: list[dict] = []
     for item in history[-RECENT_HISTORY_MESSAGES:]:
         role = item.get("role")
@@ -210,22 +224,36 @@ def _openai_input(history: list[dict], user_text: str, file_bytes: bytes | None,
         if role in {"user", "assistant"} and isinstance(body, str) and body:
             items.append({"role": role, "content": body})
 
-    if file_bytes and mime_type and mime_type.startswith("image/"):
-        encoded = base64.b64encode(file_bytes).decode("ascii")
-        items.append(
+    if not file_bytes:
+        items.append({"role": "user", "content": user_text})
+        return items
+
+    mime = mime_type or "application/octet-stream"
+    encoded = base64.b64encode(file_bytes).decode("ascii")
+    content: list[dict] = [{"type": "input_text", "text": user_text}]
+
+    if mime.startswith("image/"):
+        content.append(
             {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": user_text},
-                    {
-                        "type": "input_image",
-                        "image_url": f"data:{mime_type};base64,{encoded}",
-                    },
-                ],
+                "type": "input_image",
+                "image_url": f"data:{mime};base64,{encoded}",
             }
         )
+    elif openai_file_supported(mime, filename):
+        file_item: dict = {
+            "type": "input_file",
+            "filename": filename or "attachment",
+            "file_data": f"data:{mime};base64,{encoded}",
+        }
+        if mime == "application/pdf":
+            file_item["detail"] = "low"
+        content.append(file_item)
     else:
-        items.append({"role": "user", "content": user_text})
+        raise UnsupportedAttachment(
+            f"OpenAI file input does not support {mime or filename or 'this attachment'}"
+        )
+
+    items.append({"role": "user", "content": content})
     return items
 
 
@@ -236,18 +264,20 @@ async def _openai_reply(
     system_instruction: str,
     file_bytes: bytes | None,
     mime_type: str | None,
+    filename: str | None = None,
+    attachments: list | None = None,
 ) -> tuple[str, str]:
-    if not settings.openai_api_key:
+    if not settings.openai_api_key or not settings.openai_default_model:
         raise RuntimeError("OpenAI is not configured")
 
     model, effort = _choose_openai_model(user_text)
-    input_items = _openai_input(history, user_text, file_bytes, mime_type)
+    input_items = _openai_input(history, user_text, file_bytes, mime_type, filename, attachments)
     async with AsyncOpenAI(api_key=settings.openai_api_key, timeout=settings.llm_timeout_seconds,
                            max_retries=0) as client:
-        response = await asyncio.wait_for(client.responses.create(
+        response = await observe("openai", model, "reply", asyncio.wait_for(client.responses.create(
             model=model, instructions=system_instruction, input=input_items,
             reasoning={"effort": effort},
-        ), timeout=settings.llm_timeout_seconds)
+        ), timeout=settings.llm_timeout_seconds), input_text=system_instruction + user_text)
     text = (response.output_text or "").strip()
     if not text:
         raise ValueError("OpenAI returned an empty response")
@@ -260,7 +290,7 @@ async def _nvidia_reply(
     user_text: str,
     system_instruction: str,
 ) -> tuple[str, str]:
-    if not settings.nvidia_api_key:
+    if not settings.nvidia_api_key or not settings.nvidia_model:
         raise RuntimeError("NVIDIA is not configured")
 
     messages: list[dict] = [{"role": "system", "content": system_instruction}]
@@ -273,68 +303,59 @@ async def _nvidia_reply(
 
     async with AsyncOpenAI(api_key=settings.nvidia_api_key, base_url=settings.nvidia_base_url,
                            timeout=settings.llm_timeout_seconds, max_retries=0) as client:
-        response = await asyncio.wait_for(client.chat.completions.create(
+        response = await observe("nvidia", settings.nvidia_model, "reply", asyncio.wait_for(client.chat.completions.create(
             model=settings.nvidia_model, messages=messages, temperature=0.3, max_tokens=2200,
-        ), timeout=settings.llm_timeout_seconds)
+        ), timeout=settings.llm_timeout_seconds), input_text=system_instruction + user_text)
     text = (response.choices[0].message.content or "").strip()
     if not text:
         raise ValueError("NVIDIA returned an empty response")
     return text, settings.nvidia_model
 
 
-async def _gemini_reply(
-    *,
-    history: list[dict],
-    user_text: str,
-    system_instruction: str,
-    file_bytes: bytes | None,
-    mime_type: str | None,
-) -> tuple[str, str]:
-    if not settings.gemini_api_keys:
-        raise RuntimeError("Gemini is not configured")
+async def _gemini_generate(contents, config, capability, input_text):
+    last_exc = None
+    models = list(dict.fromkeys(m for m in (settings.gemini_model, settings.gemini_fallback_model) if m))
+    for model in models:
+        for index, api_key in enumerate(settings.gemini_api_keys):
+            circuit = f"gemini:{index}:{model}"
+            if not _provider_available(circuit):
+                continue
+            try:
+                client = genai.Client(api_key=api_key)
+                async with client.aio as async_client:
+                    response = await observe("gemini", model, capability, asyncio.wait_for(
+                        async_client.models.generate_content(model=model, contents=contents, config=config),
+                        timeout=settings.llm_timeout_seconds), input_text=input_text)
+                if not response.text or not response.text.strip():
+                    raise ValueError("Gemini returned an empty response")
+                _provider_cooldown_until.pop(circuit, None)
+                return response, model
+            except Exception as exc:
+                last_exc = exc
+                _provider_cooldown_until[circuit] = time.monotonic() + _cooldown_seconds(exc)
+                logger.warning("Gemini request failed error=%s", type(exc).__name__)
+    raise last_exc or RuntimeError("No Gemini key/model available")
 
-    last_exc: Exception | None = None
-    for api_key in settings.gemini_api_keys:
-        try:
-            client = genai.Client(api_key=api_key)
-            contents: list[gemini_types.Content] = []
-            for item in history[-RECENT_HISTORY_MESSAGES:]:
-                role = item.get("role")
-                body = item.get("text")
-                if role in {"user", "assistant"} and isinstance(body, str) and body:
-                    gemini_role = "model" if role == "assistant" else "user"
-                    contents.append(
-                        gemini_types.Content(
-                            role=gemini_role,
-                            parts=[gemini_types.Part.from_text(text=body)],
-                        )
-                    )
-            parts: list[gemini_types.Part] = []
-            if file_bytes and mime_type:
-                parts.append(gemini_types.Part.from_bytes(data=file_bytes, mime_type=mime_type))
-            parts.append(gemini_types.Part.from_text(text=user_text))
-            contents.append(gemini_types.Content(role="user", parts=parts))
 
-            async with client.aio as async_client:
-                response = await asyncio.wait_for(
-                    async_client.models.generate_content(
-                        model=settings.gemini_model,
-                        contents=contents,
-                        config=gemini_types.GenerateContentConfig(
-                            system_instruction=system_instruction,
-                        ),
-                    ),
-                    timeout=settings.llm_timeout_seconds,
-                )
-            text = (response.text or "").strip()
-            if not text:
-                raise ValueError("Gemini returned an empty response")
-            return text, settings.gemini_model
-        except Exception as exc:
-            last_exc = exc
-            logger.warning("Gemini fallback key failed: %s", type(exc).__name__)
-
-    raise last_exc or RuntimeError("Gemini fallback failed")
+async def _gemini_reply(*, history, user_text, system_instruction, file_bytes, mime_type, attachments=None):
+    contents = []
+    for item in history[-RECENT_HISTORY_MESSAGES:]:
+        role, body = item.get("role"), item.get("text")
+        if role in {"user", "assistant"} and isinstance(body, str) and body:
+            contents.append(gemini_types.Content(role="model" if role == "assistant" else "user",
+                parts=[gemini_types.Part.from_text(text=body)]))
+    parts = []
+    for file in attachments or []:
+        if file.mime_type != "application/pdf" and not file.mime_type.startswith("image/"):
+            raise UnsupportedAttachment("Gemini does not support this native document")
+        parts.append(gemini_types.Part.from_bytes(data=file.data, mime_type=file.mime_type))
+    if file_bytes and mime_type:
+        parts.append(gemini_types.Part.from_bytes(data=file_bytes, mime_type=mime_type))
+    parts.append(gemini_types.Part.from_text(text=user_text))
+    contents.append(gemini_types.Content(role="user", parts=parts))
+    response, model = await _gemini_generate(contents,
+        gemini_types.GenerateContentConfig(system_instruction=system_instruction), "reply", system_instruction + user_text)
+    return response.text.strip(), model
 
 
 async def generate_reply(
@@ -346,6 +367,8 @@ async def generate_reply(
     memory_context: str,
     file_bytes: bytes | None = None,
     mime_type: str | None = None,
+    filename: str | None = None,
+    attachments: list | None = None,
 ) -> str:
     user_text = text or "Проанализируй вложение и выполни запрос пользователя."
     history = await get_chat_history(user_id)
@@ -360,8 +383,10 @@ async def generate_reply(
         if time.monotonic() >= deadline:
             break
         try:
-            if provider == "openai" and settings.openai_api_key and (
-                not file_bytes or (mime_type or "").startswith("image/")
+            if provider == "openai" and settings.openai_api_key and settings.openai_default_model and (
+                not file_bytes
+                or (mime_type or "").startswith("image/")
+                or openai_file_supported(mime_type, filename)
             ):
                 reply, model = await asyncio.wait_for(_openai_reply(
                     history=history,
@@ -369,20 +394,23 @@ async def generate_reply(
                     system_instruction=system_instruction,
                     file_bytes=file_bytes,
                     mime_type=mime_type,
+                    filename=filename,
+                    attachments=attachments,
                 ), timeout=min(settings.llm_timeout_seconds, max(0, deadline - time.monotonic())))
-            elif provider == "nvidia" and settings.nvidia_api_key and not file_bytes:
+            elif provider == "nvidia" and settings.nvidia_api_key and settings.nvidia_model and not file_bytes and not attachments:
                 reply, model = await asyncio.wait_for(_nvidia_reply(
                     history=history,
                     user_text=user_text,
                     system_instruction=system_instruction,
                 ), timeout=min(settings.llm_timeout_seconds, max(0, deadline - time.monotonic())))
-            elif provider == "gemini" and settings.gemini_api_keys:
+            elif provider == "gemini" and settings.gemini_api_keys and settings.gemini_model:
                 reply, model = await asyncio.wait_for(_gemini_reply(
                     history=history,
                     user_text=user_text,
                     system_instruction=system_instruction,
                     file_bytes=file_bytes,
                     mime_type=mime_type,
+                    attachments=attachments,
                 ), timeout=min(settings.llm_timeout_seconds, max(0, deadline - time.monotonic())))
             else:
                 continue
@@ -399,7 +427,8 @@ async def generate_reply(
             logger.warning("Reply provider failed provider=%s error=%s", provider, type(exc).__name__)
             _mark_failure(provider, exc)
 
-    debug_id = uuid.uuid4().hex[:8]
+    from services.observability import correlation_id
+    debug_id = correlation_id.get() if correlation_id.get() != "startup" else uuid.uuid4().hex[:8]
     final_exc = RuntimeError(" | ".join(errors[-4:]) or "no configured AI provider available")
     _mark_failure("all", final_exc, debug_id=debug_id)
     logger.error("Jarvis AI reply pipeline failed [%s]: %s", debug_id, " | ".join(errors))
@@ -430,16 +459,16 @@ async def _extract_actions_impl(
         f"ASSISTANT REPLY:\n{reply}"
     )
 
-    if settings.openai_api_key and _provider_available("openai"):
+    if settings.openai_api_key and settings.openai_default_model and _provider_available("openai"):
         try:
             async with AsyncOpenAI(api_key=settings.openai_api_key,
                                    timeout=settings.llm_timeout_seconds, max_retries=0) as client:
-                response = await asyncio.wait_for(client.responses.parse(
+                response = await observe("openai", settings.openai_default_model, "extraction", asyncio.wait_for(client.responses.parse(
                     model=settings.openai_default_model,
                     input=[{"role": "developer", "content": instruction},
                            {"role": "user", "content": extraction_input}],
                     text_format=JarvisActions,
-                ), timeout=settings.llm_timeout_seconds)
+                ), timeout=settings.llm_timeout_seconds), input_text=extraction_input)
             parsed = response.output_parsed
             if parsed is not None:
                 _mark_success("openai", settings.openai_default_model, "action_extraction")
@@ -448,30 +477,18 @@ async def _extract_actions_impl(
             logger.warning("OpenAI action extraction failed: %s", type(exc).__name__)
             _mark_failure("openai", exc)
 
-    if settings.gemini_api_keys and _provider_available("gemini"):
-        for api_key in settings.gemini_api_keys:
-            try:
-                client = genai.Client(api_key=api_key)
-                async with client.aio as async_client:
-                    response = await asyncio.wait_for(
-                        async_client.models.generate_content(
-                            model=settings.gemini_model,
-                            contents=extraction_input,
-                            config=gemini_types.GenerateContentConfig(
-                                system_instruction=instruction,
-                                response_mime_type="application/json",
-                                response_json_schema=JarvisActions.model_json_schema(),
-                            ),
-                        ),
-                        timeout=settings.llm_timeout_seconds,
-                    )
-                if response.text:
-                    parsed = JarvisActions.model_validate_json(response.text)
-                    _mark_success("gemini", settings.gemini_model, "action_extraction")
-                    return parsed.model_dump()
-            except Exception as exc:
-                logger.warning("Gemini action extraction failed: %s", type(exc).__name__)
-                _mark_failure("gemini", exc)
+    if settings.gemini_api_keys and settings.gemini_model and _provider_available("gemini"):
+        try:
+            response, model = await _gemini_generate(extraction_input,
+                gemini_types.GenerateContentConfig(system_instruction=instruction,
+                    response_mime_type="application/json", response_json_schema=JarvisActions.model_json_schema()),
+                "extraction", extraction_input)
+            parsed = JarvisActions.model_validate_json(response.text)
+            _mark_success("gemini", model, "action_extraction")
+            return parsed.model_dump()
+        except Exception as exc:
+            logger.warning("Gemini action extraction failed error=%s", type(exc).__name__)
+            _mark_failure("gemini", exc)
 
     return JarvisActions().model_dump()
 
@@ -494,9 +511,9 @@ def get_llm_diagnostics() -> dict:
     }
     return {
         "providers": {
-            "openai": bool(settings.openai_api_key),
-            "nvidia": bool(settings.nvidia_api_key),
-            "gemini": bool(settings.gemini_api_keys),
+            "openai": bool(settings.openai_api_key and settings.openai_default_model),
+            "nvidia": bool(settings.nvidia_api_key and settings.nvidia_model),
+            "gemini": bool(settings.gemini_api_keys and settings.gemini_model),
         },
         "models": {
             "openai_default": settings.openai_default_model,
@@ -507,5 +524,6 @@ def get_llm_diagnostics() -> dict:
         },
         "cooldowns_seconds": cooling,
         "timeout_seconds": settings.llm_timeout_seconds,
+        "last_call": dict(last_call),
         **_llm_state,
     }

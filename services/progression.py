@@ -16,9 +16,11 @@ def double_progression_recommendation(
     reps = [int(item["reps"]) for item in working]
     rir_values = [float(item["rir"]) for item in working if item.get("rir") is not None]
     target_rir = 2.0 if main_lift else 1.0
+    if any(item.get("technique_ok") is False for item in working):
+        return {"action": "hold_or_reduce", "reason": "Reported form breakdown; restore technique before adding load"}
 
     if all(reps_value >= rep_max for reps_value in reps) and (
-        not rir_values or min(rir_values) >= target_rir
+        len(rir_values) == len(working) and min(rir_values) >= target_rir
     ):
         return {
             "action": "increase_load",

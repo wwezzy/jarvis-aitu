@@ -16,6 +16,7 @@ async def test_diag_reports_database_failure_instead_of_crashing(monkeypatch):
 
 async def test_diag_does_not_echo_legacy_lms_error(monkeypatch):
     context = AsyncMock()
+    context.__aenter__.return_value.execute.return_value = SimpleNamespace(all=lambda: [])
     monkeypatch.setattr(assignments, "async_session_factory", Mock(return_value=context))
     monkeypatch.setattr(assignments, "lms_status", AsyncMock(return_value={
         "configured": True, "last_error": "PRIVATE_OLD_ERROR",

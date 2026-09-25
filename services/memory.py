@@ -3,16 +3,16 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update as sql_update
 from sqlalchemy.orm import selectinload
 
 from database.engine import async_session_factory
+from database.time import aware, utcnow
 from database.models import (
     Assignment,
     DailyReflection,
     GTGSet,
     MemoryFact,
-    ScheduleEntry,
     Workout,
     WorkoutSession,
 )
@@ -36,7 +36,7 @@ _DAY_NAMES = (
 def _tokens(text: str) -> set[str]:
     return {
         token.lower()
-        for token in re.findall(r"[A-Za-zА-Яа-яЁё0-9_+-]{3,}", text or "")
+        for token in re.findall(r"[\w+-]{3,}", text or "")
         if token.lower() not in _STOP
     }
 
@@ -59,9 +59,10 @@ def merge_preferences(existing: str | None, new_text: str | None) -> str | None:
     return f"{existing.rstrip()}\n{clean}"[-12000:]
 
 
-async def upsert_memory_updates(user_id: int, updates: list[dict]) -> None:
+async def upsert_memory_updates(user_id: int, updates: list[dict]) -> int:
     if not updates:
-        return
+        return 0
+    saved = 0
     async with async_session_factory() as db:
         for update in updates[:30]:
             key = str(update.get("key") or "").strip()[:120]
@@ -78,7 +79,16 @@ async def upsert_memory_updates(user_id: int, updates: list[dict]) -> None:
             row.category = str(update.get("category") or "other")[:50]
             row.value = value
             row.importance = max(1, min(int(update.get("importance") or 5), 10))
+            confidence = float(update.get("confidence", 1.0))
+            if not 0 <= confidence <= 1:
+                raise ValueError("confidence must be 0..1")
+            row.confidence = confidence
+            row.provenance = str(update.get("provenance") or "user statement")[:120]
+            expiry = update.get("expires_at")
+            row.expires_at = aware(datetime.fromisoformat(expiry)) if expiry else None
+            saved += 1
         await db.commit()
+    return saved
 
 
 async def list_memory_facts(user_id: int, limit: int = 30) -> list[dict]:
@@ -97,22 +107,48 @@ async def list_memory_facts(user_id: int, limit: int = 30) -> list[dict]:
             "key": row.key,
             "value": row.value,
             "importance": row.importance,
+            "confidence": row.confidence,
+            "provenance": row.provenance,
+            "created_at": row.created_at.isoformat(),
+            "expires_at": row.expires_at.isoformat() if row.expires_at else None,
+            "last_used_at": row.last_used_at.isoformat() if row.last_used_at else None,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }
         for row in rows
     ]
 
 
+async def delete_memory(user_id: int, memory_id: int):
+    async with async_session_factory() as db:
+        row = await db.get(MemoryFact, memory_id)
+        if row is None or row.user_id != user_id:
+            raise ValueError("Memory not found")
+        await db.delete(row)
+        await db.commit()
+
+
+async def correct_memory(user_id: int, memory_id: int, value: str):
+    if not value.strip() or len(value) > 8000:
+        raise ValueError("Memory value must contain 1..8000 characters")
+    async with async_session_factory() as db:
+        row = await db.get(MemoryFact, memory_id)
+        if row is None or row.user_id != user_id:
+            raise ValueError("Memory not found")
+        row.value, row.confidence, row.provenance, row.expires_at = value.strip(), 1.0, "user correction", None
+        await db.commit()
+
+
 async def build_memory_context(user_id: int, query: str, now: datetime) -> str:
     query_tokens = _tokens(query)
-    local_now = now.replace(tzinfo=None)
+    local_now = aware(now)
     week_start = local_now - timedelta(days=7)
     assignment_horizon = local_now + timedelta(days=30)
 
     async with async_session_factory() as db:
         memory_result = await db.execute(
             select(MemoryFact)
-            .where(MemoryFact.user_id == user_id)
+            .where(MemoryFact.user_id == user_id,
+                   or_(MemoryFact.expires_at.is_(None), MemoryFact.expires_at > local_now))
             .order_by(MemoryFact.importance.desc(), MemoryFact.updated_at.desc())
             .limit(100)
         )
@@ -150,20 +186,6 @@ async def build_memory_context(user_id: int, query: str, now: datetime) -> str:
         )
         gtg_rows = gtg_result.scalars().all()
 
-        schedule_result = await db.execute(
-            select(ScheduleEntry)
-            .where(
-                ScheduleEntry.user_id == user_id,
-                ScheduleEntry.enabled.is_(True),
-            )
-            .order_by(
-                ScheduleEntry.weekday.asc(),
-                ScheduleEntry.start.asc(),
-                ScheduleEntry.sort_order.asc(),
-            )
-        )
-        schedule_rows = list(schedule_result.scalars().all())
-
         assignment_result = await db.execute(
             select(Assignment)
             .where(
@@ -188,6 +210,17 @@ async def build_memory_context(user_id: int, query: str, now: datetime) -> str:
         key=lambda row: (_lexical_score(query_tokens, f"{row.category} {row.key} {row.value}"), row.importance),
         reverse=True,
     )[:18]
+    from services.semantic import semantic_ids
+    related_ids = await semantic_ids(query, [{"id": r.id, "key": r.key, "value": r.value} for r in memory_rows])
+    for row in memory_rows:
+        if row.id in related_ids and row not in ranked_memories:
+            ranked_memories.append(row)
+    ranked_memories = ranked_memories[:18]
+    if ranked_memories:
+        async with async_session_factory() as db:
+            await db.execute(sql_update(MemoryFact).where(MemoryFact.user_id == user_id,
+                MemoryFact.id.in_([r.id for r in ranked_memories])).values(last_used_at=utcnow(), updated_at=MemoryFact.updated_at))
+            await db.commit()
 
     def session_text(row: WorkoutSession) -> str:
         details = " | ".join(
@@ -208,22 +241,19 @@ async def build_memory_context(user_id: int, query: str, now: datetime) -> str:
 
     parts: list[str] = []
 
-    if schedule_rows:
-        by_weekday: dict[int, list[ScheduleEntry]] = {weekday: [] for weekday in range(7)}
-        for row in schedule_rows:
-            by_weekday[row.weekday].append(row)
+    day_sections: list[str] = []
+    for offset in range(7):
+        target = local_now.date() + timedelta(days=offset)
+        from services.schedule import resolve_day
+        rows = await resolve_day(user_id, target)
+        label = f"{target.isoformat()} {_DAY_NAMES[target.weekday()]}"
+        block_lines = [
+            f"  - {row['start']}-{row['end']} {row['title']} ({row['block_type']}/{row['category']})"
+            for row in rows
+        ]
+        day_sections.append(label + ("\n" + "\n".join(block_lines) if block_lines else "\n  - no blocks"))
+    parts.append("UPCOMING 7-DAY SCHEDULE:\n" + "\n".join(day_sections))
 
-        day_sections: list[str] = []
-        for offset in range(7):
-            target = local_now.date() + timedelta(days=offset)
-            rows = by_weekday[target.weekday()]
-            label = f"{target.isoformat()} {_DAY_NAMES[target.weekday()]}"
-            block_lines = [
-                f"  - {row.start}-{row.end} {row.title} ({row.block_type}/{row.category})"
-                for row in rows
-            ]
-            day_sections.append(label + ("\n" + "\n".join(block_lines) if block_lines else "\n  - no blocks"))
-        parts.append("UPCOMING 7-DAY SCHEDULE:\n" + "\n".join(day_sections))
 
     if assignment_rows:
         deadline_lines: list[str] = []
@@ -238,7 +268,7 @@ async def build_memory_context(user_id: int, query: str, now: datetime) -> str:
     if ranked_memories:
         parts.append(
             "PERSISTENT FACTS:\n"
-            + "\n".join(f"- [{row.category}] {row.key}: {row.value}" for row in ranked_memories)
+            + "\n".join(f"- [{row.category}; confidence={row.confidence}; source={row.provenance}] {row.key}: {row.value}" for row in ranked_memories)
         )
 
     if selected_sessions:
@@ -270,4 +300,9 @@ async def build_memory_context(user_id: int, query: str, now: datetime) -> str:
             )
         )
 
+    if any(word in query.lower() for word in ("study", "учеб", "защит", "defense", "quiz", "explain")):
+        from services.study import study_context
+        topics = await study_context(user_id)
+        if topics:
+            parts.append("STUDY (self-reported, not verified mastery):\n" + str(topics))
     return "\n\n".join(parts) if parts else "No durable user data stored yet."

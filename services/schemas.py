@@ -23,6 +23,7 @@ class WorkoutLogPayload(BaseModel):
     title: str = "Workout"
     sets: list[WorkoutSetPayload] = Field(default_factory=list)
     notes: str | None = None
+    performed_evidence: str | None = Field(default=None, description="Exact USER quote reporting completed sets, never a proposed workout")
 
 
 class ReflectionPayload(BaseModel):
@@ -49,6 +50,7 @@ class AssignmentPayload(BaseModel):
     )
     url: str | None = None
     notes: str | None = None
+    deadline_evidence: str | None = Field(default=None, description="Exact USER quote containing this task and an explicit deadline clock time; null for vague or date-only statements")
 
 
 class MemoryUpdate(BaseModel):
@@ -56,6 +58,8 @@ class MemoryUpdate(BaseModel):
     key: str = Field(description="Stable concise identifier")
     value: str
     importance: int = Field(default=5, ge=1, le=10)
+    confidence: float = Field(default=0.8, ge=0, le=1)
+    provenance: str = "user message"
 
 
 class JarvisActions(BaseModel):

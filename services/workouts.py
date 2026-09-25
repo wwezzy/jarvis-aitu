@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import math
 from datetime import datetime
 from typing import Any
 
@@ -9,12 +10,15 @@ from sqlalchemy.orm import selectinload
 
 from database.engine import async_session_factory
 from database.models import ExerciseSet, WorkoutSession
+from database.time import aware, utcnow
 
 
 def _clean_float(value: Any, *, minimum: float | None = None, maximum: float | None = None) -> float | None:
     if value is None or value == "":
         return None
     parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("value must be finite")
     if minimum is not None and parsed < minimum:
         raise ValueError(f"value must be >= {minimum}")
     if maximum is not None and parsed > maximum:
@@ -51,8 +55,8 @@ async def log_workout(
     session_row = WorkoutSession(
         user_id=user_id,
         title=clean_title,
-        started_at=started_at or datetime.now(),
-        completed_at=datetime.now(),
+        started_at=aware(started_at) if started_at else utcnow(),
+        completed_at=utcnow(),
         notes=(notes or "").strip()[:4000] or None,
         source=source[:32],
     )
@@ -68,8 +72,8 @@ async def log_workout(
         weight_kg = _clean_float(raw.get("weight_kg"), minimum=0, maximum=2000)
         rir = _clean_float(raw.get("rir"), minimum=0, maximum=10)
         technique_ok = raw.get("technique_ok")
-        if technique_ok is not None:
-            technique_ok = bool(technique_ok)
+        if technique_ok is not None and type(technique_ok) is not bool:
+            raise ValueError("technique_ok must be boolean or null")
 
         session_row.sets.append(
             ExerciseSet(

@@ -150,7 +150,7 @@ async def test_model_pc_output_cannot_queue_commands(monkeypatch, message):
 
     monkeypatch.setattr(assistant, "generate_reply", AsyncMock(return_value="Visible answer"))
     monkeypatch.setattr(assistant, "extract_actions", AsyncMock(return_value={"system_command": "shutdown"}))
-    redis = SimpleNamespace(set=AsyncMock())
+    redis = SimpleNamespace(set=AsyncMock(), get=AsyncMock(return_value=None))
     await assistant.assistant_message(message, Mock(), Mock(), redis)
     redis.set.assert_not_awaited()
 
@@ -164,7 +164,7 @@ async def test_explicit_pc_command_works_without_ai(monkeypatch, message):
     monkeypatch.setattr(assistant, "ensure_user", AsyncMock())
     parse = AsyncMock(side_effect=AssertionError("No AI for PC commands"))
     monkeypatch.setattr(assistant, "generate_reply", parse)
-    redis = SimpleNamespace(set=AsyncMock())
+    redis = SimpleNamespace(set=AsyncMock(return_value=True), get=AsyncMock(return_value=None))
     await assistant.assistant_message(message, Mock(), Mock(), redis)
     parse.assert_not_awaited()
     assert verify_signed_command(redis.set.call_args.args[1], 42, "test-only") == "lock"

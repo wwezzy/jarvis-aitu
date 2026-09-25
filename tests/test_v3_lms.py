@@ -5,6 +5,7 @@ import pytest
 from sqlalchemy import select
 
 from database.models import Assignment, LmsSyncState
+from database.time import aware
 from services import assignments
 
 
@@ -23,6 +24,10 @@ def feed(monkeypatch):
     response = Mock()
     response.raise_for_status = Mock()
     response.read = AsyncMock(return_value=calendar(event()))
+    response.content_length = None
+    async def chunks(_):
+        yield await response.read()
+    response.content.iter_chunked = chunks
     response_context = AsyncMock()
     response_context.__aenter__.return_value = response
     session = Mock()
@@ -35,9 +40,9 @@ def feed(monkeypatch):
 
 def test_ical_timezone_and_all_day_deadline():
     parsed = assignments.parse_ical_events(calendar(event()))
-    assert parsed[0]["due_at"] == datetime(2099, 1, 8, 15)
+    assert parsed[0]["due_at"] == aware(datetime(2099, 1, 8, 15))
     all_day = event().replace("DTSTART:20990108T100000Z", "DTSTART;VALUE=DATE:20990108")
-    assert assignments.parse_ical_events(calendar(all_day))[0]["due_at"] == datetime(2099, 1, 8, 23, 59)
+    assert assignments.parse_ical_events(calendar(all_day))[0]["due_at"] == aware(datetime(2099, 1, 8, 23, 59))
 
 
 async def test_lms_import_update_idempotency_and_completion_preserved(db, feed):
@@ -54,7 +59,7 @@ async def test_lms_import_update_idempotency_and_completion_preserved(db, feed):
         rows = (await session.scalars(select(Assignment))).all()
         assert len(rows) == 1 and rows[0].status == "done"
         assert rows[0].title == "Revised assignment" and rows[0].course == "New semester subject"
-        assert rows[0].due_at == datetime(2099, 1, 9, 15)
+        assert rows[0].due_at == aware(datetime(2099, 1, 9, 15))
 
 
 async def test_duplicate_feed_uids_do_not_duplicate_assignments(db, feed):
@@ -116,12 +121,11 @@ async def test_deadline_query_converts_utc_to_local(db):
     assert result == []
 
 
-@pytest.mark.acceptance_gap
-@pytest.mark.xfail(strict=True, reason="Issue #3: feed disappearance has no deletion reconciliation/window contract")
 async def test_deleted_lms_event_stops_being_pending(db, feed):
     await assignments.sync_lms_ical(42, "offline-feed")
-    feed.read.return_value = calendar()
-    await assignments.sync_lms_ical(42, "offline-feed")
+    feed.read.return_value = calendar().replace(b"VERSION:2.0", b"VERSION:2.0\r\nX-JARVIS-WINDOW-START:2099-01-01T00:00:00+05:00\r\nX-JARVIS-WINDOW-END:2099-02-01T00:00:00+05:00")
+    for _ in range(3):
+        await assignments.sync_lms_ical(42, "offline-feed")
     async with db() as session:
         assert (await session.scalar(select(Assignment))).status == "cancelled"
 
