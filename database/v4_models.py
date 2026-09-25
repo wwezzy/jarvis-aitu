@@ -83,6 +83,7 @@ class ProviderUsage(Base):
     estimated_cost: Mapped[float | None] = mapped_column(Float)
     latency_ms: Mapped[int] = mapped_column(Integer)
     error_class: Mapped[str | None] = mapped_column(String(80))
+    usage_source: Mapped[str] = mapped_column(String(16), default="unknown", server_default="unknown")
 
 
 class StudyTopic(Base):

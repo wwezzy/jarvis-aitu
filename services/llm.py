@@ -19,6 +19,7 @@ from services.redis_backend import create_redis
 from config import get_settings
 from services.attachments import UnsupportedAttachment, openai_file_supported
 from services.schemas import JarvisActions
+from services.telemetry import observe, last_call
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -266,17 +267,17 @@ async def _openai_reply(
     filename: str | None = None,
     attachments: list | None = None,
 ) -> tuple[str, str]:
-    if not settings.openai_api_key:
+    if not settings.openai_api_key or not settings.openai_default_model:
         raise RuntimeError("OpenAI is not configured")
 
     model, effort = _choose_openai_model(user_text)
     input_items = _openai_input(history, user_text, file_bytes, mime_type, filename, attachments)
     async with AsyncOpenAI(api_key=settings.openai_api_key, timeout=settings.llm_timeout_seconds,
                            max_retries=0) as client:
-        response = await asyncio.wait_for(client.responses.create(
+        response = await observe("openai", model, "reply", asyncio.wait_for(client.responses.create(
             model=model, instructions=system_instruction, input=input_items,
             reasoning={"effort": effort},
-        ), timeout=settings.llm_timeout_seconds)
+        ), timeout=settings.llm_timeout_seconds), input_text=system_instruction + user_text)
     text = (response.output_text or "").strip()
     if not text:
         raise ValueError("OpenAI returned an empty response")
@@ -289,7 +290,7 @@ async def _nvidia_reply(
     user_text: str,
     system_instruction: str,
 ) -> tuple[str, str]:
-    if not settings.nvidia_api_key:
+    if not settings.nvidia_api_key or not settings.nvidia_model:
         raise RuntimeError("NVIDIA is not configured")
 
     messages: list[dict] = [{"role": "system", "content": system_instruction}]
@@ -302,9 +303,9 @@ async def _nvidia_reply(
 
     async with AsyncOpenAI(api_key=settings.nvidia_api_key, base_url=settings.nvidia_base_url,
                            timeout=settings.llm_timeout_seconds, max_retries=0) as client:
-        response = await asyncio.wait_for(client.chat.completions.create(
+        response = await observe("nvidia", settings.nvidia_model, "reply", asyncio.wait_for(client.chat.completions.create(
             model=settings.nvidia_model, messages=messages, temperature=0.3, max_tokens=2200,
-        ), timeout=settings.llm_timeout_seconds)
+        ), timeout=settings.llm_timeout_seconds), input_text=system_instruction + user_text)
     text = (response.choices[0].message.content or "").strip()
     if not text:
         raise ValueError("NVIDIA returned an empty response")
@@ -320,7 +321,7 @@ async def _gemini_reply(
     mime_type: str | None,
     attachments: list | None = None,
 ) -> tuple[str, str]:
-    if not settings.gemini_api_keys:
+    if not settings.gemini_api_keys or not settings.gemini_model:
         raise RuntimeError("Gemini is not configured")
 
     last_exc: Exception | None = None
@@ -350,7 +351,7 @@ async def _gemini_reply(
             contents.append(gemini_types.Content(role="user", parts=parts))
 
             async with client.aio as async_client:
-                response = await asyncio.wait_for(
+                response = await observe("gemini", settings.gemini_model, "reply", asyncio.wait_for(
                     async_client.models.generate_content(
                         model=settings.gemini_model,
                         contents=contents,
@@ -359,7 +360,7 @@ async def _gemini_reply(
                         ),
                     ),
                     timeout=settings.llm_timeout_seconds,
-                )
+                ), input_text=system_instruction + user_text)
             text = (response.text or "").strip()
             if not text:
                 raise ValueError("Gemini returned an empty response")
@@ -396,7 +397,7 @@ async def generate_reply(
         if time.monotonic() >= deadline:
             break
         try:
-            if provider == "openai" and settings.openai_api_key and (
+            if provider == "openai" and settings.openai_api_key and settings.openai_default_model and (
                 not file_bytes
                 or (mime_type or "").startswith("image/")
                 or openai_file_supported(mime_type, filename)
@@ -410,13 +411,13 @@ async def generate_reply(
                     filename=filename,
                     attachments=attachments,
                 ), timeout=min(settings.llm_timeout_seconds, max(0, deadline - time.monotonic())))
-            elif provider == "nvidia" and settings.nvidia_api_key and not file_bytes and not attachments:
+            elif provider == "nvidia" and settings.nvidia_api_key and settings.nvidia_model and not file_bytes and not attachments:
                 reply, model = await asyncio.wait_for(_nvidia_reply(
                     history=history,
                     user_text=user_text,
                     system_instruction=system_instruction,
                 ), timeout=min(settings.llm_timeout_seconds, max(0, deadline - time.monotonic())))
-            elif provider == "gemini" and settings.gemini_api_keys:
+            elif provider == "gemini" and settings.gemini_api_keys and settings.gemini_model:
                 reply, model = await asyncio.wait_for(_gemini_reply(
                     history=history,
                     user_text=user_text,
@@ -471,16 +472,16 @@ async def _extract_actions_impl(
         f"ASSISTANT REPLY:\n{reply}"
     )
 
-    if settings.openai_api_key and _provider_available("openai"):
+    if settings.openai_api_key and settings.openai_default_model and _provider_available("openai"):
         try:
             async with AsyncOpenAI(api_key=settings.openai_api_key,
                                    timeout=settings.llm_timeout_seconds, max_retries=0) as client:
-                response = await asyncio.wait_for(client.responses.parse(
+                response = await observe("openai", settings.openai_default_model, "extraction", asyncio.wait_for(client.responses.parse(
                     model=settings.openai_default_model,
                     input=[{"role": "developer", "content": instruction},
                            {"role": "user", "content": extraction_input}],
                     text_format=JarvisActions,
-                ), timeout=settings.llm_timeout_seconds)
+                ), timeout=settings.llm_timeout_seconds), input_text=extraction_input)
             parsed = response.output_parsed
             if parsed is not None:
                 _mark_success("openai", settings.openai_default_model, "action_extraction")
@@ -489,12 +490,12 @@ async def _extract_actions_impl(
             logger.warning("OpenAI action extraction failed: %s", type(exc).__name__)
             _mark_failure("openai", exc)
 
-    if settings.gemini_api_keys and _provider_available("gemini"):
+    if settings.gemini_api_keys and settings.gemini_model and _provider_available("gemini"):
         for api_key in settings.gemini_api_keys:
             try:
                 client = genai.Client(api_key=api_key)
                 async with client.aio as async_client:
-                    response = await asyncio.wait_for(
+                    response = await observe("gemini", settings.gemini_model, "extraction", asyncio.wait_for(
                         async_client.models.generate_content(
                             model=settings.gemini_model,
                             contents=extraction_input,
@@ -505,7 +506,7 @@ async def _extract_actions_impl(
                             ),
                         ),
                         timeout=settings.llm_timeout_seconds,
-                    )
+                    ), input_text=extraction_input)
                 if response.text:
                     parsed = JarvisActions.model_validate_json(response.text)
                     _mark_success("gemini", settings.gemini_model, "action_extraction")
@@ -548,5 +549,6 @@ def get_llm_diagnostics() -> dict:
         },
         "cooldowns_seconds": cooling,
         "timeout_seconds": settings.llm_timeout_seconds,
+        "last_call": dict(last_call),
         **_llm_state,
     }

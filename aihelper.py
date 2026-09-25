@@ -25,11 +25,10 @@ from services.scheduler import register_master_schedule, restore_pending_reminde
 from services.users import ensure_user
 from webapp.server import create_web_app
 
+from services.observability import configure_logging
+
 settings = get_settings()
-logging.basicConfig(
-    level=getattr(logging, settings.log_level, logging.INFO),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
+configure_logging(getattr(logging, settings.log_level, logging.INFO))
 logger = logging.getLogger("jarvis")
 
 bot = Bot(token=settings.bot_token)

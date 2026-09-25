@@ -35,7 +35,7 @@ async def migration_roundtrip(engine):
         raw = (await conn.execute(text("SELECT due_at, created_at FROM assignments"))).one()
         assert str(raw[0]).startswith("2030-01-08 10:00")  # UTC, shifted exactly once
         assert str(raw[1]).startswith("2029-01-01 10:00")  # server timestamp already UTC
-        assert await conn.scalar(text("SELECT count(*) FROM jarvis_schema_version")) == 1
+        assert await conn.scalar(text("SELECT count(*) FROM jarvis_schema_version")) == 2
         names = await conn.run_sync(lambda c: inspect(c).get_table_names())
         assert "notification_delivery" in names and "lms_events" in names
     async with async_sessionmaker(engine)() as session:

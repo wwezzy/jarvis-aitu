@@ -22,6 +22,12 @@ os.environ.update(
     TIMEZONE="Asia/Almaty",
     MINIAPP_DEV_MODE="false",
     JARVIS_PROFILE_FILE="",
+    OPENAI_DEFAULT_MODEL="offline-default",
+    OPENAI_PLANNER_MODEL="offline-planner",
+    OPENAI_PREMIUM_MODEL="offline-premium",
+    OPENAI_TRANSCRIBE_MODEL="offline-transcribe",
+    NVIDIA_MODEL="offline-nvidia",
+    GEMINI_MODEL="offline-gemini",
 )
 
 

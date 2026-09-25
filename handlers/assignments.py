@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-from sqlalchemy import text
 
 from aiogram import Bot, Router
 from aiogram.filters import Command
@@ -9,7 +7,7 @@ from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import get_settings
-from database.engine import DATABASE_URL, async_session_factory
+from database.engine import async_session_factory
 from services.assignments import (
     assignment_counts,
     format_deadlines,
@@ -18,7 +16,6 @@ from services.assignments import (
     mark_assignment_done,
     sync_lms_ical,
 )
-from services.llm import get_llm_diagnostics
 from services.scheduler import sync_assignment_jobs
 
 router = Router(name="assignments")
@@ -89,38 +86,15 @@ async def lms_sync_command(message: Message, bot: Bot, scheduler: AsyncIOSchedul
 async def diag_command(message: Message, scheduler: AsyncIOScheduler) -> None:
     if not _authorized(message):
         return
-    llm = get_llm_diagnostics()
-    db_kind = "PostgreSQL" if DATABASE_URL.startswith("postgresql") else "SQLite"
-    try:
-        async with asyncio.timeout(5):
-            async with async_session_factory() as db:
-                await db.execute(text("SELECT 1"))
-            lms = await lms_status(message.from_user.id)
-            counts = await assignment_counts(message.from_user.id)
-        database_status = "reachable"
-    except Exception as exc:
-        database_status = f"unavailable ({type(exc).__name__})"
-        lms, counts = None, None
-    lines = [
-        "🧪 JARVIS DIAGNOSTICS",
-        f"Scheduler: jobs={len(scheduler.get_jobs())}",
-        f"Database: {db_kind} · {database_status}",
-        f"Redis: {'configured (not probed)' if settings.redis_url and settings.redis_token else 'not configured'}",
-        "PC agent: heartbeat unavailable; connectivity cannot be verified",
-    ]
-    for name, configured in llm["providers"].items():
-        cooldown = llm["cooldowns_seconds"].get(name, 0)
-        lines.append(f"Provider {name}: {'configured' if configured else 'not configured'} · cooldown={cooldown}s")
-    lines.append(f"Last AI: {llm.get('last_provider') or '-'} / {llm.get('last_mode') or '-'}")
-    if db_kind == "SQLite":
-        lines.append("SQLite: local storage requires a persistent volume across redeploys")
-    if lms is None:
-        lines.append("LMS: status unavailable (database check failed)")
-    else:
-        lines.append(f"LMS: {'configured' if lms['configured'] else 'not configured'} · last success={lms.get('last_success_at') or '-'}")
-        if lms.get("last_error"):
-            # Older database rows may contain raw exception messages with credentials.
-            lines.append("LMS: last sync failed; check configuration and retry")
-    if counts:
-        lines.append(f"Assignments: {counts['pending']} pending")
-    await message.answer("\n".join(lines)[:4096])
+    import json
+    from services.diagnostics import diagnostics
+    from services.telegram_text import chunks
+    data = await diagnostics(message.from_user.id, scheduler, factory=async_session_factory,
+                             lms_reader=lms_status, counts_reader=assignment_counts)
+    pc = data.get("pc", {})
+    heading = f"Database: {data['database']['type']} · {data['database']['status']}\n"
+    heading += "PC agent: heartbeat unavailable\n" if not pc.get("online") else "PC agent: online\n"
+    if data.get("lms", {}).get("last_sync_failed"):
+        heading += "LMS: last sync failed\n"
+    for part in chunks(heading + json.dumps(data, ensure_ascii=False, indent=2)):
+        await message.answer(part)

@@ -65,6 +65,9 @@ async def route_command(user_id, text, now):
     lowered = raw.lower()
     command, _, body = raw.partition(" ")
     command = command.split("@")[0].lower()
+    if command == "/cost":
+        from services.telemetry import cost_text
+        return await cost_text(user_id)
     if command == "/study":
         from services.study import study_command
         return await study_command(user_id, body, now)

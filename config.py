@@ -93,26 +93,26 @@ def get_settings() -> Settings:
     gemini_api_keys = _collect_gemini_api_keys()
 
     webapp_url = os.getenv("WEBAPP_URL", "").strip() or None
-    fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite").strip() or None
+    fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "").strip() or None
 
     return Settings(
         bot_token=bot_token,
         admin_id=admin_id,
         openai_api_key=openai_api_key,
-        openai_default_model=os.getenv("OPENAI_DEFAULT_MODEL", "gpt-5.6-luna").strip(),
-        openai_planner_model=os.getenv("OPENAI_PLANNER_MODEL", "gpt-5.6-terra").strip(),
-        openai_premium_model=os.getenv("OPENAI_PREMIUM_MODEL", "gpt-5.6-sol").strip(),
-        openai_transcribe_model=os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-transcribe").strip(),
+        openai_default_model=os.getenv("OPENAI_DEFAULT_MODEL", "").strip(),
+        openai_planner_model=os.getenv("OPENAI_PLANNER_MODEL", os.getenv("OPENAI_DEFAULT_MODEL", "")).strip(),
+        openai_premium_model=os.getenv("OPENAI_PREMIUM_MODEL", os.getenv("OPENAI_PLANNER_MODEL", os.getenv("OPENAI_DEFAULT_MODEL", ""))).strip(),
+        openai_transcribe_model=os.getenv("OPENAI_TRANSCRIBE_MODEL", "").strip(),
         openai_reasoning_effort=os.getenv("OPENAI_REASONING_EFFORT", "low").strip(),
         nvidia_api_key=nvidia_api_key,
         nvidia_base_url=os.getenv(
             "NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"
         ).strip().rstrip("/"),
         nvidia_model=os.getenv(
-            "NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b"
+            "NVIDIA_MODEL", ""
         ).strip(),
         gemini_api_keys=gemini_api_keys,
-        gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip(),
+        gemini_model=os.getenv("GEMINI_MODEL", "").strip(),
         gemini_fallback_model=fallback_model,
         llm_timeout_seconds=max(8.0, float(os.getenv("LLM_TIMEOUT_SECONDS", "35"))),
         redis_url=os.getenv("UPSTASH_REDIS_REST_URL", "").strip() or None,

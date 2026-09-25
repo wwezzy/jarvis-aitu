@@ -12,6 +12,7 @@ import imageio_ffmpeg
 from openai import AsyncOpenAI
 
 from config import get_settings
+from services.telemetry import observe
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -108,8 +109,12 @@ def _convert_ogg_to_mp3_sync(data: bytes) -> bytes:
                 "-loglevel",
                 "error",
                 "-y",
+                "-protocol_whitelist",
+                "file,pipe",
                 "-i",
                 str(source),
+                "-t",
+                "1800",
                 "-vn",
                 "-ac",
                 "1",
@@ -141,7 +146,7 @@ async def convert_telegram_voice(data: bytes) -> tuple[bytes, str, str]:
 
 
 async def transcribe_telegram_voice(data: bytes) -> str:
-    if not settings.openai_api_key:
+    if not settings.openai_api_key or not settings.openai_transcribe_model:
         raise AttachmentError("Для расшифровки голосовых сейчас не настроен OpenAI API.")
 
     converted, filename, _ = await convert_telegram_voice(data)
@@ -153,9 +158,9 @@ async def transcribe_telegram_voice(data: bytes) -> str:
         timeout=settings.llm_timeout_seconds,
         max_retries=0,
     ) as client:
-        response = await asyncio.wait_for(
+        response = await observe("openai", settings.openai_transcribe_model, "transcription", asyncio.wait_for(
             client.audio.transcriptions.create(
-                model=getattr(settings, "openai_transcribe_model", "gpt-transcribe"),
+                model=settings.openai_transcribe_model,
                 file=audio_file,
                 prompt=(
                     "Personal assistant context. The speaker may use Russian, Kazakh and English. "
@@ -164,7 +169,7 @@ async def transcribe_telegram_voice(data: bytes) -> str:
                 ),
             ),
             timeout=settings.llm_timeout_seconds,
-        )
+        ))
 
     transcript = (getattr(response, "text", "") or "").strip()
     if not transcript:

@@ -198,6 +198,10 @@ async def assistant_message(
     if not message.from_user or message.from_user.id != settings.admin_id:
         return
 
+    from services.observability import new_correlation, correlation_id
+    from services.telemetry import request_user
+    correlation_token = new_correlation()
+    user_token = request_user.set(message.from_user.id)
     status = await message.answer("Jarvis thinking…")
     delivered = False
 
@@ -233,9 +237,19 @@ async def assistant_message(
             if native:
                 files.append(native)
             file_bytes = None
+        try:
+            collecting = await collection.active(message.from_user.id, chat_id) if not batch else False
+        except Exception:
+            # Redis is optional for the deterministic database-backed core.
+            direct_reply = await try_direct_answer(message.from_user.id, text, now) if not files else None
+            if direct_reply:
+                await deliver(message, status, direct_reply)
+                return
+            await status.edit_text("Redis временно недоступен. Сбор нельзя проверить; материалы не обработаны. Повтори позже.")
+            return
         if batch:
             text, files = batch
-        elif await collection.active(message.from_user.id, chat_id):
+        elif collecting:
             count = await collection.append(message.from_user.id, chat_id, text, files)
             await status.edit_text(f"Сохранён материал {count}. /done — анализировать вместе.")
             return
@@ -267,6 +281,10 @@ async def assistant_message(
                     await restore_pending_reminders(scheduler, bot)
                 return
 
+        from services.rate_limit import allow
+        if not allow(message.from_user.id, "ai", limit=10):
+            await status.edit_text("Слишком много AI-запросов. Попробуй через минуту; /today и /tasks доступны.")
+            return
         memory_context = await build_memory_context(message.from_user.id, text, now)
 
         reply = await generate_reply(
@@ -315,6 +333,9 @@ async def assistant_message(
         logger.error("Message reply pipeline failed error=%s", type(exc).__name__)
         send = message.answer if delivered else status.edit_text
         await send(
-            f"Jarvis не смог обработать запрос: {type(exc).__name__}. "
+            f"Jarvis не смог обработать запрос: {type(exc).__name__} · {correlation_id.get()}. "
             "Расписание и дедлайны доступны через /today и /deadlines."
         )
+    finally:
+        correlation_id.reset(correlation_token)
+        request_user.reset(user_token)

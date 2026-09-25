@@ -12,6 +12,7 @@ from openai import AsyncOpenAI
 from sqlalchemy import text
 
 from config import get_settings
+from services.telemetry import observe
 from database import engine
 
 
@@ -27,8 +28,8 @@ class PgvectorRanker:
             return []
         async with asyncio.timeout(10):
             async with AsyncOpenAI(api_key=settings.openai_api_key, timeout=8, max_retries=0) as client:
-                response = await client.embeddings.create(model=model,
-                    input=[query[:2000]] + [f"{c['key']}: {c['value']}"[:4000] for c in candidates[:100]])
+                response = await observe("openai", model, "embedding", client.embeddings.create(model=model,
+                    input=[query[:2000]] + [f"{c['key']}: {c['value']}"[:4000] for c in candidates[:100]]))
             vectors = [item.embedding for item in response.data]
             if len(vectors) != len(candidates[:100]) + 1:
                 raise ValueError("Unexpected embedding count")
