@@ -38,7 +38,7 @@ def test_agent_ack_failure_replay_and_reconnect_state(tmp_path):
     restarted.tick()
     execute.assert_called_once_with('lock')
     execute.side_effect = OSError('PRIVATE_PAYLOAD')
-    redis.set('jarvis:pc_command:42', build_signed_command('sleep', 42, 'test-only'))
+    redis.set('jarvis:pc_command:42', build_signed_command('hibernate', 42, 'test-only'))
     restarted.tick()
     assert restarted.last['error'] == 'OSError'
     assert 'PRIVATE_PAYLOAD' not in redis.get('jarvis:pc_status:42')
