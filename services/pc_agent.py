@@ -8,13 +8,14 @@ import sqlite3
 import time
 import uuid
 
-VALID_COMMANDS = {"lock", "sleep", "shutdown", "restart", "status"}
+VALID_COMMANDS = {"lock", "hibernate", "shutdown", "restart", "status"}
 
 
 def explicit_pc_command(text: str) -> str | None:
     """Only direct, whole-message requests can authorize a signed PC command."""
     aliases = {
-        "заблокируй компьютер": "lock", "усыпи компьютер": "sleep",
+        "заблокируй компьютер": "lock", "гибернация компьютера": "hibernate",
+        "отправь компьютер в гибернацию": "hibernate",
         "выключи компьютер": "shutdown", "перезагрузи компьютер": "restart",
     }
     normalized = text.strip().lower().rstrip(".!?")
@@ -145,6 +146,9 @@ async def pc_status(redis, user_id, secret):
 
 async def handle_pc_request(text, user_id, chat_id, redis, secret):
     """Call ONLY with original Telegram text, never transcripts/model output."""
+    normalized = text.strip().lower()
+    if normalized == "/pc sleep":
+        return "Sleep отключён на этом ПК. Используй /pc hibernate."
     command = explicit_pc_command(text)
     confirm = re.fullmatch(r"/pc confirm ([a-f0-9]{16})", text.strip())
     if command is None and confirm is None:
