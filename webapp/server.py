@@ -27,7 +27,13 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 @web.middleware
 async def security_headers(request: web.Request, handler):
-    response = await handler(request)
+    from services.observability import new_correlation, correlation_id
+    token = new_correlation()
+    try:
+        response = await handler(request)
+        response.headers["X-Correlation-ID"] = correlation_id.get()
+    finally:
+        correlation_id.reset(token)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
     if request.path.startswith("/api/"):
@@ -41,8 +47,6 @@ def _extract_init_data(request: web.Request) -> str:
 
 async def _authorized_user(request: web.Request) -> TelegramWebAppUser:
     init_data = _extract_init_data(request)
-    if not init_data and settings.miniapp_dev_mode:
-        return TelegramWebAppUser(id=settings.admin_id, first_name="Jarvis Dev")
     user = validate_init_data(init_data, settings.bot_token, max_age_seconds=settings.miniapp_auth_max_age_seconds)
     if user.id != settings.admin_id:
         raise web.HTTPForbidden(text="Jarvis is in private mode")
@@ -146,6 +150,9 @@ async def sync_lms_now(request: web.Request) -> web.Response:
     user = await _authorized_user(request)
     if not settings.lms_ical_url:
         raise web.HTTPBadRequest(text="LMS_ICAL_URL is not configured")
+    from services.rate_limit import allow
+    if not allow(user.id, "lms_sync", limit=4):
+        raise web.HTTPTooManyRequests(text="Retry in one minute")
     result = await sync_lms_ical(user.id)
     await _resync_assignment_notifications(request, user.id)
     return web.json_response({"ok": True, "sync": result, "lms": await lms_status(user.id), "assignments": await list_upcoming_assignments(user.id, days=30, limit=30)})
@@ -227,7 +234,7 @@ async def api_error_middleware(request: web.Request, handler):
 
 
 def create_web_app(*, bot: Bot | None = None, scheduler: AsyncIOScheduler | None = None) -> web.Application:
-    app = web.Application(middlewares=[api_error_middleware, security_headers])
+    app = web.Application(middlewares=[security_headers, api_error_middleware], client_max_size=128 * 1024)
     app["bot"] = bot
     app["scheduler"] = scheduler
     app.router.add_get("/", health)
@@ -242,5 +249,7 @@ def create_web_app(*, bot: Bot | None = None, scheduler: AsyncIOScheduler | None
     app.router.add_post("/api/gtg", create_gtg)
     app.router.add_post("/api/workouts", create_workout)
     app.router.add_post("/api/reflection", save_reflection)
+    from webapp.v4 import register
+    register(app)
     app.router.add_static("/static/", STATIC_DIR, show_index=False)
     return app

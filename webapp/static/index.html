@@ -21,6 +21,8 @@
     <nav class="tabs" aria-label="Sections">
       <button class="tab active" data-view="dashboard">Today</button>
       <button class="tab" data-view="schedule">Week</button>
+      <button class="tab" data-view="tasks">Tasks & Risk</button>
+      <button class="tab" data-view="settings">Settings</button>
       <button class="tab" data-view="workout">Workout</button>
       <button class="tab" data-view="reflection">Reflect</button>
       <button class="tab" data-view="memory">Memory</button>
@@ -119,6 +121,10 @@
           <div id="weekBlocks" class="schedule-blocks"></div>
         </section>
 
+        <section class="card"><h2>Dated changes · next seven days</h2><div id="v4Week" class="stack-list"></div>
+          <form id="overrideForm"><h3>Change one occurrence</h3><label>Date<input name="date" type="date" required></label><label>Recurring block ID<input name="entry_id" type="number" min="1" required></label>
+          <div class="two-col"><label>Start<input name="start" type="time"></label><label>End<input name="end" type="time"></label></div>
+          <label class="check"><input name="cancelled" type="checkbox"> Cancel only on this date</label><button class="primary full">Save dated change</button></form></section>
         <section id="scheduleEditorCard" class="card">
           <div class="section-head">
             <div>
@@ -284,8 +290,39 @@
             <span class="pill">SQL</span>
           </div>
           <p class="muted compact">Это не последние сообщения чата. Факты, тренировки, задания и расписание хранятся отдельно от sliding window.</p>
-          <div id="memoryList" class="stack-list"></div>
+          <div id="memoryList" class="stack-list"></div><h3>Correct or remove a fact</h3><div id="v4Memory" class="stack-list"></div>
         </section>
+      </section>
+      <section id="view-tasks" class="view">
+        <section class="card"><h2>Tasks</h2>
+          <div class="two-col"><label>Status<select id="taskFilter"><option value="pending">Pending</option><option value="done">Done</option><option value="cancelled">Cancelled</option><option value="">All</option></select></label>
+          <label>Source<select id="sourceFilter"><option value="">All</option><option value="lms_ical">LMS</option><option value="manual">Manual</option><option value="telegram_ai">Telegram</option></select></label></div>
+          <label>Course<input id="courseFilter" placeholder="Filter by course"></label><div id="v4Tasks" class="stack-list"></div>
+        </section>
+        <section class="card"><h2 id="taskEditorTitle">New task</h2><form id="taskForm">
+          <input name="id" type="hidden"><label>Title<input name="title" required maxlength="255"></label>
+          <label>Course<input name="course" maxlength="180"></label><label>Details<textarea name="details" maxlength="8000"></textarea></label>
+          <label>Deadline (local Jarvis timezone; empty = unknown)<input name="due_at" type="datetime-local"></label>
+          <div class="two-col"><label>Estimated minutes<input name="estimated_minutes" type="number" min="5" max="100000"></label><label>Progress %<input name="progress" type="number" min="0" max="100" value="0"></label></div>
+          <div class="two-col"><label>Importance 1–10<input name="importance" type="number" min="1" max="10" value="5"></label><label>Consequence 1–10<input name="consequence" type="number" min="1" max="10" value="5"></label></div>
+          <label>Status<select name="status"><option>pending</option><option>done</option><option>cancelled</option></select></label>
+          <label class="check"><input name="teacher_override" type="checkbox"> Teacher explicitly changed LMS deadline</label>
+          <button class="primary full" type="submit">Save task</button><button class="secondary full" type="reset">New task</button>
+        </form></section>
+        <section class="card"><h2>Risk & proposed plan</h2><p class="muted">Suggestions use recorded deadlines, progress and estimated effort. Uncertain estimates stay visible.</p><div id="v4Plan" class="stack-list"></div></section>
+      </section>
+      <section id="view-settings" class="view">
+        <section class="card"><h2>Notifications & planning</h2><form id="preferencesForm">
+          <div class="two-col"><label>DND from<input name="dnd_start" type="time" required></label><label>DND until<input name="dnd_end" type="time" required></label></div>
+          <div class="two-col"><label>Day begins<input name="day_start" type="time" required></label><label>Day ends<input name="day_end" type="time" required></label></div>
+          <label>Sleep hours<input name="sleep_hours" type="number" min="6" max="12" step="0.5"></label>
+          <label>Commute minutes<input name="default_commute_minutes" type="number" min="0" max="240"></label>
+          <label>Daily work budget, minutes<input name="max_work_minutes" type="number" min="30" max="600"></label>
+          <label class="check"><input name="morning_brief" type="checkbox"> Morning brief</label><label class="check"><input name="evening_brief" type="checkbox"> Evening brief</label>
+          <label class="check"><input name="quiz_open_notices" type="checkbox"> Quiz opening notices</label><label>Muted notice kinds (comma separated)<input name="muted_kinds"></label>
+          <button class="primary full">Save preferences</button></form>
+        </section>
+        <section class="card"><h2>Diagnostics</h2><button id="diagnosticsBtn" class="secondary">Refresh diagnostics</button><pre id="v4Diagnostics" class="diagnostics">Open in Telegram to authenticate.</pre></section>
       </section>
     </main>
 
@@ -305,5 +342,6 @@
 
   <script src="/static/app.js" defer></script>
   <script src="/static/deadlines.js" defer></script>
+  <script src="/static/v4.js" defer></script>
 </body>
 </html>
