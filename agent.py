@@ -104,15 +104,19 @@ class Agent:
 
 
 def start_agent():
-    load_dotenv()
+    # Prefer a per-user agent env outside the repository. This keeps the
+    # external Redis credential and HMAC secret out of git and makes Task
+    # Scheduler startup independent from the interactive shell environment.
+    state_dir = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "Jarvis"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    load_dotenv(state_dir / "agent.env", override=True)
+    load_dotenv(override=False)
     user_id, secret = int(os.getenv("ADMIN_ID", "0")), os.getenv("PC_AGENT_SECRET", "")
     redis = create_redis(sync=True)
     if user_id <= 0 or not secret or redis is None:
         raise RuntimeError("Redis, ADMIN_ID and PC_AGENT_SECRET are required")
     if os.name != "nt":
         raise RuntimeError("The installed agent requires Windows")
-    state_dir = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "Jarvis"
-    state_dir.mkdir(parents=True, exist_ok=True)
     instance = SingleInstance(state_dir / "agent.lock")
     handler = logging.handlers.RotatingFileHandler(state_dir / "agent.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
