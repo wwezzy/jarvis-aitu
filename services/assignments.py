@@ -16,6 +16,25 @@ settings = get_settings()
 
 
 
+def classify_lms_event(summary: str) -> str:
+    """Classify Moodle calendar entries so /deadlines is not polluted by attendance."""
+    value = (summary or "").strip().lower()
+    if "attendance" in value:
+        return "attendance"
+    if "quiz" in value and ("close" in value or "closes" in value):
+        return "quiz_close"
+    if "quiz" in value and ("open" in value or "opens" in value):
+        return "quiz_open"
+    if "assignment" in value or " is due" in value or value.endswith(" due"):
+        return "assignment_due"
+    return "other"
+
+
+def _deadline_event(event_type: str) -> bool:
+    return event_type in {"assignment_due", "quiz_close"}
+
+
+
 def _local_naive(value: date | datetime) -> datetime:
     if isinstance(value, datetime):
         return aware(value)
@@ -116,6 +135,7 @@ async def upsert_assignment_payloads(
                     row.notes = notes
 
             await db.flush()
+            await db.refresh(row)
             saved.append(_serialize(row))
 
         await db.commit()
@@ -291,24 +311,50 @@ async def lms_status(user_id: int) -> dict:
     }
 
 
+def _short_course(course: str | None) -> str:
+    if not course:
+        return "Без предмета"
+    name = course.split("|", 1)[0].strip()
+    aliases = {
+        "Design and Analysis of Algorithms": "DAA",
+        "Software Design Patterns": "SDP",
+        "Operating Systems": "OS",
+        "WEB Technologies 1 (Front End)": "WEB",
+        "Kazakh (Russian) Language 1 (B1)": "Kazakh/Russian B1",
+    }
+    return aliases.get(name, name)
+
+
 def format_deadlines(items: list[dict], *, title: str = "📚 Ближайшие дедлайны") -> str:
     if not items:
-        return f"{title}\n\nАктивных заданий пока нет."
+        return f"{title}\n\nАктивных дедлайнов пока нет."
 
     lines = [title]
+    current_day: str | None = None
+
     for item in items[:20]:
         due = item.get("due_at")
         if due:
             try:
                 dt = datetime.fromisoformat(due)
-                due_text = dt.strftime("%d.%m %H:%M")
+                day_text = dt.strftime("%d.%m")
+                time_text = dt.strftime("%H:%M")
             except ValueError:
-                due_text = str(due)
+                day_text = "Дата"
+                time_text = str(due)
         else:
-            due_text = "дата не уточнена"
+            day_text = "Без даты"
+            time_text = "—"
 
-        course = f"[{item['course']}] " if item.get("course") else ""
+        if day_text != current_day:
+            lines.append("")
+            lines.append(f"📅 {day_text}")
+            current_day = day_text
+
+        course = _short_course(item.get("course"))
         source = "LMS" if item.get("source") == "lms_ical" else "Jarvis"
-        lines.append(f"#{item['id']} · {due_text} · {course}{item['title']} · {source}")
+        lines.append(
+            f"• #{item['id']} {time_text} · {course} — {item['title']} · {source}"
+        )
 
     return "\n".join(lines)
