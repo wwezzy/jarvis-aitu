@@ -135,6 +135,31 @@
     try { $("v4Diagnostics").textContent = JSON.stringify(await api("diagnostics"), null, 2); }
     catch (error) { notify(error.message); }
   });
+  let calendarOperation = crypto.randomUUID();
+  async function loadCalendar() {
+    const data = await api("calendar"); const target = $("v4Calendar"); target.replaceChildren();
+    if (!data.configured) target.append(el("p", "Calendar is disabled or unconfigured."));
+    for (const item of data.events) {
+      const row = el("article", `${item.start} ${item.title}`, "list-item");
+      if (item.jarvis_owned) row.append(button("Edit", () => {
+        const form = $("calendarForm"); form.elements.id.value = item.id; form.elements.title.value = item.title;
+        form.elements.start.value = item.start.slice(0, 16); form.elements.end.value = item.end.slice(0, 16);
+      }));
+      target.append(row);
+    }
+  }
+  submit("calendarForm", async form => {
+    const payload = Object.fromEntries(new FormData(form)); payload.operation_id = calendarOperation;
+    payload.id = payload.id || null; payload.allow_conflicts = form.elements.allow_conflicts.checked;
+    const result = await api("calendar_event", "POST", payload);
+    if (!result.saved) throw new Error("Conflicts: " + result.conflicts.map(x => `${x.date} ${x.start} ${x.title}`).join("; "));
+    calendarOperation = crypto.randomUUID(); form.reset(); await loadCalendar();
+  });
+  $("calendarSyncBtn").addEventListener("click", async () => {
+    try { await api("calendar_sync", "POST", {}); await loadCalendar(); await load(); notify("Calendar sync finished"); }
+    catch (error) { notify(error.message); }
+  });
+  loadCalendar().catch(error => notify(error.message));
   $("refreshBtn").addEventListener("click", () => load().catch(error => notify(error.message)));
   load().catch(error => notify(`Auth/API: ${error.message}`));
 })();

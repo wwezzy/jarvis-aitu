@@ -65,6 +65,24 @@ async def route_command(user_id, text, now):
     lowered = raw.lower()
     command, _, body = raw.partition(" ")
     command = command.split("@")[0].lower()
+    if command == "/research":
+        from services.research import research
+        from services.rate_limit import allow
+        if not allow(user_id, 'research', limit=4):
+            return 'Слишком много запросов. Повтори через минуту.'
+        return await research(raw)
+    if command == "/calendar":
+        import json
+        from services.calendar import sync_calendar, list_events, configured, CalendarUnavailable
+        from services.rate_limit import allow
+        if body == 'sync' and allow(user_id, 'calendar_sync', limit=4):
+            try:
+                return json.dumps(await sync_calendar(user_id), ensure_ascii=False)
+            except CalendarUnavailable:
+                return 'Google Calendar временно недоступен; локальное расписание сохранено.'
+        if not configured():
+            return 'Google Calendar выключен или не настроен. Локальное расписание доступно.'
+        return json.dumps(await list_events(user_id), ensure_ascii=False)
     if command == "/cost":
         from services.telemetry import cost_text
         return await cost_text(user_id)

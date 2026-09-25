@@ -13,7 +13,7 @@ from services.tasks import list_tasks, save_task
 
 
 async def api(request):
-    from webapp.server import _authorized_user, _json_body, _resync_assignment_notifications, _resync_schedule_notifications
+    from webapp.server import SCHEDULER_KEY, _authorized_user, _json_body, _resync_assignment_notifications, _resync_schedule_notifications
     user = await _authorized_user(request)
     resource = request.match_info['resource']
     identity = request.match_info.get('identity')
@@ -28,11 +28,24 @@ async def api(request):
             if resource == 'tasks':
                 return web.json_response(await list_tasks(user.id, status=request.query.get('status'),
                     source=request.query.get('source'), course=request.query.get('course')))
+            if resource == 'calendar':
+                from services.calendar import configured, list_events
+                return web.json_response({'configured': configured(), 'events': await list_events(user.id)})
             if resource == 'diagnostics':
                 if not allow(user.id, 'diagnostics', limit=10):
                     raise web.HTTPTooManyRequests(text='Retry in one minute')
-                return web.json_response(await diagnostics(user.id, request.app.get('scheduler')))
+                return web.json_response(await diagnostics(user.id, request.app.get(SCHEDULER_KEY)))
         payload = await _json_body(request) if request.method in {'POST', 'PATCH'} else {}
+        if resource in {'calendar_sync', 'calendar_event'} and request.method == 'POST':
+            from services.calendar import sync_calendar, save_event, CalendarUnavailable
+            if not allow(user.id, resource, limit=4):
+                raise web.HTTPTooManyRequests(text='Retry in one minute')
+            try:
+                result = await sync_calendar(user.id) if resource == 'calendar_sync' else await save_event(user.id, payload)
+            except CalendarUnavailable as exc:
+                raise web.HTTPServiceUnavailable(text=str(exc)) from None
+            await _resync_schedule_notifications(request, user.id)
+            return web.json_response(result)
         if resource == 'tasks' and request.method in {'POST', 'PATCH'}:
             row = await save_task(user.id, payload, int(identity) if identity else None)
             await _resync_assignment_notifications(request, user.id)
@@ -61,7 +74,8 @@ async def api(request):
 
 def register(app):
     for resource, methods in {'state': ['GET'], 'tasks': ['GET', 'POST'],
-        'preferences': ['POST'], 'overrides': ['POST'], 'diagnostics': ['GET']}.items():
+        'preferences': ['POST'], 'overrides': ['POST'], 'diagnostics': ['GET'],
+        'calendar': ['GET'], 'calendar_sync': ['POST'], 'calendar_event': ['POST']}.items():
         for method in methods:
             app.router.add_route(method, '/api/v4/{resource:' + resource + '}', api)
     for resource, methods in {'tasks': ['PATCH'], 'memory': ['PATCH', 'DELETE']}.items():

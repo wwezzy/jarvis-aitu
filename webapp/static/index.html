@@ -322,6 +322,11 @@
           <label class="check"><input name="quiz_open_notices" type="checkbox"> Quiz opening notices</label><label>Muted notice kinds (comma separated)<input name="muted_kinds"></label>
           <button class="primary full">Save preferences</button></form>
         </section>
+        <section class="card"><h2>Google Calendar</h2><p class="muted">Optional. Reads use Google OAuth. Writes require the separate write flag and can edit only Jarvis-owned events.</p>
+          <button id="calendarSyncBtn" type="button" class="secondary">Sync calendar</button><div id="v4Calendar" class="stack-list"></div>
+          <form id="calendarForm"><label>Event ID (empty = create)<input name="id"></label><label>Title<input name="title" required maxlength="255"></label>
+            <label>Start (Jarvis local time)<input name="start" type="datetime-local" required></label><label>End<input name="end" type="datetime-local" required></label>
+            <label class="check"><input name="allow_conflicts" type="checkbox"> I reviewed and accept time conflicts</label><button class="primary full">Save Jarvis event</button></form></section>
         <section class="card"><h2>Diagnostics</h2><button id="diagnosticsBtn" class="secondary">Refresh diagnostics</button><pre id="v4Diagnostics" class="diagnostics">Open in Telegram to authenticate.</pre></section>
       </section>
     </main>

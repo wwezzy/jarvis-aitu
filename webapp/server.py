@@ -22,6 +22,8 @@ from services.workouts import log_workout, recent_workouts
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+BOT_KEY = web.AppKey("bot", Bot)
+SCHEDULER_KEY = web.AppKey("scheduler", AsyncIOScheduler)
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
@@ -74,16 +76,16 @@ def _progression_for(workout: dict | None) -> list[dict]:
 
 
 async def _resync_schedule_notifications(request: web.Request, user_id: int) -> None:
-    scheduler: AsyncIOScheduler | None = request.app.get("scheduler")
-    bot: Bot | None = request.app.get("bot")
+    scheduler: AsyncIOScheduler | None = request.app.get(SCHEDULER_KEY)
+    bot: Bot | None = request.app.get(BOT_KEY)
     if scheduler is not None and bot is not None and settings.enable_master_schedule:
         count = await sync_schedule_jobs(scheduler, bot, user_id)
         logger.info("Schedule edited; %s block notifications reloaded", count)
 
 
 async def _resync_assignment_notifications(request: web.Request, user_id: int) -> None:
-    scheduler: AsyncIOScheduler | None = request.app.get("scheduler")
-    bot: Bot | None = request.app.get("bot")
+    scheduler: AsyncIOScheduler | None = request.app.get(SCHEDULER_KEY)
+    bot: Bot | None = request.app.get(BOT_KEY)
     if scheduler is not None and bot is not None:
         count = await sync_assignment_jobs(scheduler, bot, user_id)
         logger.info("Assignments edited; %s deadline notifications reloaded", count)
@@ -235,8 +237,8 @@ async def api_error_middleware(request: web.Request, handler):
 
 def create_web_app(*, bot: Bot | None = None, scheduler: AsyncIOScheduler | None = None) -> web.Application:
     app = web.Application(middlewares=[security_headers, api_error_middleware], client_max_size=128 * 1024)
-    app["bot"] = bot
-    app["scheduler"] = scheduler
+    app[BOT_KEY] = bot
+    app[SCHEDULER_KEY] = scheduler
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
     app.router.add_get("/app", miniapp_index)

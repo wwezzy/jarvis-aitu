@@ -391,7 +391,8 @@ async def resolve_day(user_id: int, on_date: date, *, rows=None, now=None) -> li
         identity = f"lms:{row.id}" if isinstance(row, LmsEvent) else f"google:{row.id}"
         if any(b["title"] == row.title and b["start"] == start.strftime("%H:%M") for b in blocks.values()):
             continue
-        blocks[identity] = dict(id=identity, start=start.strftime("%H:%M"), end=end.strftime("%H:%M"),
+        blocks[identity] = dict(id=identity, external_id=row.external_id if isinstance(row, PersonalCalendarEvent) else None,
+            start=start.strftime("%H:%M"), end=end.strftime("%H:%M"),
             title=row.title, category="study" if isinstance(row, LmsEvent) else "flex", block_type="fixed",
             notify_before_min=60, commute_minutes=0, preparation_minutes=0, importance=5,
             provenance="LMS" if isinstance(row, LmsEvent) else "Google Calendar",
