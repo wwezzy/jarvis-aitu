@@ -1,12 +1,14 @@
 """Offline tests: never inherit credentials or a developer's database."""
 import os
 import socket
+import uuid
 
 import pytest
 import pytest_asyncio
 import aiohttp
 import httpx
-from sqlalchemy import event
+from sqlalchemy import event, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 for name in list(os.environ):
@@ -65,11 +67,22 @@ async def db(monkeypatch, tmp_path):
     from services import assignments, memory, notifications, schedule, scheduler
     from handlers import assistant
 
-    engine = create_async_engine("sqlite+aiosqlite:///" + (tmp_path / "test.db").as_posix())
+    postgres_url = os.getenv("TEST_POSTGRES_URL")
+    admin_engine, schema = None, None
+    if postgres_url:
+        parsed = make_url(postgres_url)
+        assert parsed.host in {"127.0.0.1", "::1"} and parsed.database == "jarvis_audit_test"
+        schema = "test_" + uuid.uuid4().hex
+        admin_engine = create_async_engine(postgres_url)
+        async with admin_engine.begin() as connection:
+            await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        engine = create_async_engine(postgres_url, connect_args={"server_settings": {"search_path": schema, "timezone": "UTC"}})
+    else:
+        engine = create_async_engine("sqlite+aiosqlite:///" + (tmp_path / "test.db").as_posix())
 
-    @event.listens_for(engine.sync_engine, "connect")
-    def enable_foreign_keys(connection, _):
-        connection.execute("PRAGMA foreign_keys=ON")
+        @event.listens_for(engine.sync_engine, "connect")
+        def enable_foreign_keys(connection, _):
+            connection.execute("PRAGMA foreign_keys=ON")
 
     factory = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(database_engine, "async_session_factory", factory)
@@ -84,3 +97,7 @@ async def db(monkeypatch, tmp_path):
         yield factory
     finally:
         await engine.dispose()
+        if admin_engine:
+            async with admin_engine.begin() as connection:
+                await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+            await admin_engine.dispose()

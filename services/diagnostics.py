@@ -1,7 +1,8 @@
 import asyncio
 import os
 
-from sqlalchemy import text
+from sqlalchemy import text, select, func
+from database.v4_models import NotificationDelivery
 
 from config import get_settings
 from database import engine
@@ -23,6 +24,9 @@ async def diagnostics(user_id, scheduler=None, *, factory=None, lms_reader=None,
         async with asyncio.timeout(5):
             async with (factory or engine.async_session_factory)() as db:
                 await db.execute(text("SELECT 1"))
+                counts = await db.execute(select(NotificationDelivery.status, func.count()).where(
+                    NotificationDelivery.user_id == user_id).group_by(NotificationDelivery.status))
+                data["notifications"] = dict(counts.all())
             lms = await (lms_reader or lms_status)(user_id)
             # Legacy rows may contain an exception URL; never expose that text.
             data["lms"] = {k: lms.get(k) for k in ("configured", "last_attempt_at", "last_success_at", "last_created", "last_updated")}

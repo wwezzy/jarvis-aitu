@@ -62,6 +62,16 @@ class UnsupportedAttachment(AttachmentError):
     pass
 
 
+class BoundedDownload(io.BytesIO):
+    def __init__(self, *, audio=False):
+        super().__init__()
+        self.audio = audio
+
+    def write(self, value):
+        ensure_size(self.tell() + len(value), audio=self.audio)
+        return super().write(value)
+
+
 @dataclass(slots=True)
 class Attachment:
     data: bytes
@@ -97,6 +107,8 @@ def openai_file_supported(mime_type: str | None, filename: str | None = None) ->
 
 
 def _convert_ogg_to_mp3_sync(data: bytes) -> bytes:
+    if not data.startswith(b"OggS"):
+        raise AttachmentError("Ожидалось голосовое OGG/Opus.")
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     with tempfile.TemporaryDirectory(prefix="jarvis_voice_") as temp_dir:
         source = Path(temp_dir) / "voice.ogg"
@@ -113,8 +125,6 @@ def _convert_ogg_to_mp3_sync(data: bytes) -> bytes:
                 "file,pipe",
                 "-i",
                 str(source),
-                "-t",
-                "1800",
                 "-vn",
                 "-ac",
                 "1",

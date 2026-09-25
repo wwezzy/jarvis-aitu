@@ -99,6 +99,10 @@ def _normalize(data, filename, mime):
     if mime.startswith("image/"):
         if mime not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
             raise UnsupportedAttachment("Поддерживаются JPEG, PNG, WebP и GIF.")
+        signatures = {"image/jpeg": data.startswith(b"\xff\xd8\xff"), "image/png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+                      "image/webp": data.startswith(b"RIFF") and data[8:12] == b"WEBP", "image/gif": data.startswith((b"GIF87a", b"GIF89a"))}
+        if not signatures[mime]:
+            raise AttachmentError("Тип изображения не соответствует содержимому.")
         return "", Attachment(data, filename, mime, "image")
     if suffix == ".doc":
         # Legacy binary Word is handled only by a provider advertising native

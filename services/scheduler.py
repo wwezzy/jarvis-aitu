@@ -76,7 +76,7 @@ async def restore_pending_reminders(scheduler: AsyncIOScheduler, bot: Bot) -> in
         result = await db.execute(
             select(Reminder).where(
                 Reminder.is_sent.is_(False),
-                Reminder.remind_at > now,
+                Reminder.remind_at > now - timedelta(days=1),
             )
         )
         rows = result.scalars().all()
@@ -85,7 +85,7 @@ async def restore_pending_reminders(scheduler: AsyncIOScheduler, bot: Bot) -> in
         scheduler.add_job(
             send_saved_reminder,
             "date",
-            run_date=row.remind_at,
+            run_date=max(row.remind_at, now + timedelta(seconds=1)),
             args=[bot, row.user_id, row.text, row.id],
             id=f"reminder:{row.id}",
             replace_existing=True,
@@ -101,7 +101,7 @@ def _clear_dynamic_schedule_jobs(scheduler: AsyncIOScheduler, user_id: int) -> N
 
 
 def _smart_schedule_lead(row) -> int | None:
-    if row.notify_before_min is None:
+    if row.notify_before_min is None or row.block_type == "flex":
         return None
     # v3 deliberately does NOT notify for every planned block.
     if row.block_type == "fixed" and row.category == "study":
@@ -216,7 +216,7 @@ def _assignment_leads(item: dict) -> tuple[int, ...]:
         "сро",
         "бөж",
     )
-    if any(marker in title for marker in large_markers):
+    if item.get('risk', 0) >= 65 or item.get('importance', 5) >= 8 or any(marker in title for marker in large_markers):
         return (4320, 1440, 180)  # 3 days, 24h, 3h
     return (1440, 180)
 
@@ -398,6 +398,8 @@ async def sync_lms_and_notify(
     try:
         result = await sync_lms_ical(user_id)
         assignment_jobs = await sync_assignment_jobs(scheduler, bot, user_id)
+        if settings.enable_master_schedule:
+            await sync_schedule_jobs(scheduler, bot, user_id)
         logger.info(
             "LMS sync complete: created=%s updated=%s events=%s deadline_jobs=%s",
             result.get("created"),
@@ -417,10 +419,12 @@ async def register_master_schedule(
 ) -> int:
     scheduler.add_job(flush_queued, "interval", seconds=60, args=[bot, user_id],
         id=f"notifications:flush:{user_id}", replace_existing=True, max_instances=1, coalesce=True)
-    scheduler.add_job(sync_schedule_jobs, "interval", hours=6, args=[scheduler, bot, user_id],
-        id=f"schedule:refresh:{user_id}", replace_existing=True, max_instances=1, coalesce=True)
+    scheduler.add_job(send_quiz_open_notices, 'interval', minutes=5, args=[bot, user_id],
+        id=f'quiz:open:{user_id}', replace_existing=True, max_instances=1, coalesce=True)
     block_jobs = 0
     if settings.enable_master_schedule:
+        scheduler.add_job(sync_schedule_jobs, "interval", hours=6, args=[scheduler, bot, user_id],
+            id=f"schedule:refresh:{user_id}", replace_existing=True, max_instances=1, coalesce=True)
         block_jobs = await sync_schedule_jobs(scheduler, bot, user_id)
 
         # Two useful summaries replace the old GTG/reflection/detox spam.
@@ -461,4 +465,34 @@ async def register_master_schedule(
             misfire_grace_time=600,
         )
 
+    from services.calendar import configured
+    if configured():
+        scheduler.add_job(sync_google_calendar, 'interval', minutes=30, args=[scheduler, bot, user_id],
+            id='google:sync', replace_existing=True, max_instances=1, coalesce=True)
+
     return block_jobs
+
+
+async def sync_google_calendar(scheduler, bot, user_id):
+    from services.calendar import sync_calendar
+    try:
+        await sync_calendar(user_id)
+        if settings.enable_master_schedule:
+            await sync_schedule_jobs(scheduler, bot, user_id)
+    except Exception as exc:
+        logger.warning('Calendar sync failed error=%s', type(exc).__name__)
+
+
+async def send_quiz_open_notices(bot, user_id):
+    from services.preferences import get_preferences
+    from database.v4_models import LmsEvent
+    if not (await get_preferences(user_id)).quiz_open_notices:
+        return
+    now = datetime.now(settings.timezone)
+    async with async_session_factory() as db:
+        rows = list(await db.scalars(select(LmsEvent).where(LmsEvent.user_id == user_id,
+            LmsEvent.event_type == 'quiz_open', LmsEvent.status == 'active',
+            LmsEvent.starts_at <= now, LmsEvent.starts_at > now - timedelta(hours=1)).limit(10)))
+    for row in rows:
+        await notify_once(bot, user_id, f'quizopen:{row.id}:{row.starts_at.isoformat()}',
+            f'Quiz открыт: {row.title}. Закрытие смотри в /deadlines.', expires_at=row.starts_at + timedelta(hours=1))

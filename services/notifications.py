@@ -122,7 +122,7 @@ async def deliver(bot, delivery_id, *, now=None, **kwargs):
         if not row or row.status != "queued" or aware(row.scheduled_at) > now:
             return False
         prefs = await get_preferences(row.user_id)
-        if row.kind in prefs.muted_kinds or not await _still_relevant(row, now):
+        if row.kind in prefs.muted_kinds or (row.kind == 'quizopen' and not prefs.quiz_open_notices) or not await _still_relevant(row, now):
             row.status = "cancelled"
             await db.commit()
             return False
@@ -151,6 +151,10 @@ async def deliver(bot, delivery_id, *, now=None, **kwargs):
     async with async_session_factory() as db:
         await db.execute(update(NotificationDelivery).where(NotificationDelivery.id == delivery_id).values(
             status=status, last_error=error))
+        if status == 'sent' and key.startswith('reminder:'):
+            from database.models import Reminder
+            await db.execute(update(Reminder).where(Reminder.id == int(key.split(':')[1]),
+                Reminder.user_id == user_id).values(is_sent=True))
         await db.commit()
     return status == "sent"
 
@@ -191,7 +195,7 @@ async def flush_queued(bot, user_id, now=None):
     async with async_session_factory() as db:
         rows = list(await db.scalars(select(NotificationDelivery.id).where(
             NotificationDelivery.user_id == user_id, NotificationDelivery.status == "queued",
-            NotificationDelivery.scheduled_at <= now).order_by(NotificationDelivery.scheduled_at).limit(20)))
+            NotificationDelivery.scheduled_at <= now).order_by(NotificationDelivery.critical.desc(), NotificationDelivery.scheduled_at).limit(3)))
     return sum([await deliver(bot, row_id, now=now) for row_id in rows])
 
 

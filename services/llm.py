@@ -312,64 +312,50 @@ async def _nvidia_reply(
     return text, settings.nvidia_model
 
 
-async def _gemini_reply(
-    *,
-    history: list[dict],
-    user_text: str,
-    system_instruction: str,
-    file_bytes: bytes | None,
-    mime_type: str | None,
-    attachments: list | None = None,
-) -> tuple[str, str]:
-    if not settings.gemini_api_keys or not settings.gemini_model:
-        raise RuntimeError("Gemini is not configured")
+async def _gemini_generate(contents, config, capability, input_text):
+    last_exc = None
+    models = list(dict.fromkeys(m for m in (settings.gemini_model, settings.gemini_fallback_model) if m))
+    for model in models:
+        for index, api_key in enumerate(settings.gemini_api_keys):
+            circuit = f"gemini:{index}:{model}"
+            if not _provider_available(circuit):
+                continue
+            try:
+                client = genai.Client(api_key=api_key)
+                async with client.aio as async_client:
+                    response = await observe("gemini", model, capability, asyncio.wait_for(
+                        async_client.models.generate_content(model=model, contents=contents, config=config),
+                        timeout=settings.llm_timeout_seconds), input_text=input_text)
+                if not response.text or not response.text.strip():
+                    raise ValueError("Gemini returned an empty response")
+                _provider_cooldown_until.pop(circuit, None)
+                return response, model
+            except Exception as exc:
+                last_exc = exc
+                _provider_cooldown_until[circuit] = time.monotonic() + _cooldown_seconds(exc)
+                logger.warning("Gemini request failed error=%s", type(exc).__name__)
+    raise last_exc or RuntimeError("No Gemini key/model available")
 
-    last_exc: Exception | None = None
-    for api_key in settings.gemini_api_keys:
-        try:
-            client = genai.Client(api_key=api_key)
-            contents: list[gemini_types.Content] = []
-            for item in history[-RECENT_HISTORY_MESSAGES:]:
-                role = item.get("role")
-                body = item.get("text")
-                if role in {"user", "assistant"} and isinstance(body, str) and body:
-                    gemini_role = "model" if role == "assistant" else "user"
-                    contents.append(
-                        gemini_types.Content(
-                            role=gemini_role,
-                            parts=[gemini_types.Part.from_text(text=body)],
-                        )
-                    )
-            parts: list[gemini_types.Part] = []
-            for file in attachments or []:
-                if file.mime_type != "application/pdf" and not file.mime_type.startswith("image/"):
-                    raise UnsupportedAttachment("Gemini does not support this native document")
-                parts.append(gemini_types.Part.from_bytes(data=file.data, mime_type=file.mime_type))
-            if file_bytes and mime_type:
-                parts.append(gemini_types.Part.from_bytes(data=file_bytes, mime_type=mime_type))
-            parts.append(gemini_types.Part.from_text(text=user_text))
-            contents.append(gemini_types.Content(role="user", parts=parts))
 
-            async with client.aio as async_client:
-                response = await observe("gemini", settings.gemini_model, "reply", asyncio.wait_for(
-                    async_client.models.generate_content(
-                        model=settings.gemini_model,
-                        contents=contents,
-                        config=gemini_types.GenerateContentConfig(
-                            system_instruction=system_instruction,
-                        ),
-                    ),
-                    timeout=settings.llm_timeout_seconds,
-                ), input_text=system_instruction + user_text)
-            text = (response.text or "").strip()
-            if not text:
-                raise ValueError("Gemini returned an empty response")
-            return text, settings.gemini_model
-        except Exception as exc:
-            last_exc = exc
-            logger.warning("Gemini fallback key failed: %s", type(exc).__name__)
-
-    raise last_exc or RuntimeError("Gemini fallback failed")
+async def _gemini_reply(*, history, user_text, system_instruction, file_bytes, mime_type, attachments=None):
+    contents = []
+    for item in history[-RECENT_HISTORY_MESSAGES:]:
+        role, body = item.get("role"), item.get("text")
+        if role in {"user", "assistant"} and isinstance(body, str) and body:
+            contents.append(gemini_types.Content(role="model" if role == "assistant" else "user",
+                parts=[gemini_types.Part.from_text(text=body)]))
+    parts = []
+    for file in attachments or []:
+        if file.mime_type != "application/pdf" and not file.mime_type.startswith("image/"):
+            raise UnsupportedAttachment("Gemini does not support this native document")
+        parts.append(gemini_types.Part.from_bytes(data=file.data, mime_type=file.mime_type))
+    if file_bytes and mime_type:
+        parts.append(gemini_types.Part.from_bytes(data=file_bytes, mime_type=mime_type))
+    parts.append(gemini_types.Part.from_text(text=user_text))
+    contents.append(gemini_types.Content(role="user", parts=parts))
+    response, model = await _gemini_generate(contents,
+        gemini_types.GenerateContentConfig(system_instruction=system_instruction), "reply", system_instruction + user_text)
+    return response.text.strip(), model
 
 
 async def generate_reply(
@@ -491,29 +477,17 @@ async def _extract_actions_impl(
             _mark_failure("openai", exc)
 
     if settings.gemini_api_keys and settings.gemini_model and _provider_available("gemini"):
-        for api_key in settings.gemini_api_keys:
-            try:
-                client = genai.Client(api_key=api_key)
-                async with client.aio as async_client:
-                    response = await observe("gemini", settings.gemini_model, "extraction", asyncio.wait_for(
-                        async_client.models.generate_content(
-                            model=settings.gemini_model,
-                            contents=extraction_input,
-                            config=gemini_types.GenerateContentConfig(
-                                system_instruction=instruction,
-                                response_mime_type="application/json",
-                                response_json_schema=JarvisActions.model_json_schema(),
-                            ),
-                        ),
-                        timeout=settings.llm_timeout_seconds,
-                    ), input_text=extraction_input)
-                if response.text:
-                    parsed = JarvisActions.model_validate_json(response.text)
-                    _mark_success("gemini", settings.gemini_model, "action_extraction")
-                    return parsed.model_dump()
-            except Exception as exc:
-                logger.warning("Gemini action extraction failed: %s", type(exc).__name__)
-                _mark_failure("gemini", exc)
+        try:
+            response, model = await _gemini_generate(extraction_input,
+                gemini_types.GenerateContentConfig(system_instruction=instruction,
+                    response_mime_type="application/json", response_json_schema=JarvisActions.model_json_schema()),
+                "extraction", extraction_input)
+            parsed = JarvisActions.model_validate_json(response.text)
+            _mark_success("gemini", model, "action_extraction")
+            return parsed.model_dump()
+        except Exception as exc:
+            logger.warning("Gemini action extraction failed error=%s", type(exc).__name__)
+            _mark_failure("gemini", exc)
 
     return JarvisActions().model_dump()
 

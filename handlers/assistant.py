@@ -13,7 +13,7 @@ from config import get_settings
 from database.engine import async_session_factory
 from database.models import Habit, Reminder
 from services.assignments import upsert_assignment_payloads
-from services.attachments import AttachmentError, ensure_size, transcribe_telegram_voice
+from services.attachments import AttachmentError, BoundedDownload, ensure_size, transcribe_telegram_voice
 from services.direct_intents import try_direct_answer
 from services.llm import extract_actions, generate_reply
 from services.memory import build_memory_context, upsert_memory_updates
@@ -47,7 +47,7 @@ async def _download_attachment(
         photo = message.photo[-1]
         ensure_size(photo.file_size)
         file_info = await bot.get_file(photo.file_id)
-        downloaded = await bot.download_file(file_info.file_path)
+        downloaded = await bot.download_file(file_info.file_path, destination=BoundedDownload())
         file_bytes = downloaded.read()
         ensure_size(len(file_bytes))
         mime_type = "image/jpeg"
@@ -58,7 +58,7 @@ async def _download_attachment(
     elif message.document:
         ensure_size(message.document.file_size)
         file_info = await bot.get_file(message.document.file_id)
-        downloaded = await bot.download_file(file_info.file_path)
+        downloaded = await bot.download_file(file_info.file_path, destination=BoundedDownload())
         file_bytes = downloaded.read()
         ensure_size(len(file_bytes))
         mime_type = message.document.mime_type or "application/octet-stream"
@@ -67,9 +67,12 @@ async def _download_attachment(
             text = f"Проанализируй файл {filename} и выдели главное, важные требования и действия."
 
     elif message.voice:
+        from services.rate_limit import allow
+        if not allow(message.from_user.id, "transcription", limit=6):
+            raise AttachmentError("Слишком много голосовых. Повтори через минуту; текстовые команды доступны.")
         ensure_size(message.voice.file_size, audio=True)
         file_info = await bot.get_file(message.voice.file_id)
-        downloaded = await bot.download_file(file_info.file_path)
+        downloaded = await bot.download_file(file_info.file_path, destination=BoundedDownload(audio=True))
         transcript = await transcribe_telegram_voice(downloaded.read())
         text = (
             f"{text}\n\n[Расшифровка голосового]\n{transcript}".strip()
@@ -315,6 +318,8 @@ async def assistant_message(
                 user_name=message.from_user.full_name,
                 memory_context=memory_context,
             )
+            from services.action_evidence import supported_actions
+            actions = supported_actions(actions, text)
             confirmations = await _apply_actions(
                 message=message,
                 bot=bot,
@@ -323,8 +328,23 @@ async def assistant_message(
                 actions=actions,
                 now=now,
             )
+            from services.commands import apply_schedule_text
+            schedule_confirmation = await apply_schedule_text(message.from_user.id, text, now)
+            if schedule_confirmation:
+                confirmations.append(schedule_confirmation)
+                await sync_schedule_jobs(scheduler, bot, message.from_user.id)
             if confirmations:
                 await message.answer("✅ " + " · ".join(confirmations)[:3900])
+            try:
+                from services.telemetry import daily_usage
+                usage = await daily_usage(message.from_user.id)
+                if usage['budget_warning']:
+                    from services.notifications import notify_once
+                    await notify_once(bot, message.from_user.id, f"budget:{usage['date']}",
+                        "⚠ Оценка AI-расходов достигла 80% дневного бюджета. /cost — детали. Неизвестные цены не включены.")
+            except Exception as exc:
+                logger.warning("Budget warning unavailable error=%s", type(exc).__name__)
+
         except Exception as exc:
             logger.warning("Post-reply action pipeline failed error=%s", type(exc).__name__)
             await message.answer("Не удалось сохранить все действия. Проверь журнал перед повтором.")
