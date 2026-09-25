@@ -29,7 +29,7 @@ def tokens(response, input_text=""):
     for input_key, output_key in [("input_tokens", "output_tokens"), ("prompt_tokens", "completion_tokens"), ("prompt_token_count", "candidates_token_count")]:
         incoming, outgoing = _get(usage, input_key), _get(usage, output_key)
         if type(incoming) is int and incoming >= 0:
-            return incoming, max(0, outgoing or 0), "reported"
+            return incoming, max(0, outgoing) if type(outgoing) is int else 0, "reported"
     text = _get(response, "output_text") or _get(response, "text") or ""
     if input_text and isinstance(text, str):
         return math.ceil(len(input_text) / 4), math.ceil(len(text) / 4), "estimated"

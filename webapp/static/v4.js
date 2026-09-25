@@ -1,7 +1,7 @@
 (() => {
   "use strict";
   const $ = id => document.getElementById(id);
-  let state, selectedTask;
+  let state, selectedTask, loadSequence = 0, preferencesDirty = false;
   const el = (tag, text, cls = "") => {
     const node = document.createElement(tag); node.textContent = text; node.className = cls; return node;
   };
@@ -14,7 +14,9 @@
       headers: {"X-Telegram-Init-Data": window.Telegram?.WebApp?.initData || "", "Content-Type": "application/json"},
       body: payload === undefined ? undefined : JSON.stringify(payload)});
     if (!response.ok) throw new Error(await response.text());
-    return response.json();
+    const data = await response.json();
+    if (method !== "GET") window.dispatchEvent(new CustomEvent("jarvis:changed", {detail: {origin: "v4"}}));
+    return data;
   }
   function button(label, action) {
     const node = el("button", label, "secondary small"); node.type = "button";
@@ -45,7 +47,7 @@
         form.scrollIntoView({behavior: "smooth"});
       }));
       if (task.status !== "done") row.append(button("Done", async () => {
-        await fetchDone(task.id); await load(); $("refreshBtn").click();
+        await fetchDone(task.id); await load();
       }));
       target.append(row);
     }
@@ -54,6 +56,7 @@
   async function fetchDone(id) {
     const response = await fetch(`/api/assignments/${id}/done`, {method: "POST", headers: {"X-Telegram-Init-Data": window.Telegram?.WebApp?.initData || ""}});
     if (!response.ok) throw new Error(await response.text());
+    window.dispatchEvent(new CustomEvent("jarvis:changed", {detail: {origin: "v4"}}));
   }
   function renderPlan() {
     const target = $("v4Plan"); target.replaceChildren();
@@ -95,7 +98,12 @@
     }
   }
   async function load() {
-    state = await api("state"); renderTasks(); renderPlan(); renderWeek(); renderMemory();
+    const sequence = ++loadSequence;
+    const result = await api("state");
+    if (sequence !== loadSequence) return;
+    state = result; renderTasks(); renderPlan(); renderWeek();
+    if (!$("v4Memory").contains(document.activeElement)) renderMemory();
+    if (preferencesDirty) return;
     const form = $("preferencesForm");
     for (const [key, value] of Object.entries(state.preferences)) {
       const field = form.elements.namedItem(key); if (!field) continue;
@@ -106,7 +114,7 @@
   function submit(id, action) {
     $(id).addEventListener("submit", async event => {
       event.preventDefault(); event.submitter.disabled = true;
-      try { await action(event.target); await load(); $("refreshBtn").click(); notify("Saved"); }
+      try { await action(event.target); await load(); notify("Saved"); }
       catch (error) { notify(error.message); }
       finally { event.submitter.disabled = false; }
     });
@@ -128,7 +136,11 @@
     for (const key of ["sleep_hours", "default_commute_minutes", "max_work_minutes"]) payload[key] = Number(payload[key]);
     for (const key of ["morning_brief", "evening_brief", "quiz_open_notices"]) payload[key] = form.elements.namedItem(key).checked;
     payload.muted_kinds = payload.muted_kinds.split(",").map(x => x.trim()).filter(Boolean);
-    return api("preferences", "POST", payload);
+    return api("preferences", "POST", payload).then(() => { preferencesDirty = false; });
+  });
+  $("preferencesForm").addEventListener("input", () => { preferencesDirty = true; });
+  window.addEventListener("jarvis:changed", event => {
+    if (event.detail?.origin !== "v4") load().catch(error => notify(error.message));
   });
   for (const id of ["taskFilter", "sourceFilter", "courseFilter"]) $(id).addEventListener("input", () => state && renderTasks());
   $("diagnosticsBtn").addEventListener("click", async () => {

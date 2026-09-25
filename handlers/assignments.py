@@ -16,7 +16,7 @@ from services.assignments import (
     mark_assignment_done,
     sync_lms_ical,
 )
-from services.scheduler import sync_assignment_jobs
+from services.scheduler import sync_assignment_jobs, sync_schedule_jobs
 
 router = Router(name="assignments")
 settings = get_settings()
@@ -69,6 +69,8 @@ async def lms_sync_command(message: Message, bot: Bot, scheduler: AsyncIOSchedul
     try:
         result = await sync_lms_ical(message.from_user.id)
         jobs = await sync_assignment_jobs(scheduler, bot, message.from_user.id)
+        if settings.enable_master_schedule:
+            await sync_schedule_jobs(scheduler, bot, message.from_user.id)
         await status.edit_text(
             "✅ LMS sync завершён.\n"
             f"Новых: {result.get('created', 0)}\n"

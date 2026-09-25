@@ -73,7 +73,7 @@ def upgrade(connection):
                 if stamp.tzinfo is None:
                     stamp = stamp.replace(tzinfo=zone)
                 stamp = stamp.astimezone(timezone.utc).replace(tzinfo=None)
-                connection.execute(text(f'UPDATE "{name}" SET "{col.name}"=:stamp WHERE "{pk}"=:key'), {"stamp": stamp, "key": key})
+                connection.execute(text(f'UPDATE "{name}" SET "{col.name}"=:stamp WHERE "{pk}"=:key'), {"stamp": stamp.isoformat(sep=" ") if connection.dialect.name == "sqlite" else stamp, "key": key})
     Base.metadata.create_all(connection)
     connection.execute(text("INSERT INTO jarvis_schema_version (version) VALUES (1)"))
     _version_two(connection)

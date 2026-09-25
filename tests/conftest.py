@@ -64,7 +64,7 @@ def no_external_network(monkeypatch):
 async def db(monkeypatch, tmp_path):
     from database import engine as database_engine
     from database.models import Base, User
-    from services import assignments, memory, notifications, schedule, scheduler
+    from services import assignments, memory, notifications, schedule, scheduler, workouts, gtg, reflections, users
     from handlers import assistant
 
     postgres_url = os.getenv("TEST_POSTGRES_URL")
@@ -91,7 +91,7 @@ async def db(monkeypatch, tmp_path):
     async with factory() as session:
         session.add_all([User(telegram_id=42, name="Test"), User(telegram_id=43, name="Other")])
         await session.commit()
-    for module in (assignments, memory, notifications, schedule, scheduler, assistant):
+    for module in (assignments, memory, notifications, schedule, scheduler, assistant, workouts, gtg, reflections, users):
         monkeypatch.setattr(module, "async_session_factory", factory)
     try:
         yield factory

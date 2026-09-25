@@ -157,6 +157,7 @@ async def sync_lms_now(request: web.Request) -> web.Response:
         raise web.HTTPTooManyRequests(text="Retry in one minute")
     result = await sync_lms_ical(user.id)
     await _resync_assignment_notifications(request, user.id)
+    await _resync_schedule_notifications(request, user.id)
     return web.json_response({"ok": True, "sync": result, "lms": await lms_status(user.id), "assignments": await list_upcoming_assignments(user.id, days=30, limit=30)})
 
 

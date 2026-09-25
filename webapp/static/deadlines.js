@@ -13,7 +13,9 @@
       const text = await response.text();
       throw new Error(text || `HTTP ${response.status}`);
     }
-    return response.json();
+    const data = await response.json();
+    if (options.method && options.method !== "GET") window.dispatchEvent(new CustomEvent("jarvis:changed", {detail: {origin: "deadlines"}}));
+    return data;
   }
 
   function node(tag, className, text) {
@@ -119,6 +121,7 @@
     }
   });
 
+  window.addEventListener("jarvis:changed", event => { if (event.detail?.origin !== "deadlines") loadDeadlines(); });
   loadDeadlines();
   setInterval(loadDeadlines, 5 * 60 * 1000);
 })();

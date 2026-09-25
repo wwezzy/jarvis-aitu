@@ -94,6 +94,18 @@ async def test_diag_rate_limit_and_invalid_inputs(client):
     assert response.status == 400
 
 
+async def test_manual_lms_sync_rebuilds_both_deadline_and_calendar_jobs(client, monkeypatch):
+    monkeypatch.setattr(server, 'settings', replace(server.settings, lms_ical_url='configured-in-test'))
+    monkeypatch.setattr(server, 'sync_lms_ical', AsyncMock(return_value={'created': 0}))
+    calendar_jobs, deadline_jobs = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(server, '_resync_schedule_notifications', calendar_jobs)
+    monkeypatch.setattr(server, '_resync_assignment_notifications', deadline_jobs)
+    response = await client.post('/api/lms/sync', headers=authorization())
+    assert response.status == 200
+    calendar_jobs.assert_awaited_once()
+    deadline_jobs.assert_awaited_once()
+
+
 def test_structured_logging_never_outputs_sensitive_payloads():
     import logging
     from services.observability import PrivateFormatter, new_correlation, correlation_id

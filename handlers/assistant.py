@@ -278,7 +278,7 @@ async def assistant_message(
             if direct_reply:
                 await deliver(message, status, direct_reply)
                 delivered = True
-                if text.startswith(("/task ", "/remind ", "/schedule ", "/override ", "/study timer")) or direct_reply.startswith("Сохранено только"):
+                if text.startswith(("/task ", "/remind ", "/schedule ", "/override ", "/study timer", "/calendar sync")) or direct_reply.startswith("Сохранено только"):
                     await sync_assignment_jobs(scheduler, bot, message.from_user.id)
                     await sync_schedule_jobs(scheduler, bot, message.from_user.id)
                     await restore_pending_reminders(scheduler, bot)

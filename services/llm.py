@@ -427,7 +427,8 @@ async def generate_reply(
             logger.warning("Reply provider failed provider=%s error=%s", provider, type(exc).__name__)
             _mark_failure(provider, exc)
 
-    debug_id = uuid.uuid4().hex[:8]
+    from services.observability import correlation_id
+    debug_id = correlation_id.get() if correlation_id.get() != "startup" else uuid.uuid4().hex[:8]
     final_exc = RuntimeError(" | ".join(errors[-4:]) or "no configured AI provider available")
     _mark_failure("all", final_exc, debug_id=debug_id)
     logger.error("Jarvis AI reply pipeline failed [%s]: %s", debug_id, " | ".join(errors))
@@ -510,9 +511,9 @@ def get_llm_diagnostics() -> dict:
     }
     return {
         "providers": {
-            "openai": bool(settings.openai_api_key),
-            "nvidia": bool(settings.nvidia_api_key),
-            "gemini": bool(settings.gemini_api_keys),
+            "openai": bool(settings.openai_api_key and settings.openai_default_model),
+            "nvidia": bool(settings.nvidia_api_key and settings.nvidia_model),
+            "gemini": bool(settings.gemini_api_keys and settings.gemini_model),
         },
         "models": {
             "openai_default": settings.openai_default_model,

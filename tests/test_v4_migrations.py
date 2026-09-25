@@ -29,7 +29,8 @@ async def migration_roundtrip(engine):
         await conn.execute(text("""INSERT INTO assignments
             (id,user_id,source,external_id,title,due_at,status,created_at,updated_at)
             VALUES (1,42,'lms_ical','one','Legacy done task',:due,'done',:created,:created)"""),
-            {"due": datetime(2030, 1, 8, 15), "created": datetime(2029, 1, 1, 10)})
+            {"due": "2030-01-08 15:00:00" if engine.dialect.name == "sqlite" else datetime(2030, 1, 8, 15),
+             "created": "2029-01-01 10:00:00" if engine.dialect.name == "sqlite" else datetime(2029, 1, 1, 10)})
         await conn.run_sync(upgrade)
         await conn.run_sync(upgrade)
         raw = (await conn.execute(text("SELECT due_at, created_at FROM assignments"))).one()
