@@ -1,9 +1,6 @@
 param(
-    [Parameter(Mandatory = $true)]
     [string]$RedisUrl,
-
-    [Parameter(Mandatory = $true)]
-    [int]$AdminId
+    [int]$AdminId = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -12,8 +9,25 @@ if ($env:OS -ne 'Windows_NT') {
     throw 'Jarvis PC Agent setup must run on Windows.'
 }
 
+if (-not $RedisUrl) {
+    $secureUrl = Read-Host 'Paste the EXTERNAL Render Redis URL' -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureUrl)
+    try {
+        $RedisUrl = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    } finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+}
+
 if ($RedisUrl -notmatch '^rediss?://') {
     throw 'RedisUrl must start with redis:// or rediss://'
+}
+
+if ($AdminId -le 0) {
+    $AdminId = [int](Read-Host 'Telegram ADMIN_ID')
+}
+if ($AdminId -le 0) {
+    throw 'ADMIN_ID must be a positive integer.'
 }
 
 $repoPath = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
