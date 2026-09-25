@@ -73,3 +73,18 @@ async def test_voice_model_transcription_never_authorizes_pc(monkeypatch, messag
     redis = SimpleNamespace(set=AsyncMock())
     await assistant.assistant_message(message, Mock(), Mock(), redis)
     redis.set.assert_not_awaited()
+
+
+
+async def test_explicit_memory_recall_returns_durable_profile(db):
+    await upsert_memory_updates(42, [
+        {"key": "device_model", "value": "Laptop X", "importance": 7},
+        {"key": "education_level", "value": "year 2", "importance": 7},
+    ])
+    context = await build_memory_context(
+        42,
+        "Что ты обо мне помнишь? Какой у меня ноутбук и на каком я курсе?",
+        NOW,
+    )
+    assert "Laptop X" in context
+    assert "year 2" in context
