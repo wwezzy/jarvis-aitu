@@ -8,7 +8,7 @@ import sqlite3
 import time
 import uuid
 
-VALID_COMMANDS = {"lock", "sleep", "shutdown", "restart"}
+VALID_COMMANDS = {"lock", "sleep", "shutdown", "restart", "status"}
 
 
 def explicit_pc_command(text: str) -> str | None:
@@ -109,3 +109,61 @@ def consume_command(redis, key: str, user_id: int, secret: str, guard: ReplayGua
         return False
     execute(command)
     return True
+
+
+def signed_status(data, secret):
+    body = json.dumps(data, sort_keys=True, separators=(",", ":"))
+    return json.dumps({"body": body, "sig": hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()})
+
+
+def read_status(raw, user_id, secret):
+    try:
+        envelope = json.loads(raw)
+        expected = hmac.new(secret.encode(), envelope["body"].encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, envelope["sig"]):
+            return None
+        data = json.loads(envelope["body"])
+        if data["user_id"] != user_id or type(data["seen_at"]) is not int or data["seen_at"] > time.time() + 30:
+            return None
+        return data
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+async def pc_status(redis, user_id, secret):
+    if redis is None or not secret:
+        return {"online": False, "state": "not configured"}
+    try:
+        raw = await redis.get(f"jarvis:pc_status:{user_id}")
+        data = read_status(raw, user_id, secret) if raw else None
+        if data is None:
+            return {"online": False, "state": "heartbeat unavailable"}
+        return {**data, "online": time.time() - data["seen_at"] <= 45}
+    except Exception as exc:
+        return {"online": False, "state": "unavailable", "error": type(exc).__name__}
+
+
+async def handle_pc_request(text, user_id, chat_id, redis, secret):
+    """Call ONLY with original Telegram text, never transcripts/model output."""
+    command = explicit_pc_command(text)
+    confirm = re.fullmatch(r"/pc confirm ([a-f0-9]{16})", text.strip())
+    if command is None and confirm is None:
+        return None
+    if redis is None or not secret:
+        return "PC-agent unavailable: Redis/PC_AGENT_SECRET is not configured."
+    if command == "status":
+        return "PC: " + json.dumps(await pc_status(redis, user_id, secret), ensure_ascii=False)
+    if confirm:
+        raw = await redis.getdel(f"jarvis:pc_confirm:{user_id}:{chat_id}:{confirm[1]}")
+        if raw not in {"shutdown", "restart"}:
+            return "Подтверждение истекло или уже использовано. Повтори исходную команду."
+        command = raw
+    elif command in {"shutdown", "restart"}:
+        token = uuid.uuid4().hex[:16]
+        await redis.set(f"jarvis:pc_confirm:{user_id}:{chat_id}:{token}", command, ex=60)
+        return f"Подтверди {command} в течение 60 секунд: /pc confirm {token}"
+    payload = build_signed_command(command, user_id, secret)
+    queued = await redis.set(f"jarvis:pc_command:{user_id}", payload, ex=90, nx=True)
+    if queued is False or queued is None:
+        return "Команда уже ожидает выполнения. Проверь /pc status; повтори после её обработки."
+    return f"Signed PC command queued: {command}. Receipt: {json.loads(payload)['nonce']}. /pc status — ACK/result."

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 from datetime import datetime
 
 from aiogram import Bot, F, Router
@@ -16,10 +17,12 @@ from services.attachments import AttachmentError, ensure_size, transcribe_telegr
 from services.direct_intents import try_direct_answer
 from services.llm import extract_actions, generate_reply
 from services.memory import build_memory_context, upsert_memory_updates
-from services.pc_agent import build_signed_command, explicit_pc_command
+from services.pc_agent import handle_pc_request
 from services.reflections import upsert_reflection
 from services.scheduler import send_saved_reminder, sync_assignment_jobs, sync_schedule_jobs, restore_pending_reminders
 from services.users import ensure_user
+from services.inbox import CollectionStore, normalize, starts_collection, finishes_collection
+from services.telegram_text import deliver
 from services.workouts import log_workout
 
 logger = logging.getLogger(__name__)
@@ -46,6 +49,7 @@ async def _download_attachment(
         file_info = await bot.get_file(photo.file_id)
         downloaded = await bot.download_file(file_info.file_path)
         file_bytes = downloaded.read()
+        ensure_size(len(file_bytes))
         mime_type = "image/jpeg"
         filename = "photo.jpg"
         if not text:
@@ -56,6 +60,7 @@ async def _download_attachment(
         file_info = await bot.get_file(message.document.file_id)
         downloaded = await bot.download_file(file_info.file_path)
         file_bytes = downloaded.read()
+        ensure_size(len(file_bytes))
         mime_type = message.document.mime_type or "application/octet-stream"
         filename = message.document.file_name or "document"
         if not text:
@@ -194,32 +199,68 @@ async def assistant_message(
         return
 
     status = await message.answer("Jarvis thinking…")
+    delivered = False
 
     try:
         user = await ensure_user(message.from_user.id, message.from_user.full_name)
+        collection = CollectionStore(pc_redis)
+        chat_id = getattr(getattr(message, "chat", None), "id", message.from_user.id)
+        raw_text = message.text or message.caption or ""
+        batch = None
+        if starts_collection(raw_text):
+            await collection.start(user.telegram_id if hasattr(user, "telegram_id") else message.from_user.id, chat_id)
+            await status.edit_text("Сбор открыт на 15 минут. До 12 материалов / 12 MB. /done — анализ, /cancel_collect — удалить.")
+            return
+        if raw_text.strip() == "/cancel_collect":
+            await collection.cancel(message.from_user.id, chat_id)
+            await status.edit_text("Сбор отменён; временные материалы удалены.")
+            return
+        if finishes_collection(raw_text):
+            batch = await collection.finish(message.from_user.id, chat_id)
+            if not batch or not batch[0]:
+                await status.edit_text("Нет собранных материалов. /collect — начать; /done 12 — закрыть задание.")
+                return
         try:
             text, file_bytes, mime_type, filename = await _download_attachment(message, bot)
         except AttachmentError as exc:
             await status.edit_text(str(exc))
             return
         now = _local_now()
+        files = []
+        if file_bytes:
+            extracted, native = await normalize(file_bytes, filename, mime_type or "application/octet-stream")
+            text = f"{text}\n\n[{filename}]\n{extracted}" if extracted else text
+            if native:
+                files.append(native)
+            file_bytes = None
+        if batch:
+            text, files = batch
+        elif await collection.active(message.from_user.id, chat_id):
+            count = await collection.append(message.from_user.id, chat_id, text, files)
+            await status.edit_text(f"Сохранён материал {count}. /done — анализировать вместе.")
+            return
+        elif getattr(message, "media_group_id", None) and pc_redis is not None:
+            # Only Telegram-declared albums aggregate automatically. Unrelated
+            # quick messages remain independent; ambiguous text uses /collect.
+            chat_id = f"{chat_id}:album:{message.media_group_id}"
+            await collection.start(message.from_user.id, chat_id)
+            await collection.append(message.from_user.id, chat_id, text, files)
+            await asyncio.sleep(1.5)
+            if not await pc_redis.set(collection.key(message.from_user.id, chat_id) + ":processing", "1", ex=180, nx=True):
+                await status.edit_text("Материал добавлен в анализ альбома.")
+                return
+            batch = await collection.finish(message.from_user.id, chat_id)
+            text, files = batch
 
-        if file_bytes is None:
-            command = explicit_pc_command(message.text or "")
-            if command:
-                if pc_redis is None or not settings.pc_agent_secret:
-                    await status.edit_text("PC-agent unavailable: Redis/PC_AGENT_SECRET is not configured.")
-                else:
-                    await pc_redis.set(
-                        f"jarvis:pc_command:{settings.admin_id}",
-                        build_signed_command(command, settings.admin_id, settings.pc_agent_secret),
-                        ex=90,
-                    )
-                    await status.edit_text(f"Signed PC command queued: {command}.")
+        if not files and not batch:
+            pc_reply = await handle_pc_request(message.text or "", message.from_user.id, chat_id, pc_redis, settings.pc_agent_secret)
+            if pc_reply:
+                await status.edit_text(pc_reply)
                 return
             direct_reply = await try_direct_answer(message.from_user.id, text, now)
             if direct_reply:
-                await status.edit_text(direct_reply[:4096])
+                await deliver(message, status, direct_reply)
+                delivered = True
                 if text.startswith(("/task ", "/remind ", "/schedule ", "/override ", "/study timer")) or direct_reply.startswith("Сохранено только"):
                     await sync_assignment_jobs(scheduler, bot, message.from_user.id)
                     await sync_schedule_jobs(scheduler, bot, message.from_user.id)
@@ -237,10 +278,17 @@ async def assistant_message(
             file_bytes=file_bytes,
             mime_type=mime_type,
             filename=filename,
+            attachments=files,
         )
 
         # Critical v3 rule: the user sees the reply before any structured extraction.
-        await status.edit_text(reply[:4096])
+        await deliver(message, status, reply)
+        delivered = True
+        if batch:
+            if reply.startswith("Сейчас AI-каналы не ответили"):
+                await message.answer("Материалы остаются в сборе до истечения TTL. Повтори /done или удали /cancel_collect.")
+            elif not await collection.acknowledge(message.from_user.id, chat_id):
+                await message.answer("Во время анализа добавлены материалы; сбор сохранён. /done — повторить с ними.")
 
         try:
             actions = await extract_actions(
@@ -265,7 +313,8 @@ async def assistant_message(
 
     except Exception as exc:
         logger.error("Message reply pipeline failed error=%s", type(exc).__name__)
-        await status.edit_text(
+        send = message.answer if delivered else status.edit_text
+        await send(
             f"Jarvis не смог обработать запрос: {type(exc).__name__}. "
             "Расписание и дедлайны доступны через /today и /deadlines."
         )

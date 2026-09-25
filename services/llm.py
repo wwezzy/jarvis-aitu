@@ -14,7 +14,7 @@ from google import genai
 from google.genai import types as gemini_types
 from openai import AsyncOpenAI
 from pydantic import ValidationError
-from upstash_redis.asyncio import Redis
+from services.redis_backend import create_redis
 
 from config import get_settings
 from services.attachments import UnsupportedAttachment, openai_file_supported
@@ -26,9 +26,7 @@ settings = get_settings()
 RECENT_HISTORY_MESSAGES = 20
 HISTORY_TTL_SECONDS = 60 * 60 * 24 * 30
 
-redis: Redis | None = None
-if settings.redis_url and settings.redis_token:
-    redis = Redis(url=settings.redis_url, token=settings.redis_token)
+redis = create_redis()
 
 _provider_cooldown_until: dict[str, float] = {}
 _llm_state: dict[str, object | None] = {
@@ -209,7 +207,15 @@ def _openai_input(
     file_bytes: bytes | None,
     mime_type: str | None,
     filename: str | None,
+    attachments: list | None = None,
 ) -> list[dict]:
+    if attachments:
+        result = _openai_input(history, user_text, None, None, None)
+        content = [{"type": "input_text", "text": user_text}]
+        for file in attachments:
+            content.extend(_openai_input([], "", file.data, file.mime_type, file.filename)[-1]["content"][1:])
+        result[-1]["content"] = content
+        return result
     items: list[dict] = []
     for item in history[-RECENT_HISTORY_MESSAGES:]:
         role = item.get("role")
@@ -258,12 +264,13 @@ async def _openai_reply(
     file_bytes: bytes | None,
     mime_type: str | None,
     filename: str | None = None,
+    attachments: list | None = None,
 ) -> tuple[str, str]:
     if not settings.openai_api_key:
         raise RuntimeError("OpenAI is not configured")
 
     model, effort = _choose_openai_model(user_text)
-    input_items = _openai_input(history, user_text, file_bytes, mime_type, filename)
+    input_items = _openai_input(history, user_text, file_bytes, mime_type, filename, attachments)
     async with AsyncOpenAI(api_key=settings.openai_api_key, timeout=settings.llm_timeout_seconds,
                            max_retries=0) as client:
         response = await asyncio.wait_for(client.responses.create(
@@ -311,6 +318,7 @@ async def _gemini_reply(
     system_instruction: str,
     file_bytes: bytes | None,
     mime_type: str | None,
+    attachments: list | None = None,
 ) -> tuple[str, str]:
     if not settings.gemini_api_keys:
         raise RuntimeError("Gemini is not configured")
@@ -332,6 +340,10 @@ async def _gemini_reply(
                         )
                     )
             parts: list[gemini_types.Part] = []
+            for file in attachments or []:
+                if file.mime_type != "application/pdf" and not file.mime_type.startswith("image/"):
+                    raise UnsupportedAttachment("Gemini does not support this native document")
+                parts.append(gemini_types.Part.from_bytes(data=file.data, mime_type=file.mime_type))
             if file_bytes and mime_type:
                 parts.append(gemini_types.Part.from_bytes(data=file_bytes, mime_type=mime_type))
             parts.append(gemini_types.Part.from_text(text=user_text))
@@ -369,6 +381,7 @@ async def generate_reply(
     file_bytes: bytes | None = None,
     mime_type: str | None = None,
     filename: str | None = None,
+    attachments: list | None = None,
 ) -> str:
     user_text = text or "Проанализируй вложение и выполни запрос пользователя."
     history = await get_chat_history(user_id)
@@ -395,8 +408,9 @@ async def generate_reply(
                     file_bytes=file_bytes,
                     mime_type=mime_type,
                     filename=filename,
+                    attachments=attachments,
                 ), timeout=min(settings.llm_timeout_seconds, max(0, deadline - time.monotonic())))
-            elif provider == "nvidia" and settings.nvidia_api_key and not file_bytes:
+            elif provider == "nvidia" and settings.nvidia_api_key and not file_bytes and not attachments:
                 reply, model = await asyncio.wait_for(_nvidia_reply(
                     history=history,
                     user_text=user_text,
@@ -409,6 +423,7 @@ async def generate_reply(
                     system_instruction=system_instruction,
                     file_bytes=file_bytes,
                     mime_type=mime_type,
+                    attachments=attachments,
                 ), timeout=min(settings.llm_timeout_seconds, max(0, deadline - time.monotonic())))
             else:
                 continue

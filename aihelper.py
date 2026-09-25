@@ -8,7 +8,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import BotCommand, MenuButtonWebApp, WebAppInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from upstash_redis.asyncio import Redis as AsyncRedis
+from services.redis_backend import create_redis
 
 from config import get_settings
 from database.engine import init_db
@@ -43,10 +43,7 @@ dp.include_router(notifications_router)
 dp.include_router(assistant_router)
 
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
-pc_redis: AsyncRedis | None = None
-if settings.redis_url and settings.redis_token:
-    pc_redis = AsyncRedis(url=settings.redis_url, token=settings.redis_token)
-
+pc_redis = create_redis()
 
 async def configure_bot_ui() -> None:
     await bot.set_my_commands(

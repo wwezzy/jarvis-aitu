@@ -45,7 +45,9 @@ async def done_command(message: Message, bot: Bot, scheduler: AsyncIOScheduler) 
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) != 2:
-        await message.answer("Использование: /done 12")
+        from handlers.assistant import assistant_message
+        from services.llm import redis
+        await assistant_message(message, bot, scheduler, pc_redis=redis)
         return
     try:
         assignment_id = int(parts[1].strip())
