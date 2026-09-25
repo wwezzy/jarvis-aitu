@@ -42,6 +42,9 @@ if (-not (Test-Path -LiteralPath $pythonPath)) {
     }
 
     & $py.Source -3.12 -m venv $venvPath
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $pythonPath)) {
+        throw 'Python 3.12 is not installed. Run: winget install -e --id Python.Python.3.12 ; then reopen PowerShell and run this setup again.'
+    }
 }
 
 & $pythonPath -m pip install --upgrade pip
