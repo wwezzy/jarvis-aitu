@@ -46,6 +46,25 @@ def _lexical_score(query_tokens: set[str], text: str) -> int:
     return sum(1 for token in query_tokens if token in haystack)
 
 
+def _is_memory_recall_query(query: str) -> bool:
+    """Detect explicit requests to inspect the user's durable profile/memory."""
+    value = (query or "").lower()
+    markers = (
+        "что ты обо мне помнишь",
+        "что обо мне помнишь",
+        "что ты помнишь обо мне",
+        "что ты знаешь обо мне",
+        "что знаешь обо мне",
+        "моя память",
+        "покажи память",
+        "покажи что ты помнишь",
+        "what do you remember about me",
+        "what do you know about me",
+        "show my memory",
+    )
+    return any(marker in value for marker in markers)
+
+
 def merge_preferences(existing: str | None, new_text: str | None) -> str | None:
     if not new_text:
         return existing
@@ -205,17 +224,23 @@ async def build_memory_context(user_id: int, query: str, now: datetime) -> str:
             if row.due_at is None or row.due_at <= assignment_horizon
         ]
 
-    ranked_memories = sorted(
-        [row for row in memory_rows if _lexical_score(query_tokens, f"{row.category} {row.key} {row.value}") > 0],
-        key=lambda row: (_lexical_score(query_tokens, f"{row.category} {row.key} {row.value}"), row.importance),
-        reverse=True,
-    )[:18]
-    from services.semantic import semantic_ids
-    related_ids = await semantic_ids(query, [{"id": r.id, "key": r.key, "value": r.value} for r in memory_rows])
-    for row in memory_rows:
-        if row.id in related_ids and row not in ranked_memories:
-            ranked_memories.append(row)
-    ranked_memories = ranked_memories[:18]
+    if _is_memory_recall_query(query):
+        # Explicit "what do you remember about me?" requests should inspect the
+        # durable profile itself, not depend on lexical overlap with arbitrary
+        # extractor-generated keys such as "device_model" or "education_level".
+        ranked_memories = list(memory_rows[:30])
+    else:
+        ranked_memories = sorted(
+            [row for row in memory_rows if _lexical_score(query_tokens, f"{row.category} {row.key} {row.value}") > 0],
+            key=lambda row: (_lexical_score(query_tokens, f"{row.category} {row.key} {row.value}"), row.importance),
+            reverse=True,
+        )[:18]
+        from services.semantic import semantic_ids
+        related_ids = await semantic_ids(query, [{"id": r.id, "key": r.key, "value": r.value} for r in memory_rows])
+        for row in memory_rows:
+            if row.id in related_ids and row not in ranked_memories:
+                ranked_memories.append(row)
+        ranked_memories = ranked_memories[:18]
     if ranked_memories:
         async with async_session_factory() as db:
             await db.execute(sql_update(MemoryFact).where(MemoryFact.user_id == user_id,
