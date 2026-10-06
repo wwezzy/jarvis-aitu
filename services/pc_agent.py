@@ -8,17 +8,22 @@ import sqlite3
 import time
 import uuid
 
-VALID_COMMANDS = {"lock", "hibernate", "shutdown", "restart", "status"}
+VALID_COMMANDS = {"lock", "sleep", "hibernate", "shutdown", "restart", "status", "cancel_shutdown"}
 
 
 def explicit_pc_command(text: str) -> str | None:
     """Only direct, whole-message requests can authorize a signed PC command."""
     aliases = {
-        "заблокируй компьютер": "lock", "гибернация компьютера": "hibernate",
+        "заблокируй компьютер": "lock", "усыпи компьютер": "sleep", "гибернация компьютера": "hibernate",
         "отправь компьютер в гибернацию": "hibernate",
         "выключи компьютер": "shutdown", "перезагрузи компьютер": "restart",
     }
     normalized = text.strip().lower().rstrip(".!?")
+    normalized = re.sub(r"^(?:джарвис|jarvis)[, ]+", "", normalized)
+    normalized = re.sub(r"\b(?:ноутбук|ноут|пк)\b", "компьютер", normalized)
+    aliases.update({"выключить компьютер": "shutdown", "перезагрузить компьютер": "restart",
+                    "отмени выключение": "cancel_shutdown", "отмени перезагрузку": "cancel_shutdown",
+                    "статус компьютера": "status"})
     for command in VALID_COMMANDS:
         if normalized in {f"/pc {command}", f"{command} pc"}:
             return command

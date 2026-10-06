@@ -58,7 +58,7 @@ def test_agent_reconnect_backoff_resets_after_success(tmp_path, monkeypatch):
     monkeypatch.setenv('ADMIN_ID', '42')
     monkeypatch.setenv('PC_AGENT_SECRET', 'offline-test-only')
     monkeypatch.setenv('LOCALAPPDATA', str(tmp_path))
-    monkeypatch.setattr(agent, 'load_dotenv', lambda: None)
+    monkeypatch.setattr(agent, 'load_dotenv', lambda *args, **kwargs: None)
     monkeypatch.setattr(agent, 'create_redis', lambda **kwargs: Mock())
     runtime = Mock(tick=Mock(side_effect=[TimeoutError(), TimeoutError(), None]))
     monkeypatch.setattr(agent, 'Agent', Mock(return_value=runtime))
