@@ -133,8 +133,8 @@
     cancelled: form.elements.cancelled.checked, changes: form.elements.cancelled.checked ? {} : {start: form.elements.start.value, end: form.elements.end.value}}));
   submit("preferencesForm", form => {
     const payload = Object.fromEntries(new FormData(form));
-    for (const key of ["sleep_hours", "default_commute_minutes", "max_work_minutes"]) payload[key] = Number(payload[key]);
-    for (const key of ["morning_brief", "evening_brief", "quiz_open_notices"]) payload[key] = form.elements.namedItem(key).checked;
+    for (const key of ["sleep_hours", "default_commute_minutes", "max_work_minutes", "gaming_budget_minutes"]) payload[key] = Number(payload[key]);
+    for (const key of ["morning_brief", "evening_brief", "quiz_open_notices", "activity_enabled", "auto_capture_materials"]) payload[key] = form.elements.namedItem(key).checked;
     payload.muted_kinds = payload.muted_kinds.split(",").map(x => x.trim()).filter(Boolean);
     return api("preferences", "POST", payload).then(() => { preferencesDirty = false; });
   });

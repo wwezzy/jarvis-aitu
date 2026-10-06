@@ -23,7 +23,7 @@ jobs:
           cache: pip
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m ruff check .
-      - run: node --check webapp/static/app.js && node --check webapp/static/v4.js && node --check webapp/static/deadlines.js
+      - run: node --check webapp/static/app.js && node --check webapp/static/v4.js && node --check webapp/static/deadlines.js && node --check webapp/static/assistant.js
       - run: python -m pytest -q -ra -m "not postgres"
   postgres:
     runs-on: ubuntu-latest

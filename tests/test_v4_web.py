@@ -38,13 +38,36 @@ async def client(db, monkeypatch):
 
 async def test_all_api_auth_required_even_with_dev_flag(client, monkeypatch):
     monkeypatch.setattr(server, 'settings', replace(server.settings, miniapp_dev_mode=True))
-    for path in ['/api/dashboard', '/api/v4/state', '/api/v4/tasks', '/api/v4/diagnostics']:
+    for path in ['/api/dashboard', '/api/v4/state', '/api/v4/tasks', '/api/v4/diagnostics', '/api/v4/assistant', '/api/v4/notes', '/api/v4/pc_status']:
         response = await client.get(path)
         assert response.status == 401
         response = await client.get(path, headers=authorization(43))
         assert response.status == 403
     response = await client.post('/api/v4/tasks', json={'title': 'forbidden'})
     assert response.status == 401
+
+
+async def test_assistant_goal_note_editing_auth_and_focus_conflicts(client):
+    headers = authorization()
+    response = await client.post('/api/v4/goals', json={'title': 'My goal', 'next_step': 'Read one page'}, headers=headers)
+    assert response.status == 200
+    goal = await response.json()
+    response = await client.get('/api/v4/assistant', headers=headers)
+    data = await response.json()
+    assert data['goals'][0]['id'] == goal['id'] and data['goals'][0]['today'] == 'unknown'
+    from services.autonomy import save_goal
+    other = await save_goal(43, {'title': 'Private', 'next_step': 'Secret'})
+    assert (await client.patch(f"/api/v4/goals/{other['id']}", json={'next_step': 'stolen'}, headers=headers)).status == 400
+    assert (await client.post('/api/v4/checkins', json={'goal_id': other['id'], 'outcome': 'done', 'minutes': 10}, headers=headers)).status == 400
+    assert (await client.post('/api/v4/checkins', json={'goal_id': goal['id'], 'outcome': 'done', 'minutes': 10}, headers=headers)).status == 200
+    response = await client.post('/api/v4/notes', json={'title': 'Source', 'content': '<script>alert(1)</script> actual notes'}, headers=headers)
+    assert response.status == 200
+    note = await response.json()
+    assert (await client.get('/api/v4/notes?q=actual', headers=headers)).status == 200
+    assert (await client.patch(f"/api/v4/notes/{note['id']}", json={'status': 'reference'}, headers=headers)).status == 200
+    assert (await client.delete(f"/api/v4/notes/{note['id']}", headers=headers)).status == 200
+    assert (await client.post('/api/v4/focus', json={'action': 'start', 'minutes': -1}, headers=headers)).status == 400
+    assert (await client.post('/api/v4/focus', json={'action': 'stop'}, headers=headers)).status == 400
 
 
 async def test_task_crud_filters_and_cross_user_protection(client):

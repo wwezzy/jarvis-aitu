@@ -73,6 +73,8 @@ async def api(request):
 
 
 def register(app):
+    from webapp.assistant import register as register_assistant
+    register_assistant(app)
     for resource, methods in {'state': ['GET'], 'tasks': ['GET', 'POST'],
         'preferences': ['POST'], 'overrides': ['POST'], 'diagnostics': ['GET'],
         'calendar': ['GET'], 'calendar_sync': ['POST'], 'calendar_event': ['POST']}.items():

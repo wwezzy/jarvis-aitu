@@ -20,6 +20,8 @@
 
     <nav class="tabs" aria-label="Sections">
       <button class="tab active" data-view="dashboard">Today</button>
+      <button class="tab" data-view="assistant">Ассистент</button>
+      <button class="tab" data-view="inbox">Входящие</button>
       <button class="tab" data-view="schedule">Week</button>
       <button class="tab" data-view="tasks">Tasks & Risk</button>
       <button class="tab" data-view="settings">Settings</button>
@@ -29,6 +31,21 @@
     </nav>
 
     <main>
+      <section id="view-assistant" class="view">
+        <section class="card"><h2>Один следующий шаг</h2><p id="assistantNext" class="muted">Загружаю контекст…</p>
+          <div class="button-row"><button id="startSuggestedFocus" class="primary" type="button">Начать шаг</button><button id="refreshAssistant" class="secondary" type="button">Перепланировать</button></div>
+          <p id="assistantFocus"></p><form id="finishFocusForm"><label>Фактически работал, минут<input name="minutes" type="number" min="0" max="1440" required></label><button class="primary">Завершить фокус</button><button id="cancelFocus" class="secondary" type="button">Отменить</button></form>
+          <p class="muted">Таймер и активное окно не подтверждают выполнение. Отметь результат отдельно.</p></section>
+        <section class="card"><h2>Ориентиры недели</h2><div id="assistantGoals" class="stack-list"></div>
+          <form id="goalForm"><input name="id" type="hidden"><label>Цель<input name="title" maxlength="180" required></label><label>Самый маленький следующий шаг<textarea name="next_step" maxlength="500" required></textarea></label>
+            <label>Почему это важно<input name="reason" maxlength="500"></label><label>Если происходит…<input name="cue" maxlength="180" required></label>
+            <div class="two-col"><label>Минимум минут<input name="minimum_minutes" type="number" min="2" max="120" value="10" required></label><label>Дней в неделю<input name="target_per_week" type="number" min="1" max="7" value="3" required></label></div>
+            <label>Категория<select name="category"><option value="learning">Развитие</option><option value="movement">Движение</option><option value="organization">Организация</option><option value="other">Другое</option></select></label>
+            <button class="primary">Сохранить цель</button><button class="secondary" type="reset">Новая цель</button></form></section>
+        <section class="card"><h2>Наблюдаемое время на ноутбуке</h2><div id="assistantActivity"></div><p class="muted">Только категории активного процесса и простоя. Браузер не позволяет отличить работу от аниме. Открытая фоновая игра не считается активной.</p><button id="refreshPcStatus" class="secondary" type="button">Проверить связь</button><pre id="assistantPcStatus" class="diagnostics"></pre></section>
+      </section>
+      <section id="view-inbox" class="view"><section class="card"><h2>Собрать → разобрать → найти</h2><form id="captureForm"><label>Название<input name="title" maxlength="180"></label><label>Источник / заметка<textarea name="content" maxlength="20000" required></textarea></label><button class="primary">Сохранить запись</button></form>
+        <label>Найти в источниках<input id="noteQuery" maxlength="200"></label><button id="searchNotes" class="secondary" type="button">Найти</button><div id="assistantNotes" class="stack-list"></div></section></section>
       <section id="view-dashboard" class="view active">
         <div class="hero card">
           <div>
@@ -320,6 +337,9 @@
           <label>Daily work budget, minutes<input name="max_work_minutes" type="number" min="30" max="600"></label>
           <label class="check"><input name="morning_brief" type="checkbox"> Morning brief</label><label class="check"><input name="evening_brief" type="checkbox"> Evening brief</label>
           <label class="check"><input name="quiz_open_notices" type="checkbox"> Quiz opening notices</label><label>Muted notice kinds (comma separated)<input name="muted_kinds"></label>
+          <label>Инициатива<select name="autonomy_mode"><option value="active">Активная, до 5 обращений в день</option><option value="balanced">Умеренная, до 3</option><option value="quiet">Тихая, до 2</option><option value="off">Выключить</option></select></label>
+          <label>Ориентир времени игр, минут в день<input name="gaming_budget_minutes" type="number" min="0" max="480"></label><label class="check"><input name="activity_enabled" type="checkbox"> Принимать категории времени от моего агента</label>
+          <label class="check"><input name="auto_capture_materials" type="checkbox"> Сохранять текст материалов и длинных голосовых во входящие</label>
           <button class="primary full">Save preferences</button></form>
         </section>
         <section class="card"><h2>Google Calendar</h2><p class="muted">Optional. Reads use Google OAuth. Writes require the separate write flag and can edit only Jarvis-owned events.</p>
@@ -348,5 +368,6 @@
   <script src="/static/app.js" defer></script>
   <script src="/static/deadlines.js" defer></script>
   <script src="/static/v4.js" defer></script>
+  <script src="/static/assistant.js" defer></script>
 </body>
 </html>
