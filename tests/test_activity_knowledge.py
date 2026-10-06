@@ -3,7 +3,7 @@ import time
 import os
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import Mock
 
 import fakeredis
@@ -12,7 +12,6 @@ import pytest
 from sqlalchemy import select
 
 from database.assistant_models import ActivityReceipt
-from database.time import aware
 from services.activity import ActivityJournal, ingest_activity
 from services.autonomy import activity_summary
 from services.knowledge import capture_note, list_notes, update_note, knowledge_context
@@ -62,7 +61,7 @@ async def test_signed_activity_delivery_restart_ack_idempotency_and_opt_out(db, 
     assert await ingest_activity(redis, 42, 'test-only') == 1
     async with db() as session:
         assert len(list(await session.scalars(select(ActivityReceipt)))) == 1
-    summary = await activity_summary(42, aware(datetime.now()))
+    summary = await activity_summary(42, datetime.now(timezone.utc))
     assert summary['seconds']['work'] == 5
     restarted = ActivityJournal(tmp_path / 'activity.db', sample=sample)
     restarted.sync(sync, 42, 'test-only')
@@ -141,7 +140,7 @@ print('standalone monitor ok')
 
 async def test_deleted_server_activity_does_not_reappear_from_spool(db):
     from services.autonomy import autonomy_command
-    now = aware(datetime.now())
+    now = datetime.now(timezone.utc)
     redis = NativeAsyncRedis(fakeredis.aioredis.FakeRedis(decode_responses=True))
     await save_preferences(42, {'activity_enabled': True})
     start = int(now.timestamp()) // 60 * 60 - 60
@@ -154,3 +153,18 @@ async def test_deleted_server_activity_does_not_reappear_from_spool(db):
     assert 'd' * 32 in read_status(await redis.get('jarvis:activity_ack:42'), 42, 'test-only')['ids']
     async with db() as session:
         assert list(await session.scalars(select(ActivityReceipt))) == []
+
+
+async def test_activity_day_uses_configured_timezone_with_utc_input(db):
+    async with db() as session:
+        session.add_all([
+            ActivityReceipt(user_id=42, bucket_id='e' * 32,
+                starts_at=datetime(2026, 10, 6, 18, tzinfo=timezone.utc), seconds={'gaming': 10}),
+            ActivityReceipt(user_id=42, bucket_id='f' * 32,
+                starts_at=datetime(2026, 10, 6, 20, tzinfo=timezone.utc), seconds={'work': 20}),
+        ])
+        await session.commit()
+    summary = await activity_summary(42, datetime(2026, 10, 6, 22, tzinfo=timezone.utc))
+    assert summary['date'] == '2026-10-07'
+    assert summary['seconds']['work'] == 20
+    assert summary['seconds']['gaming'] == 0

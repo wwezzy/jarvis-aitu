@@ -216,7 +216,7 @@ async def finish_focus(user_id, minutes=None, now=None):
 
 
 async def activity_summary(user_id, now):
-    now = aware(now)
+    now = aware(now).astimezone(get_settings().timezone)
     left = aware(datetime.combine(now.date(), time.min))
     totals = {category: 0 for category in ("work", "gaming", "media", "other", "idle", "unknown")}
     async with engine.async_session_factory() as db:
