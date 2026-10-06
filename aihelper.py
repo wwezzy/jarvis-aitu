@@ -17,6 +17,7 @@ from handlers.assistant import router as assistant_router
 from handlers.gtg import router as gtg_router
 from handlers.memory import router as memory_router
 from handlers.notifications import router as notifications_router
+from handlers.initiative import router as initiative_router
 from handlers.start import router as start_router
 from handlers.workouts import router as workouts_router
 from services.assignments import sync_lms_ical
@@ -39,6 +40,7 @@ dp.include_router(workouts_router)
 dp.include_router(memory_router)
 dp.include_router(assignments_router)
 dp.include_router(notifications_router)
+dp.include_router(initiative_router)
 dp.include_router(assistant_router)
 
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
@@ -48,6 +50,12 @@ async def configure_bot_ui() -> None:
     await bot.set_my_commands(
         [
             BotCommand(command="today", description="Today's protocol"),
+            BotCommand(command="next", description="Следующий конкретный шаг к цели"),
+            BotCommand(command="bored", description="Скучно: выбрать короткое полезное занятие"),
+            BotCommand(command="autopilot", description="Режим инициативы и пауза"),
+            BotCommand(command="focus", description="Один шаг без отвлечений"),
+            BotCommand(command="inbox", description="Разобрать сохранённую информацию"),
+            BotCommand(command="activity", description="Наблюдаемое время работы и игр"),
             BotCommand(command="deadlines", description="Upcoming assignments and deadlines"),
             BotCommand(command="lms_sync", description="Sync Moodle/LMS calendar"),
             BotCommand(command="diag", description="Jarvis diagnostics"),
@@ -93,6 +101,8 @@ async def main() -> None:
     logger.info("Initializing Jarvis database")
     await init_db()
     await ensure_user(settings.admin_id, "Аллажар")
+    from services.autonomy import ensure_starter_goals
+    await ensure_starter_goals(settings.admin_id)
     seeded = await ensure_default_schedule(settings.admin_id)
 
     if settings.lms_ical_url:

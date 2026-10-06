@@ -34,6 +34,21 @@ def _local_now() -> datetime:
     return datetime.now(settings.timezone)
 
 
+async def _capture_source(message, text, source_material):
+    if not source_material:
+        return
+    try:
+        from services.knowledge import capture_material
+        saved_notes = await capture_material(message.from_user.id, text, "telegram_material")
+        if saved_notes:
+            await message.answer("Источник сохранён во входящих: " + ", ".join(f"#{note['id']}" for note in saved_notes) + ". /inbox — разобрать; /find — найти. Оригинальные вложения в SQL не хранятся.")
+    except ValueError as error:
+        await message.answer(str(error))
+    except Exception as error:
+        logger.warning("Source capture unavailable error=%s", type(error).__name__)
+        await message.answer("Не удалось сохранить источник во входящих; ответ сохранён в чате. Повтори /capture позже.")
+
+
 async def _download_attachment(
     message: Message,
     bot: Bot,
@@ -213,6 +228,11 @@ async def assistant_message(
         collection = CollectionStore(pc_redis)
         chat_id = getattr(getattr(message, "chat", None), "id", message.from_user.id)
         raw_text = message.text or message.caption or ""
+        # Original typed commands get a result even if collection Redis is unhealthy.
+        pc_reply = await handle_pc_request(message.text or "", message.from_user.id, chat_id, pc_redis, settings.pc_agent_secret)
+        if pc_reply:
+            await status.edit_text(pc_reply)
+            return
         batch = None
         if starts_collection(raw_text):
             await collection.start(user.telegram_id if hasattr(user, "telegram_id") else message.from_user.id, chat_id)
@@ -233,9 +253,22 @@ async def assistant_message(
             await status.edit_text(str(exc))
             return
         now = _local_now()
+        from services.autonomy import touch
+        try:
+            await touch(message.from_user.id, now)
+        except Exception as error:
+            # Auxiliary initiative must never suppress the requested answer.
+            logger.warning("Assistant context unavailable error=%s", type(error).__name__)
+        if message.voice:
+            from services.pc_agent import explicit_pc_command
+            if explicit_pc_command(text):
+                await status.edit_text("Голос распознан как запрос к ноутбуку. Для управления отправь текстовую /pc команду; расшифровка не даёт разрешение на выполнение.")
+                return
+        source_material = bool(file_bytes or (message.voice and len(text) >= 200))
         files = []
         if file_bytes:
             extracted, native = await normalize(file_bytes, filename, mime_type or "application/octet-stream")
+            source_material = bool(extracted or getattr(message, "caption", None))
             text = f"{text}\n\n[{filename}]\n{extracted}" if extracted else text
             if native:
                 files.append(native)
@@ -252,6 +285,7 @@ async def assistant_message(
             return
         if batch:
             text, files = batch
+            source_material = True
         elif collecting:
             count = await collection.append(message.from_user.id, chat_id, text, files)
             await status.edit_text(f"Сохранён материал {count}. /done — анализировать вместе.")
@@ -268,16 +302,14 @@ async def assistant_message(
                 return
             batch = await collection.finish(message.from_user.id, chat_id)
             text, files = batch
+            source_material = True
 
         if not files and not batch:
-            pc_reply = await handle_pc_request(message.text or "", message.from_user.id, chat_id, pc_redis, settings.pc_agent_secret)
-            if pc_reply:
-                await status.edit_text(pc_reply)
-                return
             direct_reply = await try_direct_answer(message.from_user.id, text, now)
             if direct_reply:
                 await deliver(message, status, direct_reply)
                 delivered = True
+                await _capture_source(message, text, source_material)
                 if text.startswith(("/task ", "/remind ", "/schedule ", "/override ", "/study timer", "/calendar sync")) or direct_reply.startswith("Сохранено только"):
                     await sync_assignment_jobs(scheduler, bot, message.from_user.id)
                     await sync_schedule_jobs(scheduler, bot, message.from_user.id)
@@ -305,6 +337,7 @@ async def assistant_message(
         # Critical v3 rule: the user sees the reply before any structured extraction.
         await deliver(message, status, reply)
         delivered = True
+        await _capture_source(message, text, source_material)
         if batch:
             if reply.startswith("Сейчас AI-каналы не ответили"):
                 await message.answer("Материалы остаются в сборе до истечения TTL. Повтори /done или удали /cancel_collect.")

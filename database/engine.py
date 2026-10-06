@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from config import get_settings
 import database.notification_models  # noqa: F401  # register v3 notification tables
 import database.v4_models  # noqa: F401
+import database.assistant_models  # noqa: F401
 
 settings = get_settings()
 def normalize_database_url(url: str) -> str:

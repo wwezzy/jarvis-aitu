@@ -26,6 +26,13 @@ async def start_command(message: Message) -> None:
     await ensure_user(message.from_user.id, message.from_user.full_name)
     text = (
         "JARVIS ONLINE\n\n"
+        "/next — один шаг к твоей цели\n"
+        "/bored — скучно или трудно начать\n"
+        "/autopilot — инициативный режим и пауза\n"
+        "/goals · /checkin — ориентиры и явные отметки\n"
+        "/focus — защищённое время с обратной связью\n"
+        "/capture · /inbox · /find — собрать и разобрать информацию\n"
+        "/activity — наблюдаемое время работы и игр\n"
         "/today — текущий протокол\n"
         "/deadlines — задания и дедлайны\n"
         "/lms_sync — синхронизация Moodle/LMS\n"

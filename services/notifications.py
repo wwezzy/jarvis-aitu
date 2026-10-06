@@ -64,7 +64,7 @@ async def claim_notification(
         return True
 
 
-async def is_dnd(user_id: int, now: datetime) -> bool:
+async def is_dnd(user_id: int, now: datetime, *, include_focus=True) -> bool:
     from services.preferences import get_preferences
     from services.schedule import resolve_day
     local = aware(now)
@@ -73,6 +73,9 @@ async def is_dnd(user_id: int, now: datetime) -> bool:
     sleeping = (clock >= prefs.dnd_start or clock < prefs.dnd_end) if prefs.dnd_start > prefs.dnd_end else prefs.dnd_start <= clock < prefs.dnd_end
     if sleeping:
         return True
+    from services.autonomy import focus_running
+    if include_focus and await focus_running(user_id, local):
+        return True
     blocks = await resolve_day(user_id, local.date())
     return any(b['start'] <= clock < b['end'] and (
         b['category'] in {'training', 'sleep', 'deep_work'}
@@ -80,6 +83,9 @@ async def is_dnd(user_id: int, now: datetime) -> bool:
 
 
 def notification_buttons(row):
+    if row.kind in {"autonomy", "focuscoach"}:
+        from handlers.initiative import initiative_buttons
+        return initiative_buttons()
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     buttons = []
     if row.task_id:
@@ -95,6 +101,20 @@ def notification_buttons(row):
 async def _still_relevant(row, now):
     if row.expires_at and aware(row.expires_at) <= aware(now):
         return False
+    if row.kind == "autonomy":
+        from services.autonomy import autonomy_relevant, active_focus
+        if not await autonomy_relevant(row.user_id, now) or await active_focus(row.user_id):
+            return False
+    if row.kind == "focus":
+        from services.autonomy import active_focus
+        focus = await active_focus(row.user_id)
+        if not focus or row.event_key != f"focus:{focus['id']}":
+            return False
+    if row.kind == "focuscoach":
+        from services.autonomy import active_focus, autonomy_relevant
+        focus = await active_focus(row.user_id)
+        if not focus or row.event_key != f"focuscoach:{focus['id']}" or not await autonomy_relevant(row.user_id, now):
+            return False
     if row.task_id:
         async with async_session_factory() as db:
             task = await db.get(Assignment, row.task_id)
@@ -126,7 +146,7 @@ async def deliver(bot, delivery_id, *, now=None, **kwargs):
             row.status = "cancelled"
             await db.commit()
             return False
-        if not row.critical and await is_dnd(row.user_id, now):
+        if not row.critical and await is_dnd(row.user_id, now, include_focus=row.kind != "focuscoach"):
             return False
         claim = await db.execute(update(NotificationDelivery).where(
             NotificationDelivery.id == delivery_id, NotificationDelivery.status == "queued"

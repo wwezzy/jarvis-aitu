@@ -62,4 +62,4 @@ async def test_v1_upgrade_preserves_utc_and_usage(db):
         await connection.run_sync(upgrade)
         await connection.run_sync(upgrade)
         assert str(await session.scalar(text('SELECT due_at FROM assignments'))).startswith('2030-01-08 10:00')
-        assert await session.scalar(text('SELECT max(version) FROM jarvis_schema_version')) == 2
+        assert await session.scalar(text('SELECT max(version) FROM jarvis_schema_version')) == 3

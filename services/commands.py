@@ -65,6 +65,14 @@ async def route_command(user_id, text, now):
     lowered = raw.lower()
     command, _, body = raw.partition(" ")
     command = command.split("@")[0].lower()
+    from services.autonomy import autonomy_command
+    from services.knowledge import knowledge_command
+    value = await autonomy_command(user_id, raw, now)
+    if value is not None:
+        return value
+    value = await knowledge_command(user_id, raw)
+    if value is not None:
+        return value
     if command == "/research":
         from services.research import research
         from services.rate_limit import allow

@@ -419,6 +419,11 @@ async def register_master_schedule(
 ) -> int:
     scheduler.add_job(flush_queued, "interval", seconds=60, args=[bot, user_id],
         id=f"notifications:flush:{user_id}", replace_existing=True, max_instances=1, coalesce=True)
+    from services.autonomy import assistant_tick
+    scheduler.add_job(assistant_tick, "interval", minutes=5, args=[bot, user_id],
+        id=f"assistant:tick:{user_id}", replace_existing=True, max_instances=1, coalesce=True)
+    scheduler.add_job(sync_activity, "interval", minutes=1, args=[user_id, bot],
+        id=f"assistant:activity:{user_id}", replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(send_quiz_open_notices, 'interval', minutes=5, args=[bot, user_id],
         id=f'quiz:open:{user_id}', replace_existing=True, max_instances=1, coalesce=True)
     block_jobs = 0
@@ -481,6 +486,22 @@ async def sync_google_calendar(scheduler, bot, user_id):
             await sync_schedule_jobs(scheduler, bot, user_id)
     except Exception as exc:
         logger.warning('Calendar sync failed error=%s', type(exc).__name__)
+
+
+async def sync_activity(user_id, bot=None):
+    from services.activity import ingest_activity
+    from services.redis_backend import create_redis
+    redis = create_redis()
+    try:
+        await ingest_activity(redis, user_id, settings.pc_agent_secret)
+        if bot:
+            from services.autonomy import focus_drift_notice
+            await focus_drift_notice(bot, user_id)
+    except Exception as error:
+        logger.warning("Activity unavailable error=%s", type(error).__name__)
+    finally:
+        if redis is not None and hasattr(redis, "aclose"):
+            await redis.aclose()
 
 
 async def send_quiz_open_notices(bot, user_id):

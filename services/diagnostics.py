@@ -15,7 +15,7 @@ from services.telemetry import daily_usage
 
 async def diagnostics(user_id, scheduler=None, *, factory=None, lms_reader=None, counts_reader=None):
     settings = get_settings()
-    data = {"version": "4", "commit": os.getenv("APP_COMMIT") or os.getenv("RENDER_GIT_COMMIT") or "unknown",
+    data = {"version": "4.1", "commit": os.getenv("APP_COMMIT") or os.getenv("RENDER_GIT_COMMIT") or "unknown",
             "database": {"type": "PostgreSQL" if engine.DATABASE_URL.startswith("postgresql") else "SQLite"},
             "scheduler": {"running": bool(getattr(scheduler, "running", False)), "jobs": len(scheduler.get_jobs()) if scheduler else 0},
             "providers": get_llm_diagnostics(),
@@ -40,6 +40,16 @@ async def diagnostics(user_id, scheduler=None, *, factory=None, lms_reader=None,
             data["usage"] = await daily_usage(user_id)
     except Exception:
         data["usage"] = {"status": "unavailable"}
+    try:
+        from services.autonomy import active_focus
+        from services.preferences import get_preferences
+        async with asyncio.timeout(3):
+            prefs = await get_preferences(user_id)
+            focus = await active_focus(user_id)
+            data["assistant"] = {"mode": prefs.autonomy_mode, "focus_active": bool(focus),
+                "activity_receiving": prefs.activity_enabled, "auto_capture_materials": prefs.auto_capture_materials}
+    except Exception:
+        data["assistant"] = {"status": "unavailable"}
     try:
         async with asyncio.timeout(8):
             data["redis"] = await health(redis)

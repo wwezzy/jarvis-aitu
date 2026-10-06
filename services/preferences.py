@@ -1,3 +1,4 @@
+from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from database import engine
@@ -22,6 +23,10 @@ class Preferences(BaseModel):
     muted_kinds: list[str] = Field(default_factory=list, max_length=20)
     morning_brief: bool = True
     evening_brief: bool = True
+    autonomy_mode: Literal["off", "quiet", "balanced", "active"] = "active"
+    gaming_budget_minutes: int = Field(default=60, ge=0, le=480)
+    activity_enabled: bool = False
+    auto_capture_materials: bool = True
 
 
 async def get_preferences(user_id):

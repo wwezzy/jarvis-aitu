@@ -15,7 +15,7 @@ from sqlalchemy.schema import CreateColumn
 from config import get_settings
 from database.models import Base
 
-VERSION = 2
+VERSION = 3
 ADDED = {
     "memory_facts": ("confidence", "provenance", "expires_at", "last_used_at"),
     "schedule_entries": ("location", "commute_minutes", "preparation_minutes", "importance", "provenance"),
@@ -41,8 +41,10 @@ def upgrade(connection):
         raise RuntimeError("Database schema is newer than this application; refusing downgrade")
     if current == VERSION:
         return
-    if current == 1:
-        _version_two(connection)
+    if current in {1, 2}:
+        if current == 1:
+            _version_two(connection)
+        _version_three(connection)
         return
     old_tables = set(inspect(connection).get_table_names())
     old_columns = {name: inspect(connection).get_columns(name) for name in old_tables}
@@ -77,6 +79,7 @@ def upgrade(connection):
     Base.metadata.create_all(connection)
     connection.execute(text("INSERT INTO jarvis_schema_version (version) VALUES (1)"))
     _version_two(connection)
+    _version_three(connection)
 
 
 def _version_two(connection):
@@ -84,3 +87,10 @@ def _version_two(connection):
     if "usage_source" not in columns:
         connection.execute(text("ALTER TABLE provider_usage ADD COLUMN usage_source VARCHAR(16) NOT NULL DEFAULT 'unknown'"))
     connection.execute(text("INSERT INTO jarvis_schema_version (version) VALUES (2)"))
+
+
+def _version_three(connection):
+    # Additive tables only: v4 timestamps are already UTC and stay untouched.
+    import database.assistant_models  # noqa: F401
+    Base.metadata.create_all(connection)
+    connection.execute(text("INSERT INTO jarvis_schema_version (version) VALUES (3)"))
