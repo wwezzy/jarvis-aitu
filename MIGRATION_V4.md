@@ -23,6 +23,7 @@ The same upgrade runs at normal startup. It uses a transaction and a PostgreSQL 
 
 - Version 1 adds v4 columns to existing assignments/memory/schedule tables; creates normalized LMS events, dated overrides, user settings, durable notification delivery, provider usage, study records and personal calendar events; converts pre-existing legacy naive timestamps to physical UTC once.
 - Version 2 adds `provider_usage.usage_source` with safe `unknown` default to distinguish reported/estimated/unknown token counts. Existing version-1 databases never repeat the legacy timezone conversion.
+- Version 3 adds goals/check-ins, assistant state/focus, original source notes and deduplicated activity receipts. Existing v4 UTC values remain unchanged; see ASSISTANT_V41.md.
 - SQL DateTime columns remain physically UTC without timezone. The UTCDateTime boundary accepts aware inputs or documented local naive inputs and returns aware application-local values. PostgreSQL connections explicitly use UTC.
 - New tables and identity/lookup indexes are created through registered SQLAlchemy metadata. Existing IDs, completed statuses, facts, workout records and notification claims remain in place. Versioned changes are forward-only; a newer schema version aborts startup instead of guessing a downgrade.
 
@@ -41,7 +42,7 @@ SELECT COUNT(*) FROM reminders;
 SELECT COUNT(*) FROM notification_log;
 ```
 
-Expect versions 1 and 2. Compare recorded counts and representative values to the backup. A legacy local 15:00 event in UTC+05:00 is physically 10:00 UTC and displays as 15:00; a second run must leave that physical timestamp unchanged. Check completed LMS tasks stay completed and that reminder identities do not change.
+Expect versions 1, 2 and 3. Compare recorded counts and representative values to the backup. A legacy local 15:00 event in UTC+05:00 is physically 10:00 UTC and displays as 15:00; a second run must leave that physical timestamp unchanged. Check completed LMS tasks stay completed and that reminder identities do not change.
 
 Start the staging application, open Telegram `/diag`, then execute the complete checklist in ACCEPTANCE_TESTS_V4.md. Start with all AI providers and optional integrations disabled. Re-enable integrations one at a time. Do not use production Redis command keys, a production PC secret, a production bot token or a production database for staging.
 

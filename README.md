@@ -1,4 +1,6 @@
-# Jarvis Ultimate v4
+# Jarvis Ultimate v4.1
+
+The active-assistant follow-up adds persistent goals, bounded initiative, focus protection, boredom alternatives, searchable source notes and authorized foreground-time observation. Read [ASSISTANT_V41.md](ASSISTANT_V41.md) for behavior, scientific sources, local agent diagnosis/update, migration 3 and staging checks. PR #9 was already merged; this follow-up stays on `codex/jarvis-ultimate-v4` without deploying production.
 
 Private Telegram personal assistant and authenticated Mini App. Python 3.12, aiogram 3, SQLAlchemy asyncio, PostgreSQL/SQLite, APScheduler, optional Redis, OpenAI/NVIDIA/Gemini, and an optional Windows agent.
 
@@ -75,6 +77,8 @@ Only `BOT_TOKEN` and positive numeric `ADMIN_ID` are mandatory to start. SQLite 
 | `JARVIS_PROFILE_FILE` | Optional ignored private profile path; default profile.local.md; empty disables |
 | `ENABLE_SEMANTIC_MEMORY`, `OPENAI_EMBEDDING_MODEL` | Optional pgvector ranking; default disabled, explicit embedding model and installed vector extension required |
 | `PC_AGENT_SECRET` | Shared HMAC secret in bot and agent env; use a random high-entropy value |
+| `PC_MONITOR_ENABLED` | Local Windows agent category sampling; default disabled; server receiving is enabled separately in authenticated preferences |
+| `PC_ACTIVITY_RULES_JSON` | Optional exact executable-basename to category overrides; browser activity remains unknown by default |
 | `ENABLE_GOOGLE_CALENDAR`, `ENABLE_GOOGLE_CALENDAR_WRITE` | Optional read integration and separate write gate; both default disabled |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`, `GOOGLE_CALENDAR_ID` | OAuth setup for selected calendar; all env-only |
 | `ENABLE_WEB_RESEARCH`, `WEB_RESEARCH_API_KEY` | Optional real Tavily search; disabled by default |
@@ -98,7 +102,7 @@ Only `BOT_TOKEN` and positive numeric `ADMIN_ID` are mandatory to start. SQLite 
 
 Set `ADMIN_ID`, `PC_AGENT_SECRET`, and the same standard Redis or Upstash env variables for the interactive Windows account. Use a separate Redis database/credentials and HMAC secret for staging. Install dependencies in the repository's virtual environment. Run `python agent.py` manually first, or register startup with `powershell -File scripts/install-agent.ps1`. The installer creates a current-user, limited-privilege, hidden Python task at logon; it does not embed credentials or auto-run commands. `Start-ScheduledTask JarvisPersonalAgent` starts it; `scripts/uninstall-agent.ps1` stops/removes startup while retaining replay state/logs.
 
-`/pc status` reads a signed heartbeat (online if seen within 45 seconds), last accepted command and result. `/pc lock` and `/pc hibernate` queue an exact allowlisted action. `/pc sleep` is intentionally disabled on this PC. `/pc shutdown` and `/pc restart` require the returned `/pc confirm TOKEN` in the same chat/user within 60 seconds. Commands expire after 90 seconds; a pending command cannot be overwritten. The agent atomically consumes, validates HMAC/time/nonce/user, persists its replay claim, publishes ACK, then executes a fixed API or argument list with `shell=False`. Redis failures use 2–60 second backoff. A local OS file lock prevents duplicate instances. Three rotating 1 MB logs and persistent replay/result files live in LOCALAPPDATA/Jarvis.
+`/pc status` reads a signed heartbeat (online if seen within 45 seconds), last accepted command and result. `/pc lock` and `/pc hibernate` queue an exact allowlisted action. `/pc sleep` is intentionally disabled on this PC. `/pc shutdown` and `/pc restart` require the returned `/pc confirm TOKEN` in the same chat/user within 60 seconds. Pending queue TTL is 20 seconds; a pending command cannot be overwritten. The agent atomically consumes, validates HMAC/time/nonce/user, persists its replay claim, publishes ACK, then executes a fixed API or argument list with `shell=False`. Shutdown/restart allow 30 seconds for `/pc cancel_shutdown`; no forced application closure is requested. Redis failures use 2–60 second backoff. A local OS file lock prevents duplicate instances. Three rotating 1 MB logs and persistent replay/result files live in LOCALAPPDATA/Jarvis.
 
 An ACK means accepted, not completed. Hibernate/shutdown/restart return `scheduled`; lock returns `completed`. A crash or ambiguous transport result is never automatically replayed. Verify `/pc status` before issuing a new explicit action. OS policy, logged-in session, power settings and device support still require the manual staging checks. Volume/app/URL launching, battery telemetry and Wake-on-LAN are optional extensions and are not implemented.
 
