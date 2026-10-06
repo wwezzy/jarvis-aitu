@@ -1,6 +1,6 @@
 # Active assistant: behavior, evidence and acceptance
 
-This follow-up stays on `codex/jarvis-ultimate-v4`. PR #9 already merged. No new PR, production deployment, provider network changes or edits to another checkout are performed.
+This follow-up stays on `codex/jarvis-ultimate-v4`. PR #9 already merged. No new PR, production deployment or edits to another checkout are performed. The staging Key Value IP allowlist was updated only after explicit operator confirmation.
 
 ## Initiative and feedback
 
@@ -28,6 +28,8 @@ Source notes are untrusted data, cited by ID, and cannot authorize tools. Known 
 ## PC failure and updated transport
 
 The real local probe on 2026-10-06 found an IP allowlist rejection. Redis cannot deliver commands while the laptop is blocked. The running agent came from `C:/Users/alnbu/jarvis-aitu/agent.py`; no file in that other checkout was edited. Two pythonw entries may be a venv launcher and child, not two instances.
+
+On the same date, the authorized narrow IP rule restored TLS Redis access. The local updater replaced that runtime with this checkout's agent, preserved its existing credentials and enabled category observation. The limited interactive `JarvisPersonalAgent` task was verified running, with a signed version-4.1 heartbeat. A live diagnostic `status` command returned a nonce-correlated `completed` receipt, and local minute buckets were present. No live power action was performed. These checks do not substitute for deploying the server changes or completing Telegram acceptance.
 
 Original typed requests now run before optional collection state. Exact “выключить”, “выключить ноутбук”, “Джарвис, выключи компьютер” and `/pc` commands are understood. Voice, documents and model output never authorize execution.
 
