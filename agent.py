@@ -6,6 +6,7 @@ import logging.handlers
 import os
 import subprocess
 import time
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -48,9 +49,10 @@ def execute_command(cmd):
         executable = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32" / "shutdown.exe"
         subprocess.run([str(executable), "/h"],
                        shell=False, check=True, timeout=15, capture_output=True)
-    elif cmd in {"shutdown", "restart"}:
+    elif cmd in {"shutdown", "restart", "cancel_shutdown"}:
         executable = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32" / "shutdown.exe"
-        subprocess.run([str(executable), "/s" if cmd == "shutdown" else "/r", "/t", "10"],
+        arguments = ["/a"] if cmd == "cancel_shutdown" else ["/s" if cmd == "shutdown" else "/r", "/t", "30"]
+        subprocess.run([str(executable), *arguments],
                        shell=False, check=True, timeout=15, capture_output=True)
     elif cmd != "status":
         raise ValueError("Unsupported PC command")
@@ -63,6 +65,7 @@ class Agent:
         self.guard = ReplayGuard(state_dir / "agent-replay.db")
         self.result_path = state_dir / "last-result.json"
         self.last = None
+        self.monitor = None
         if self.result_path.exists():
             try:
                 self.last = json.loads(self.result_path.read_text(encoding="utf-8"))
@@ -70,10 +73,15 @@ class Agent:
                 pass
 
     def publish(self):
-        self.redis.set(f"jarvis:pc_status:{self.user_id}", signed_status({
+        data = signed_status({
             "user_id": self.user_id, "seen_at": int(time.time()), "state": "running",
-            "version": "4", "last_result": self.last,
-        }, self.secret), ex=86400)
+            "version": "4.1", "last_result": self.last,
+            "monitoring": self.monitor is not None,
+            "activity_category": self.monitor.current if self.monitor else None,
+        }, self.secret)
+        if self.last:
+            self.redis.set(f"jarvis:pc_result:{self.user_id}:{self.last['nonce']}", data, ex=86400)
+        self.redis.set(f"jarvis:pc_status:{self.user_id}", data, ex=86400)
 
     def record(self, command, nonce, state, error=None):
         self.last = {"command": command, "nonce": nonce, "state": state,
@@ -84,6 +92,12 @@ class Agent:
 
     def tick(self):
         self.publish()
+        if self.monitor:
+            try:
+                self.monitor.sync(self.redis, self.user_id, self.secret)
+            except Exception as error:
+                # Optional observation must not prevent authenticated commands.
+                logger.warning("Activity sync unavailable: %s", type(error).__name__)
         payload = self.redis.getdel(f"jarvis:pc_command:{self.user_id}")
         if not payload:
             return
@@ -93,8 +107,7 @@ class Agent:
             return
         nonce = json.loads(payload)["nonce"]
         self.record(command, nonce, "accepted")
-        # ACK before suspend/shutdown; never confuse accepted with completed.
-        # If ACK cannot be published, do not execute or replay the command.
+        # Persist replay claim and publish ACK before any OS effect.
         self.publish()
         try:
             self.execute(command)
@@ -104,14 +117,41 @@ class Agent:
         self.publish()
 
 
+def local_config(state_dir):
+    load_dotenv(state_dir / "agent.env", override=True)
+    load_dotenv(override=False)
+
+
+def doctor():
+    """Read-only diagnostics. Never consumes commands or dumps configuration."""
+    from services.redis_backend import backend_name, safe_transport_reason
+    state_dir = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "Jarvis"
+    local_config(state_dir)
+    report = {"version": "4.1", "windows": os.name == "nt", "backend": backend_name(),
+        "admin_configured": bool(os.getenv("ADMIN_ID", "").isdigit() and int(os.getenv("ADMIN_ID", "0")) > 0),
+        "secret_configured": bool(os.getenv("PC_AGENT_SECRET")),
+        "monitoring_enabled": os.getenv("PC_MONITOR_ENABLED", "0").lower() in {"1", "true", "yes"}}
+    try:
+        redis = create_redis(sync=True)
+        report["redis_healthy"] = bool(redis and redis.ping())
+        if redis:
+            from services.pc_agent import read_status
+            user_id, secret = int(os.getenv("ADMIN_ID", "0")), os.getenv("PC_AGENT_SECRET", "")
+            data = read_status(redis.get(f"jarvis:pc_status:{user_id}"), user_id, secret)
+            report["heartbeat_verified"] = bool(data and time.time() - data["seen_at"] <= 45)
+            report["agent_version"] = data.get("version") if data else None
+    except Exception as error:
+        report.update(redis_healthy=False, reason=safe_transport_reason(error), error_class=type(error).__name__)
+    return report
+
+
 def start_agent():
     # Prefer a per-user agent env outside the repository. This keeps the
     # external Redis credential and HMAC secret out of git and makes Task
     # Scheduler startup independent from the interactive shell environment.
     state_dir = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "Jarvis"
     state_dir.mkdir(parents=True, exist_ok=True)
-    load_dotenv(state_dir / "agent.env", override=True)
-    load_dotenv(override=False)
+    local_config(state_dir)
     user_id, secret = int(os.getenv("ADMIN_ID", "0")), os.getenv("PC_AGENT_SECRET", "")
     redis = create_redis(sync=True)
     if user_id <= 0 or not secret or redis is None:
@@ -124,6 +164,19 @@ def start_agent():
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     agent = Agent(redis, user_id, secret, state_dir)
+    stop_monitor, monitor_thread = threading.Event(), None
+    if os.getenv("PC_MONITOR_ENABLED", "0").lower() in {"1", "true", "yes"}:
+        from services.activity import ActivityJournal
+        agent.monitor = ActivityJournal(state_dir / "activity.db")
+        def record_activity():
+            while not stop_monitor.is_set():
+                try:
+                    agent.monitor.tick()
+                except Exception as error:
+                    logger.warning("Activity sample unavailable error=%s", type(error).__name__)
+                stop_monitor.wait(2)
+        monitor_thread = threading.Thread(target=record_activity, name="JarvisActivity", daemon=True)
+        monitor_thread.start()
     backoff = 2
     try:
         while True:
@@ -131,13 +184,35 @@ def start_agent():
                 agent.tick()
                 backoff = 2
             except Exception as exc:
-                logger.warning("Agent transport failure error=%s", type(exc).__name__)
+                from services.redis_backend import safe_transport_reason
+                logger.warning("Agent transport failure error=%s reason=%s", type(exc).__name__, safe_transport_reason(exc))
                 backoff = min(backoff * 2, 60)
             time.sleep(backoff)
     finally:
+        stop_monitor.set()
+        if monitor_thread:
+            monitor_thread.join(timeout=3)
         instance.close()
         handler.close()
 
 
 if __name__ == "__main__":
-    start_agent()
+    import argparse
+    parser = argparse.ArgumentParser(description="Jarvis Windows agent")
+    parser.add_argument("--doctor", action="store_true", help="Read-only safe diagnostics")
+    parser.add_argument("--clear-activity", action="store_true", help="Delete only local activity history while the agent is stopped")
+    options = parser.parse_args()
+    if options.doctor:
+        print(json.dumps(doctor(), ensure_ascii=False, indent=2))
+    elif options.clear_activity:
+        state_dir = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "Jarvis"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        instance = SingleInstance(state_dir / "agent.lock")
+        try:
+            from services.activity import ActivityJournal
+            ActivityJournal(state_dir / "activity.db").clear()
+            print("Local activity history cleared.")
+        finally:
+            instance.close()
+    else:
+        start_agent()

@@ -54,6 +54,45 @@ function Unregister-ScheduledTask { param($TaskName,[bool]$Confirm) $global:jarv
     assert json.loads(response.stdout.strip().splitlines()[-1]) == {'stopped': 'JarvisPersonalAgent', 'removed': 'JarvisPersonalAgent'}
 
 
+def test_updater_preserves_configuration_and_targets_only_identified_agent(tmp_path):
+    state = tmp_path / 'Jarvis'
+    state.mkdir()
+    config = state / 'agent.env'
+    original = 'ADMIN_ID=42\nPC_AGENT_SECRET=offline-test-only\nPC_MONITOR_ENABLED=0\n'
+    config.write_text(original, encoding='utf-8')
+    previous = tmp_path / 'old' / 'agent.py'
+    previous.parent.mkdir()
+    previous.touch()
+    script = r'''
+$ErrorActionPreference = 'Stop'
+$global:jarvisTestPids = @()
+function Get-ScheduledTask { param($TaskName,$ErrorAction) return @{name=$TaskName} }
+function Stop-ScheduledTask { param($TaskName,$ErrorAction) $global:jarvisTestStopped=$TaskName }
+function Stop-Process { param($Id,$ErrorAction) $global:jarvisTestPids += $Id }
+function New-ScheduledTaskAction { param($Execute,$Argument,$WorkingDirectory) return @{exe=$Execute;args=$Argument;cwd=$WorkingDirectory} }
+function New-ScheduledTaskTrigger { param([switch]$AtLogOn,$User) return @{} }
+function New-ScheduledTaskPrincipal { param($UserId,$LogonType,$RunLevel) return @{level=$RunLevel} }
+function New-ScheduledTaskSettingsSet { param($MultipleInstances,$ExecutionTimeLimit,[switch]$StartWhenAvailable,$RestartCount,$RestartInterval,[switch]$AllowStartIfOnBatteries,[switch]$DontStopIfGoingOnBatteries) return @{} }
+function Register-ScheduledTask { param($TaskName,$Action,$Trigger,$Principal,$Settings,[switch]$Force) $global:jarvisTestRegistration=@{name=$TaskName;action=$Action;principal=$Principal} }
+function Start-ScheduledTask { param($TaskName) $global:jarvisTestStarted=$TaskName }
+'''
+    script += '\nfunction Get-CimInstance { param($ClassName,$Filter) return @(' + (
+        '@{ProcessId=111;CommandLine=' + ps_quote(f'pythonw.exe "{previous}"') + '},'
+        '@{ProcessId=222;CommandLine=\'pythonw.exe "C:\\foreign\\agent.py"\'}) }\n')
+    script += f"& {ps_quote(ROOT / 'scripts/update-agent.ps1')} -PythonPath {ps_quote(sys.executable)} -PreviousAgentPath {ps_quote(previous)} -EnableMonitoring -AllowOfflineMonitoring\n"
+    script += '@{pids=$global:jarvisTestPids;started=$global:jarvisTestStarted;stopped=$global:jarvisTestStopped;registration=$global:jarvisTestRegistration} | ConvertTo-Json -Depth 5 -Compress'
+    environment = {**os.environ, 'LOCALAPPDATA': str(tmp_path), 'PC_AGENT_SECRET': 'offline-test-only'}
+    response = subprocess.run([shutil.which('pwsh') or 'powershell', '-NoProfile', '-NonInteractive', '-Command', script],
+        env=environment, capture_output=True, text=True, timeout=30, check=True)
+    data = json.loads(response.stdout.strip().splitlines()[-1])
+    assert data['pids'] == [111]
+    assert data['started'] == data['stopped'] == 'JarvisPersonalAgent'
+    assert data['registration']['principal']['level'] == 'Limited'
+    assert Path(data['registration']['action']['cwd']) == ROOT
+    assert config.read_text(encoding='utf-8') == original.replace('PC_MONITOR_ENABLED=0', 'PC_MONITOR_ENABLED=1')
+    assert 'offline-test-only' not in response.stdout + response.stderr
+
+
 def test_agent_reconnect_backoff_resets_after_success(tmp_path, monkeypatch):
     monkeypatch.setenv('ADMIN_ID', '42')
     monkeypatch.setenv('PC_AGENT_SECRET', 'offline-test-only')

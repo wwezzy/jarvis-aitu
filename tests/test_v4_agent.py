@@ -13,12 +13,14 @@ from services.redis_backend import NativeAsyncRedis
 
 async def test_confirmation_bound_to_user_chat_and_one_use():
     redis = NativeAsyncRedis(fakeredis.aioredis.FakeRedis(decode_responses=True))
+    import time
+    await redis.set('jarvis:pc_status:42', signed_status({'user_id': 42, 'seen_at': int(time.time())}, 'test-only'))
     reply = await handle_pc_request('/pc shutdown', 42, 100, redis, 'test-only')
     assert await redis.get('jarvis:pc_command:42') is None
     token = re.search(r'confirm ([a-f0-9]+)', reply)[1]
     assert 'истекло' in await handle_pc_request('/pc confirm ' + token, 43, 100, redis, 'test-only')
     assert 'истекло' in await handle_pc_request('/pc confirm ' + token, 42, 101, redis, 'test-only')
-    assert 'queued' in await handle_pc_request('/pc confirm ' + token, 42, 100, redis, 'test-only')
+    assert 'queued' in await handle_pc_request('/pc confirm ' + token, 42, 100, redis, 'test-only', wait_seconds=0)
     assert 'истекло' in await handle_pc_request('/pc confirm ' + token, 42, 100, redis, 'test-only')
     assert json.loads(await redis.get('jarvis:pc_command:42'))['cmd'] == 'shutdown'
     assert 'ожидает' in await handle_pc_request('/pc lock', 42, 100, redis, 'test-only')
@@ -62,3 +64,16 @@ def test_single_instance_lock_released(tmp_path):
     finally:
         instance.close()
     SingleInstance(tmp_path / 'lock').close()
+
+
+def test_failed_optional_observation_does_not_block_pc_command(tmp_path):
+    redis = fakeredis.FakeRedis(decode_responses=True)
+    execute = Mock()
+    agent = Agent(redis, 42, 'test-only', tmp_path, execute)
+    agent.monitor = Mock(current='unknown')
+    agent.monitor.sync.side_effect = OSError('PRIVATE_PAYLOAD')
+    redis.set('jarvis:pc_command:42', build_signed_command('status', 42, 'test-only'))
+    agent.tick()
+    execute.assert_called_once_with('status')
+    assert agent.last['state'] == 'completed'
+    assert 'PRIVATE_PAYLOAD' not in redis.get('jarvis:pc_status:42')

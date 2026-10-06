@@ -5,6 +5,20 @@ No memory emulation: absence or failure is reported by the feature using Redis.
 import os
 
 
+def safe_transport_reason(error):
+    """Map transport exceptions to fixed labels; never echo Redis URLs/passwords."""
+    value = str(error).lower()
+    if "allowlist" in value or "allow list" in value:
+        return "ip_not_allowed"
+    if any(marker in value for marker in ("wrongpass", "noauth", "authentication", "auth failed")):
+        return "authentication_failed"
+    if "noperm" in value:
+        return "permission_denied"
+    if "timeout" in value or type(error).__name__ == "TimeoutError":
+        return "timeout"
+    return "transport_unavailable"
+
+
 class NativeAsyncRedis:
     def __init__(self, client):
         self.client = client
@@ -53,4 +67,4 @@ async def health(client):
         await client.ping()
         return {"backend": backend_name(), "healthy": True}
     except Exception as exc:
-        return {"backend": backend_name(), "healthy": False, "error": type(exc).__name__}
+        return {"backend": backend_name(), "healthy": False, "error": type(exc).__name__, "reason": safe_transport_reason(exc)}

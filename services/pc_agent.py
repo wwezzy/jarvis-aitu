@@ -7,6 +7,8 @@ import re
 import sqlite3
 import time
 import uuid
+import asyncio
+from contextlib import closing
 
 VALID_COMMANDS = {"lock", "sleep", "hibernate", "shutdown", "restart", "status", "cancel_shutdown"}
 
@@ -20,8 +22,9 @@ def explicit_pc_command(text: str) -> str | None:
     }
     normalized = text.strip().lower().rstrip(".!?")
     normalized = re.sub(r"^(?:джарвис|jarvis)[, ]+", "", normalized)
-    normalized = re.sub(r"\b(?:ноутбук|ноут|пк)\b", "компьютер", normalized)
+    normalized = re.sub(r"\b(?:ноутбук|ноут|пк|комп)\b", "компьютер", normalized)
     aliases.update({"выключить компьютер": "shutdown", "перезагрузить компьютер": "restart",
+                    "выключить": "shutdown", "выключи": "shutdown",
                     "отмени выключение": "cancel_shutdown", "отмени перезагрузку": "cancel_shutdown",
                     "статус компьютера": "status"})
     for command in VALID_COMMANDS:
@@ -92,14 +95,14 @@ class ReplayGuard:
 
     def __init__(self, path):
         self.path = str(path)
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.execute("CREATE TABLE IF NOT EXISTS consumed (nonce TEXT PRIMARY KEY, expires INTEGER NOT NULL)")
 
     def claim(self, payload: str) -> bool:
         # Only pass a payload after successful signature verification.
         data = json.loads(payload)
         now = int(time.time())
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.execute("DELETE FROM consumed WHERE expires < ?", (now,))
             result = db.execute("INSERT OR IGNORE INTO consumed VALUES (?, ?)",
                                 (data["nonce"], data["issued_at"] + 90))
@@ -124,12 +127,14 @@ def signed_status(data, secret):
 
 def read_status(raw, user_id, secret):
     try:
+        if not secret or not isinstance(raw, str) or len(raw) > 50000:
+            return None
         envelope = json.loads(raw)
         expected = hmac.new(secret.encode(), envelope["body"].encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, envelope["sig"]):
             return None
         data = json.loads(envelope["body"])
-        if data["user_id"] != user_id or type(data["seen_at"]) is not int or data["seen_at"] > time.time() + 30:
+        if type(data["user_id"]) is not int or data["user_id"] != user_id or type(data["seen_at"]) is not int or data["seen_at"] > time.time() + 30:
             return None
         return data
     except (ValueError, TypeError, KeyError, AttributeError):
@@ -146,33 +151,78 @@ async def pc_status(redis, user_id, secret):
             return {"online": False, "state": "heartbeat unavailable"}
         return {**data, "online": time.time() - data["seen_at"] <= 45}
     except Exception as exc:
-        return {"online": False, "state": "unavailable", "error": type(exc).__name__}
+        from services.redis_backend import safe_transport_reason
+        return {"online": False, "state": "unavailable", "error": type(exc).__name__, "reason": safe_transport_reason(exc)}
 
 
-async def handle_pc_request(text, user_id, chat_id, redis, secret):
+def offline_help(status):
+    reason = status.get("reason")
+    if reason == "ip_not_allowed":
+        return "Redis отклоняет IP ноутбука. Проверь Networking → IP allow list нужного экземпляра и внешний TLS REDIS_URL. agent.py --doctor покажет причину."
+    if reason == "authentication_failed":
+        return "Redis отклонил учётные данные. Проверь существующую локальную конфигурацию и выбранный экземпляр; не отправляй секреты в чат."
+    return "Ноутбук не подтвердил связь: нет свежего подписанного heartbeat. Проверь agent.py --doctor, автозапуск, сеть и одинаковые ADMIN_ID/PC_AGENT_SECRET/Redis."
+
+
+async def wait_receipt(redis, user_id, secret, nonce, seconds=6):
+    end = asyncio.get_running_loop().time() + seconds
+    accepted = None
+    while True:
+        raw = await redis.get(f"jarvis:pc_result:{user_id}:{nonce}")
+        data = read_status(raw, user_id, secret) if raw else None
+        result = data.get("last_result") if data else None
+        if isinstance(result, dict) and result.get("nonce") == nonce:
+            accepted = result
+            if result.get("state") in {"completed", "scheduled", "failed"}:
+                return result
+        if asyncio.get_running_loop().time() >= end:
+            return accepted
+        await asyncio.sleep(0.25)
+
+
+async def handle_pc_request(text, user_id, chat_id, redis, secret, *, wait_seconds=6):
     """Call ONLY with original Telegram text, never transcripts/model output."""
-    normalized = text.strip().lower()
-    if normalized == "/pc sleep":
-        return "Sleep отключён на этом ПК. Используй /pc hibernate."
     command = explicit_pc_command(text)
+    if command == "sleep":
+        return "Sleep отключён на этом ПК. Используй /pc hibernate (поддержка зависит от настроек Windows)."
+    if text.strip().lower() == "/pc diagnose":
+        status = await pc_status(redis, user_id, secret)
+        return "Подписанная связь с ноутбуком работает." if status["online"] else offline_help(status)
     confirm = re.fullmatch(r"/pc confirm ([a-f0-9]{16})", text.strip())
     if command is None and confirm is None:
-        return None
+        return "/pc status · diagnose · lock · hibernate · shutdown · restart · cancel_shutdown. Выключение/перезапуск требуют отдельного подтверждения." if text.strip().lower().startswith("/pc") else None
     if redis is None or not secret:
         return "PC-agent unavailable: Redis/PC_AGENT_SECRET is not configured."
     if command == "status":
         return "PC: " + json.dumps(await pc_status(redis, user_id, secret), ensure_ascii=False)
-    if confirm:
-        raw = await redis.getdel(f"jarvis:pc_confirm:{user_id}:{chat_id}:{confirm[1]}")
-        if raw not in {"shutdown", "restart"}:
-            return "Подтверждение истекло или уже использовано. Повтори исходную команду."
-        command = raw
-    elif command in {"shutdown", "restart"}:
-        token = uuid.uuid4().hex[:16]
-        await redis.set(f"jarvis:pc_confirm:{user_id}:{chat_id}:{token}", command, ex=60)
-        return f"Подтверди {command} в течение 60 секунд: /pc confirm {token}"
-    payload = build_signed_command(command, user_id, secret)
-    queued = await redis.set(f"jarvis:pc_command:{user_id}", payload, ex=90, nx=True)
-    if queued is False or queued is None:
-        return "Команда уже ожидает выполнения. Проверь /pc status; повтори после её обработки."
-    return f"Signed PC command queued: {command}. Receipt: {json.loads(payload)['nonce']}. /pc status — ACK/result."
+    try:
+        if confirm:
+            raw = await redis.getdel(f"jarvis:pc_confirm:{user_id}:{chat_id}:{confirm[1]}")
+            if raw not in {"shutdown", "restart"}:
+                return "Подтверждение истекло или уже использовано. Повтори исходную команду."
+            command = raw
+        status = await pc_status(redis, user_id, secret)
+        if not status["online"]:
+            return "Команда не отправлена. " + offline_help(status)
+        if not confirm and command in {"shutdown", "restart"}:
+            token = uuid.uuid4().hex[:16]
+            await redis.set(f"jarvis:pc_confirm:{user_id}:{chat_id}:{token}", command, ex=60)
+            return f"Ноутбук на связи. Подтверди {command} в течение 60 секунд: /pc confirm {token}. Windows получит 30 секунд для отмены: /pc cancel_shutdown."
+        payload = build_signed_command(command, user_id, secret)
+        queued = await redis.set(f"jarvis:pc_command:{user_id}", payload, ex=20, nx=True)
+        if queued is False or queued is None:
+            return "Команда уже ожидает выполнения. Проверь /pc status; повтори после её обработки."
+        nonce = json.loads(payload)["nonce"]
+        result = await wait_receipt(redis, user_id, secret, nonce, wait_seconds)
+        if not result:
+            return f"Команда queued: {command}; подтверждения от агента пока нет. Выполнение НЕ подтверждено. Ожидание максимум 20 секунд; /pc status. Receipt: {nonce}"
+        if result["state"] == "failed":
+            return f"Агент получил команду, Windows вернул ошибку: {result.get('error', 'unknown')}. /pc diagnose и локальный agent.py --doctor. Повтор автоматически не выполняется."
+        if result["state"] == "scheduled":
+            return f"Windows подтвердил планирование {command}. Это ещё не подтверждение выключенного питания. /pc cancel_shutdown — отменить shutdown/restart в течение 30 секунд. Receipt: {nonce}"
+        if result["state"] == "completed":
+            return f"Агент подтвердил выполнение {command}. Receipt: {nonce}"
+        return f"Агент принял {command}, результат ещё ожидается. /pc status. Receipt: {nonce}"
+    except Exception as exc:
+        from services.redis_backend import safe_transport_reason
+        return "Результат команды не подтверждён; автоматического повтора нет. " + offline_help({"reason": safe_transport_reason(exc)})

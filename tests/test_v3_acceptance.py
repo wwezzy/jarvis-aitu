@@ -158,13 +158,18 @@ async def test_model_pc_output_cannot_queue_commands(monkeypatch, message):
 async def test_explicit_pc_command_works_without_ai(monkeypatch, message):
     from dataclasses import replace
     from services.pc_agent import verify_signed_command
+    from services.pc_agent import signed_status
+    import time
 
     message.text = "/pc lock"
     monkeypatch.setattr(assistant, "settings", replace(assistant.settings, pc_agent_secret="test-only"))
     monkeypatch.setattr(assistant, "ensure_user", AsyncMock())
     parse = AsyncMock(side_effect=AssertionError("No AI for PC commands"))
     monkeypatch.setattr(assistant, "generate_reply", parse)
-    redis = SimpleNamespace(set=AsyncMock(return_value=True), get=AsyncMock(return_value=None))
+    heartbeat = signed_status({'user_id': 42, 'seen_at': int(time.time())}, 'test-only')
+    redis = SimpleNamespace(set=AsyncMock(return_value=True), get=AsyncMock(return_value=heartbeat))
+    from services import pc_agent
+    monkeypatch.setattr(pc_agent, 'wait_receipt', AsyncMock(return_value={'state': 'completed'}))
     await assistant.assistant_message(message, Mock(), Mock(), redis)
     parse.assert_not_awaited()
     assert verify_signed_command(redis.set.call_args.args[1], 42, "test-only") == "lock"
