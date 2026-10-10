@@ -13,7 +13,7 @@ Run on a dedicated staging bot, service, PostgreSQL copy and Redis namespace/dat
 ## 1. Migration rehearsal
 
 - [ ] Complete MIGRATION_V4.md backup/restore steps against a staging copy; record baseline counts and representative UTC/local times privately.
-- [ ] Run `init_db()` twice. Versions are 1 and 2. Counts, IDs, memory, workouts and done statuses are preserved; the second run does not shift timestamps.
+- [ ] Run `init_db()` twice. Versions are 1, 2 and 3. Counts, IDs, memory, workouts and done statuses are preserved; the second run does not shift timestamps.
 - [ ] Restart staging twice. Existing history/tasks/overrides/preferences persist; no duplicate seeded schedule or delivered notices appear.
 - [ ] Rehearse rollback to the backup copy with the former staging commit. Keep production untouched.
 
