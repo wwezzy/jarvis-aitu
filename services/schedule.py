@@ -384,17 +384,32 @@ async def resolve_day(user_id: int, on_date: date, *, rows=None, now=None) -> li
         elif not override.cancelled:
             blocks[f"dated:{override.id}"] = dict(override.changes, id=f"dated:{override.id}",
                 override_id=override.id, provenance=override.provenance)
+    from services.preferences import get_preferences
+    prefs = await get_preferences(user_id) if lms_events else None
     for row in lms_events + personal:
         start = max(left, row.starts_at)
         # Unknown class duration remains explicit; use a one-hour planning reserve.
         end = min(right - timedelta(minutes=1), row.ends_at or start + timedelta(hours=1))
         identity = f"lms:{row.id}" if isinstance(row, LmsEvent) else f"google:{row.id}"
-        if any(b["title"] == row.title and b["start"] == start.strftime("%H:%M") for b in blocks.values()):
+        candidates = [b for b in blocks.values() if b["start"] == start.strftime("%H:%M")
+                      and b.get("category") == "study" and b.get("block_type") == "fixed"]
+        exact = [b for b in blocks.values() if b["start"] == start.strftime("%H:%M")
+                 and b["title"].casefold() == row.title.casefold()]
+        # Moodle attendance is evidence about a slot, not a second named class.
+        # Only merge with one unambiguous fixed study occurrence at that start.
+        matches = exact or (candidates if isinstance(row, LmsEvent) and row.event_type == "attendance"
+                            and len(candidates) == 1 and not str(candidates[0]["id"]).startswith("lms:") else [])
+        if len(matches) == 1:
+            matches[0].setdefault("linked_sources", []).append({"id": identity,
+                "source": "LMS" if isinstance(row, LmsEvent) else "Google Calendar",
+                "title": row.title})
             continue
         blocks[identity] = dict(id=identity, external_id=row.external_id if isinstance(row, PersonalCalendarEvent) else None,
             start=start.strftime("%H:%M"), end=end.strftime("%H:%M"),
             title=row.title, category="study" if isinstance(row, LmsEvent) else "flex", block_type="fixed",
-            notify_before_min=60, commute_minutes=0, preparation_minutes=0, importance=5,
+            notify_before_min=None if isinstance(row, LmsEvent) and row.event_type == "attendance"
+                and not prefs.lms_attendance_notices else 60,
+            commute_minutes=0, preparation_minutes=0, importance=5,
             provenance="LMS" if isinstance(row, LmsEvent) else "Google Calendar",
             duration_estimated=row.ends_at is None, enabled=True)
     result = sorted(blocks.values(), key=lambda b: (b["start"], str(b["id"])))

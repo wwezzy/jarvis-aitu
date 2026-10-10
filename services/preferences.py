@@ -20,6 +20,7 @@ class Preferences(BaseModel):
     free_fraction: float = Field(default=0.3, ge=0.15, le=0.75)
     course_weights: dict[str, int] = Field(default_factory=dict, max_length=50)
     quiz_open_notices: bool = False
+    lms_attendance_notices: bool = False
     muted_kinds: list[str] = Field(default_factory=list, max_length=20)
     morning_brief: bool = True
     evening_brief: bool = True

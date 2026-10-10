@@ -11,6 +11,16 @@ import asyncio
 from contextlib import closing
 
 VALID_COMMANDS = {"lock", "sleep", "hibernate", "shutdown", "restart", "status", "cancel_shutdown"}
+PC_SHORTCUTS = {f"/pc{cmd}": cmd for cmd in VALID_COMMANDS}
+PC_SHORTCUTS["/pccancel"] = "cancel_shutdown"
+
+
+def normalized_pc_text(text: str) -> str:
+    value = re.sub(r"\s+", " ", text.strip().lower()).rstrip(".!?")
+    value = re.sub(r"^(?:джарвис|джарсис|джарвиз|jarvis)[, ]+", "", value)
+    value = re.sub(r"^пожалуйста[, ]+|[, ]+пожалуйста$", "", value)
+    value = re.sub(r"\bмой (?=ноутбук|ноут|пк|компьютер|комп\b)", "", value)
+    return re.sub(r"\b(?:ноутбук|ноут|пк|комп)\b", "компьютер", value)
 
 
 def explicit_pc_command(text: str) -> str | None:
@@ -20,9 +30,7 @@ def explicit_pc_command(text: str) -> str | None:
         "отправь компьютер в гибернацию": "hibernate",
         "выключи компьютер": "shutdown", "перезагрузи компьютер": "restart",
     }
-    normalized = text.strip().lower().rstrip(".!?")
-    normalized = re.sub(r"^(?:джарвис|jarvis)[, ]+", "", normalized)
-    normalized = re.sub(r"\b(?:ноутбук|ноут|пк|комп)\b", "компьютер", normalized)
+    normalized = normalized_pc_text(text)
     aliases.update({"выключить компьютер": "shutdown", "перезагрузить компьютер": "restart",
                     "выключить": "shutdown", "выключи": "shutdown",
                     "отмени выключение": "cancel_shutdown", "отмени перезагрузку": "cancel_shutdown",
@@ -30,7 +38,21 @@ def explicit_pc_command(text: str) -> str | None:
     for command in VALID_COMMANDS:
         if normalized in {f"/pc {command}", f"{command} pc"}:
             return command
+    if normalized in PC_SHORTCUTS:
+        return PC_SHORTCUTS[normalized]
     return aliases.get(normalized)
+
+
+def pc_confirmation_markup(reply: str):
+    """Buttons reference server-created one-use challenges, never model output."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    match = re.search(r"/pc confirm ([a-f0-9]{16})\b", reply)
+    if not match:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Подтвердить", callback_data=f"pc:confirm:{match[1]}"),
+        InlineKeyboardButton(text="Отмена", callback_data=f"pc:cancel:{match[1]}"),
+    ]])
 
 
 def _message(cmd: str, user_id: int, issued_at: int, nonce: str) -> bytes:
@@ -164,6 +186,27 @@ def offline_help(status):
     return "Ноутбук не подтвердил связь: нет свежего подписанного heartbeat. Проверь agent.py --doctor, автозапуск, сеть и одинаковые ADMIN_ID/PC_AGENT_SECRET/Redis."
 
 
+def pc_status_text(status):
+    if not status.get("online"):
+        return "Ноутбук сейчас недоступен. " + offline_help(status)
+    categories = {"gaming": "игра", "work": "работа", "media": "медиа",
+                  "idle": "нет активности", "unknown": "не определено", "other": "другое"}
+    lines = ["Ноутбук на связи. Подписанный сигнал агента актуален."]
+    if status.get("monitoring"):
+        lines.append("Наблюдение включено: " + categories.get(status.get("activity_category"), "не определено") + ".")
+    else:
+        lines.append("Наблюдение за активностью выключено.")
+    last = status.get("last_result")
+    if isinstance(last, dict):
+        states = {"accepted": "принята, результат ожидается", "completed": "выполнение подтверждено агентом",
+                  "scheduled": "запланирована Windows; питание ещё не подтверждено", "failed": "ошибка выполнения"}
+        commands = {"shutdown": "выключение", "restart": "перезагрузка", "lock": "блокировка",
+                    "hibernate": "гибернация", "status": "проверка связи", "cancel_shutdown": "отмена выключения"}
+        lines.append("Последняя команда: " + commands.get(last.get("command"), "неизвестна") + " — "
+                     + states.get(last.get("state"), "результат неизвестен") + ".")
+    return "\n".join(lines)
+
+
 async def wait_receipt(redis, user_id, secret, nonce, seconds=6):
     end = asyncio.get_running_loop().time() + seconds
     accepted = None
@@ -190,11 +233,16 @@ async def handle_pc_request(text, user_id, chat_id, redis, secret, *, wait_secon
         return "Подписанная связь с ноутбуком работает." if status["online"] else offline_help(status)
     confirm = re.fullmatch(r"/pc confirm ([a-f0-9]{16})", text.strip())
     if command is None and confirm is None:
-        return "/pc status · diagnose · lock · hibernate · shutdown · restart · cancel_shutdown. Выключение/перезапуск требуют отдельного подтверждения." if text.strip().lower().startswith("/pc") else None
+        if text.strip().lower().startswith("/pc"):
+            return ("Команда не выполнена. /pclock означает блокировку, /pc shutdown — выключение. "
+                    "Отправь одну команду без дополнительных слов. "
+                    "/pc status · diagnose · lock · hibernate · shutdown · restart · cancel_shutdown. "
+                    "Выключение/перезапуск требуют подтверждения.")
+        return None
     if redis is None or not secret:
-        return "PC-agent unavailable: Redis/PC_AGENT_SECRET is not configured."
+        return "Канал управления ноутбуком не настроен: нужны Redis и PC_AGENT_SECRET в конфигурации сервера."
     if command == "status":
-        return "PC: " + json.dumps(await pc_status(redis, user_id, secret), ensure_ascii=False)
+        return pc_status_text(await pc_status(redis, user_id, secret))
     try:
         if confirm:
             raw = await redis.getdel(f"jarvis:pc_confirm:{user_id}:{chat_id}:{confirm[1]}")
@@ -207,7 +255,8 @@ async def handle_pc_request(text, user_id, chat_id, redis, secret, *, wait_secon
         if not confirm and command in {"shutdown", "restart"}:
             token = uuid.uuid4().hex[:16]
             await redis.set(f"jarvis:pc_confirm:{user_id}:{chat_id}:{token}", command, ex=60)
-            return f"Ноутбук на связи. Подтверди {command} в течение 60 секунд: /pc confirm {token}. Windows получит 30 секунд для отмены: /pc cancel_shutdown."
+            action = "выключение" if command == "shutdown" else "перезагрузку"
+            return f"Ноутбук на связи. Сохрани работу. Подтверди {action} в течение 60 секунд: /pc confirm {token}. После подтверждения будет 30 секунд для отмены: /pc cancel_shutdown."
         payload = build_signed_command(command, user_id, secret)
         queued = await redis.set(f"jarvis:pc_command:{user_id}", payload, ex=20, nx=True)
         if queued is False or queued is None:

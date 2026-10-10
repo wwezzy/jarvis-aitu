@@ -89,11 +89,11 @@ def notification_buttons(row):
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     buttons = []
     if row.task_id:
-        buttons.append(InlineKeyboardButton(text="Done", callback_data=f"notice:done:{row.id}"))
+        buttons.append(InlineKeyboardButton(text="Готово", callback_data=f"notice:done:{row.id}"))
     buttons.extend([
-        InlineKeyboardButton(text="Snooze 1h", callback_data=f"notice:snooze:{row.id}"),
-        InlineKeyboardButton(text="Reschedule", callback_data=f"notice:reschedule:{row.id}"),
-        InlineKeyboardButton(text="Mute", callback_data=f"notice:mute:{row.id}"),
+        InlineKeyboardButton(text="Через час", callback_data=f"notice:snooze:{row.id}"),
+        InlineKeyboardButton(text="Перенести", callback_data=f"notice:reschedule:{row.id}"),
+        InlineKeyboardButton(text="Без напоминаний", callback_data=f"notice:mute:{row.id}"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=[buttons[:2], buttons[2:]])
 
@@ -128,8 +128,11 @@ async def _still_relevant(row, now):
         from services.schedule import resolve_day
         parts = row.event_key.split(":")
         if len(parts) == 6:
+            from types import SimpleNamespace
+            from services.scheduler import _smart_schedule_lead
             blocks = await resolve_day(row.user_id, date.fromisoformat(parts[2]))
-            if not any(str(b["id"]).replace(":", "@") == parts[1] and b["start"] == f"{parts[3]}:{parts[4]}" for b in blocks):
+            if not any(str(b["id"]).replace(":", "@") == parts[1] and b["start"] == f"{parts[3]}:{parts[4]}"
+                       and _smart_schedule_lead(SimpleNamespace(**b)) == int(parts[5]) for b in blocks):
                 return False
     return True
 

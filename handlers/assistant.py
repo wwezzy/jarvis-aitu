@@ -17,7 +17,7 @@ from services.attachments import AttachmentError, BoundedDownload, ensure_size, 
 from services.direct_intents import try_direct_answer
 from services.llm import extract_actions, generate_reply
 from services.memory import build_memory_context, upsert_memory_updates
-from services.pc_agent import handle_pc_request
+from services.pc_agent import handle_pc_request, pc_confirmation_markup, explicit_pc_command
 from services.reflections import upsert_reflection
 from services.scheduler import send_saved_reminder, sync_assignment_jobs, sync_schedule_jobs, restore_pending_reminders
 from services.users import ensure_user
@@ -224,15 +224,19 @@ async def assistant_message(
     delivered = False
 
     try:
-        user = await ensure_user(message.from_user.id, message.from_user.full_name)
-        collection = CollectionStore(pc_redis)
         chat_id = getattr(getattr(message, "chat", None), "id", message.from_user.id)
         raw_text = message.text or message.caption or ""
+        if getattr(message, "forward_origin", None) and (
+                explicit_pc_command(message.text or "") or raw_text.lower().startswith("/pc")):
+            await status.edit_text("Пересланные сообщения не управляют ноутбуком. Напиши команду самостоятельно: /pc lock или /pc shutdown.")
+            return
         # Original typed commands get a result even if collection Redis is unhealthy.
         pc_reply = await handle_pc_request(message.text or "", message.from_user.id, chat_id, pc_redis, settings.pc_agent_secret)
         if pc_reply:
-            await status.edit_text(pc_reply)
+            await status.edit_text(pc_reply, reply_markup=pc_confirmation_markup(pc_reply))
             return
+        user = await ensure_user(message.from_user.id, message.from_user.full_name)
+        collection = CollectionStore(pc_redis)
         batch = None
         if starts_collection(raw_text):
             await collection.start(user.telegram_id if hasattr(user, "telegram_id") else message.from_user.id, chat_id)
@@ -260,7 +264,6 @@ async def assistant_message(
             # Auxiliary initiative must never suppress the requested answer.
             logger.warning("Assistant context unavailable error=%s", type(error).__name__)
         if message.voice:
-            from services.pc_agent import explicit_pc_command
             if explicit_pc_command(text):
                 await status.edit_text("Голос распознан как запрос к ноутбуку. Для управления отправь текстовую /pc команду; расшифровка не даёт разрешение на выполнение.")
                 return
