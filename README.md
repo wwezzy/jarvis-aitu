@@ -77,6 +77,8 @@ Only `BOT_TOKEN` and positive numeric `ADMIN_ID` are mandatory to start. SQLite 
 | `JARVIS_PROFILE_FILE` | Optional ignored private profile path; default profile.local.md; empty disables |
 | `ENABLE_SEMANTIC_MEMORY`, `OPENAI_EMBEDDING_MODEL` | Optional pgvector ranking; default disabled, explicit embedding model and installed vector extension required |
 | `PC_AGENT_SECRET` | Shared HMAC secret in bot and agent env; use a random high-entropy value |
+| `ENABLE_PC_AGENT_HTTP` | Server opt-in for the limited signed HTTPS agent mailbox; default disabled |
+| `PC_AGENT_SERVER_URL` | Local agent only: HTTPS origin of the same staging bot, with no credentials/path/query; chooses HTTPS instead of direct Redis |
 | `PC_MONITOR_ENABLED` | Local Windows agent category sampling; default disabled; server receiving is enabled separately in authenticated preferences |
 | `PC_ACTIVITY_RULES_JSON` | Optional exact executable-basename to category overrides; browser activity remains unknown by default |
 | `ENABLE_GOOGLE_CALENDAR`, `ENABLE_GOOGLE_CALENDAR_WRITE` | Optional read integration and separate write gate; both default disabled |
@@ -99,6 +101,8 @@ Only `BOT_TOKEN` and positive numeric `ADMIN_ID` are mandatory to start. SQLite 
 - `/diag` shows DB type/health, Redis backend/health, LMS last success, pending tasks, scheduler jobs, provider models/cooldowns/latency, transcription configuration, PC heartbeat/results, version/commit and delivery state counts. Logs use correlation IDs and omit raw messages, prompts, API URLs and exception payloads.
 
 ## Windows agent
+
+For a changing laptop IP, the optional HTTPS transport removes the need for public Redis access: enable `ENABLE_PC_AGENT_HTTP=1` on the staging server and set `PC_AGENT_SERVER_URL` to that server's HTTPS origin in the existing local agent env. Keep the existing same `ADMIN_ID` and `PC_AGENT_SECRET`. The server alone connects to its internal Redis. Run the local doctor before switching the scheduled task. HTTP authentication uses a separate derived HMAC key, short timestamps, atomic request nonces and nonce-bound signed responses. The endpoint cannot create commands or access chat/history/other users' keys. TLS certificate checks remain enabled; redirects and URLs containing credentials are rejected. Direct Redis/Upstash remain available when the HTTPS origin is absent. Network failures do not automatically replay a consumed command. Optional activity retains its separate consent controls.
 
 Set `ADMIN_ID`, `PC_AGENT_SECRET`, and the same standard Redis or Upstash env variables for the interactive Windows account. Use a separate Redis database/credentials and HMAC secret for staging. Install dependencies in the repository's virtual environment. Run `python agent.py` manually first, or register startup with `powershell -File scripts/install-agent.ps1`. The installer creates a current-user, limited-privilege, hidden Python task at logon; it does not embed credentials or auto-run commands. `Start-ScheduledTask JarvisPersonalAgent` starts it; `scripts/uninstall-agent.ps1` stops/removes startup while retaining replay state/logs.
 

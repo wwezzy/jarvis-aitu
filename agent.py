@@ -132,7 +132,12 @@ def doctor():
         "secret_configured": bool(os.getenv("PC_AGENT_SECRET")),
         "monitoring_enabled": os.getenv("PC_MONITOR_ENABLED", "0").lower() in {"1", "true", "yes"}}
     try:
-        redis = create_redis(sync=True)
+        if os.getenv('PC_AGENT_SERVER_URL'):
+            from services.agent_http import AgentHttps
+            redis = AgentHttps(os.getenv('PC_AGENT_SERVER_URL'), int(os.getenv('ADMIN_ID', '0')), os.getenv('PC_AGENT_SECRET', ''))
+            report['backend'] = 'agent_https'
+        else:
+            redis = create_redis(sync=True)
         report["redis_healthy"] = bool(redis and redis.ping())
         if redis:
             from services.pc_agent import read_status
@@ -153,7 +158,11 @@ def start_agent():
     state_dir.mkdir(parents=True, exist_ok=True)
     local_config(state_dir)
     user_id, secret = int(os.getenv("ADMIN_ID", "0")), os.getenv("PC_AGENT_SECRET", "")
-    redis = create_redis(sync=True)
+    if os.getenv('PC_AGENT_SERVER_URL'):
+        from services.agent_http import AgentHttps
+        redis = AgentHttps(os.getenv('PC_AGENT_SERVER_URL'), user_id, secret)
+    else:
+        redis = create_redis(sync=True)
     if user_id <= 0 or not secret or redis is None:
         raise RuntimeError("Redis, ADMIN_ID and PC_AGENT_SECRET are required")
     if os.name != "nt":
@@ -187,7 +196,7 @@ def start_agent():
                 from services.redis_backend import safe_transport_reason
                 logger.warning("Agent transport failure error=%s reason=%s", type(exc).__name__, safe_transport_reason(exc))
                 backoff = min(backoff * 2, 60)
-            time.sleep(backoff)
+            time.sleep(max(backoff, 5) if os.getenv('PC_AGENT_SERVER_URL') else backoff)
     finally:
         stop_monitor.set()
         if monitor_thread:

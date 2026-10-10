@@ -90,7 +90,7 @@ async def configure_bot_ui() -> None:
 
 
 async def start_http_server() -> web.AppRunner:
-    app = create_web_app(bot=bot, scheduler=scheduler)
+    app = create_web_app(bot=bot, scheduler=scheduler, pc_redis=pc_redis)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, settings.webapp_host, settings.webapp_port)

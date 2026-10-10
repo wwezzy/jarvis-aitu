@@ -236,7 +236,7 @@ async def api_error_middleware(request: web.Request, handler):
         raise web.HTTPInternalServerError(text="Internal server error")
 
 
-def create_web_app(*, bot: Bot | None = None, scheduler: AsyncIOScheduler | None = None) -> web.Application:
+def create_web_app(*, bot: Bot | None = None, scheduler: AsyncIOScheduler | None = None, pc_redis=None) -> web.Application:
     app = web.Application(middlewares=[security_headers, api_error_middleware], client_max_size=128 * 1024)
     app[BOT_KEY] = bot
     app[SCHEDULER_KEY] = scheduler
@@ -254,5 +254,7 @@ def create_web_app(*, bot: Bot | None = None, scheduler: AsyncIOScheduler | None
     app.router.add_post("/api/reflection", save_reflection)
     from webapp.v4 import register
     register(app)
+    from webapp.agent_api import register as register_agent
+    register_agent(app, pc_redis)
     app.router.add_static("/static/", STATIC_DIR, show_index=False)
     return app

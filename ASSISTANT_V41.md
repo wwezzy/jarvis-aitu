@@ -57,6 +57,14 @@ An independent thread samples during Redis reconnect backoff. SQLite spools minu
 
 Reports show coverage, not a complete day. `gaming_budget_minutes` (default 60) is an editable intent, not a scientific threshold. Active initiative compares observed gaming with it. Two observed gaming minutes during a chosen focus can trigger one neutral prompt per session, capped at five/day; it passes its own focus DND but respects class/sleep/training DND. No process is automatically closed.
 
+## Optional HTTPS agent channel
+
+Direct Redis on a dynamic laptop IP can lose connectivity after a network change. The complete optional HTTPS mailbox adapter uses the existing HMAC secret and admin identity; no new key is required. Server `ENABLE_PC_AGENT_HTTP=1` and local `PC_AGENT_SERVER_URL=<staging HTTPS origin>` opt in; default server access is disabled. TLS verification and same-origin/no-redirect restrictions apply. The server uses its existing private Redis connection.
+
+Only own heartbeat/result/activity writes, own activity ACK/status reads and atomic own command consumption are exposed. Creating commands, arbitrary Redis keys, chat content, other users and shell execution are forbidden. Requests and responses use a domain-separated derived HMAC, fresh timestamps and request nonce binding; reused requests fail while their 90-second Redis claim survives. OS replay protection remains independently persistent across Redis eviction/restarts. OS effects still require original typed authorization, confirmation, signed commands and persistent agent replay protection. Observation consent and limits remain unchanged. HTTP polls have a five-second minimum interval; outages use existing backoff. A lost command response may lose delivery; it is never automatically retried as a power action.
+
+Acceptance: with direct external Redis blocked, verify the opted-in HTTPS doctor/heartbeat, fake-executor command/result round trip, signed activity ACK and reconnection. Disable the server flag and verify clear failure. Test foreign identities, old/future/reused nonces, forged observations/responses, oversized bodies, no command writes, no unrelated keys, TLS validation and no redirects. Cold starts/provider outages can exceed the 20-second command TTL; no fresh heartbeat means no dispatch. A free Render service can sleep while the laptop is offline; continuous server availability is not guaranteed.
+
 ## Scientific basis and limits
 
 Research informs design, not a guarantee that this app creates discipline:
