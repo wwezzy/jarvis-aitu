@@ -2,6 +2,7 @@ param(
     [string]$InstallRoot,
     [string]$PythonPath,
     [string]$ModelDir,
+    [string]$OllamaPath,
     [switch]$NoShortcut
 )
 $ErrorActionPreference = 'Stop'
@@ -82,6 +83,7 @@ if ($forbidden) { throw 'Private data was found in application sources; shortcut
 $launcher = @'
 """Private local launcher: isolated signed CPython, explicit app dependencies."""
 import os
+import json
 import runpy
 import site
 import sys
@@ -109,8 +111,22 @@ if os.name == "nt":
 sys.path.insert(0, str(APP))
 # Pin this installation's data outside packaged-terminal AppData virtualization.
 # The same directory is used from the Start Menu and development probes.
-if "--state-dir" not in sys.argv[1:]:
-    sys.argv.extend(["--state-dir", str(Path.home() / "JarvisData" / "Desktop")])
+data_path = Path.home() / "JarvisData" / "Desktop"
+if "--state-dir" in sys.argv[1:]:
+    index = sys.argv.index("--state-dir")
+    if index + 1 < len(sys.argv):
+        data_path = Path(sys.argv[index + 1])
+elif any(arg.startswith("--state-dir=") for arg in sys.argv[1:]):
+    data_path = Path(next(arg.split("=", 1)[1] for arg in sys.argv[1:] if arg.startswith("--state-dir=")))
+else:
+    sys.argv.extend(["--state-dir", str(data_path)])
+if not any(flag in sys.argv[1:] for flag in ("--smoke-test", "--diagnose-voice")):
+    try:
+        from desktop.model_runtime import ensure_model_runtime
+        manifest = json.loads((ROOT / "installation.json").read_text(encoding="utf-8-sig"))
+        ensure_model_runtime(data_path, manifest)
+    except Exception:
+        pass  # An optional model outage must never prevent the desktop UI.
 runpy.run_path(str(APP / "desktop_app.py"), run_name="__main__")
 '@
 $launcherPath = Join-Path $installPath 'launcher.pyw'
@@ -120,6 +136,24 @@ $manifest = @{
     runtimeSigner = $signature.SignerCertificate.Subject
     pythonwSha256 = (Get-FileHash -LiteralPath (Join-Path $runtimePath 'pythonw.exe') -Algorithm SHA256).Hash
     personalDataBundled = $false; cloudCredentialsBundled = $false
+}
+if (-not $OllamaPath) {
+    $OllamaPath = @(
+        (Join-Path $env:USERPROFILE 'Applications\Ollama\ollama.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe')
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+}
+if ($OllamaPath) {
+    if ($OllamaPath.StartsWith('\\') -or $OllamaPath.Contains('://')) { throw 'Only a local Ollama executable is accepted.' }
+    $modelExecutable = (Resolve-Path -LiteralPath $OllamaPath).Path
+    $modelSignature = Get-AuthenticodeSignature -LiteralPath $modelExecutable
+    if ($modelSignature.Status -eq 'Valid' -and (Split-Path -Leaf $modelExecutable) -ieq 'ollama.exe') {
+        $modelPublisher = $modelSignature.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+        if ($modelPublisher -in @('Ollama Inc.', 'Ollama Inc')) {
+            $manifest.ollamaExe = $modelExecutable
+            $manifest.ollamaSha256 = (Get-FileHash -LiteralPath $modelExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+    }
 }
 $manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $installPath 'installation.json') -Encoding UTF8
 
