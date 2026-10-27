@@ -1,4 +1,8 @@
-# Jarvis Ultimate v4.1
+# Jarvis Desktop 4.2 / Ultimate v4.1
+
+The primary personal interface is now a local Windows application with offline Russian wake-word recognition, Windows speech, explicit PC controls, tasks, notes and a read-only view of recovered personal data. GTG and reflections are absent from its main interface. It works without Render, Redis, Telegram or a language model. See [DESKTOP.md](DESKTOP.md) for installation, offline voice, optional local Ollama, recovery evidence, limitations and the exact desktop acceptance checklist. Build the per-user installer with `desktop/build.ps1`; no personal data or env files are packaged.
+
+On 2026-10-27 the staging free PostgreSQL instance was confirmed expired/suspended. A retained 2026-10-10 backup was recovered locally and verified (27 tables, 819 records); later cloud changes are not claimed recovered. The user selected the local application without a paid cloud plan. The cloud Telegram bot remains unavailable; no production service or branch was changed.
 
 The active-assistant follow-up adds persistent goals, bounded initiative, focus protection, boredom alternatives, searchable source notes and authorized foreground-time observation. Read [ASSISTANT_V41.md](ASSISTANT_V41.md) for behavior, scientific sources, local agent diagnosis/update, migration 3 and staging checks. PR #9 was already merged; this follow-up stays on `codex/jarvis-ultimate-v4` without deploying production.
 
