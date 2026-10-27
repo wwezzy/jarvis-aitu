@@ -522,7 +522,7 @@ def test_schema_one_upgrade_preserves_rows_and_online_backup(tmp_path):
     assert migrated.snapshot()["notes"][0]["text"] == "Старая заметка"
     assert migrated.preferences()["speech_enabled"] is False
     with migrated.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
     backups = list((tmp_path / "backups").glob("*-schema1.db"))
     assert len(backups) == 1
     with sqlite3.connect(backups[0]) as backup:
@@ -532,7 +532,7 @@ def test_schema_one_upgrade_preserves_rows_and_online_backup(tmp_path):
     migrated.close()
     LocalStore(tmp_path).close()
     LocalStore(tmp_path).close()
-    assert len(list((tmp_path / "backups").glob("*-schema2.db"))) == 1
+    assert len(list((tmp_path / "backups").glob("*-schema3.db"))) == 1
     assert not list((tmp_path / "backups").glob("*.partial"))
 
 
@@ -550,7 +550,7 @@ def test_corrupt_daily_backup_cannot_be_silently_trusted_for_upgrade(tmp_path):
     store.add_task("preserve original")
     store.close()
     LocalStore(tmp_path).close()
-    backup = next((tmp_path / "backups").glob("*-schema2.db"))
+    backup = next((tmp_path / "backups").glob("*-schema3.db"))
     backup.write_bytes(b"corrupt backup")
     with pytest.raises(sqlite3.DatabaseError):
         LocalStore(tmp_path)
@@ -632,7 +632,7 @@ def test_personal_commands_default_none_never_discover_global_data(local, monkey
     monkeypatch.setattr("desktop.personal.load_personal_snapshot", unexpected)
     monkeypatch.setattr("desktop.chat.LocalChat.answer", unexpected)
     core.store.set_preferences({"local_chat_enabled": True})
-    for command in ("расписание", "сегодня", "дедлайны", "моя память"):
+    for command in ("старое расписание", "сегодня из копии", "дедлайны", "моя память"):
         reply = core.handle(command, source="voice")
         assert "не подключена" in reply.text
         assert reply.action is None
@@ -647,7 +647,7 @@ def test_personal_read_routes_show_historical_data_with_utc5_deadline(tmp_path, 
     core = DesktopCore(tmp_path / "app", executor=calls.append, personal_path=personal_source)
     core.store.set_preferences({"local_chat_enabled": True})
     monkeypatch.setattr("desktop.chat.LocalChat.answer", lambda *_: pytest.fail("Personal command called a model"))
-    schedule = core.handle("Джарвис, расписание")
+    schedule = core.handle("Джарвис, расписание из копии")
     deadlines = core.handle("дедлайны")
     memory = core.handle("что ты обо мне помнишь")
     for reply in (schedule, deadlines, memory):
@@ -668,7 +668,7 @@ def test_today_uses_actual_weekday_in_utc_plus_five(tmp_path, personal_source, m
     instant = datetime.fromisoformat("2026-10-18T23:30:00+00:00").timestamp()
     monkeypatch.setattr("desktop.core.time.time", lambda: instant)
     core = DesktopCore(tmp_path / "app", personal_path=personal_source)
-    reply = core.handle("что у меня сегодня", source="voice")
+    reply = core.handle("старое расписание на сегодня", source="voice")
     assert "19.10.2026 (UTC+5)" in reply.text
     assert "Monday Math" in reply.text and "Sunday Class" not in reply.text
     assert "Копия от 10.10.2026" in reply.text
@@ -684,7 +684,7 @@ def test_personal_summaries_are_bounded_previews(tmp_path, personal_source):
                        [(index, "SCHEDULE " + "z" * 3000) for index in range(10, 20)])
     before = personal_source.read_bytes()
     core = DesktopCore(tmp_path / "app", personal_path=personal_source)
-    for command in ("schedule", "deadlines", "my memory"):
+    for command in ("archived schedule", "deadlines", "my memory"):
         reply = core.handle(command)
         assert len(reply.text) < 5000
         assert "Показаны первые 8 записей" in reply.text
@@ -744,7 +744,7 @@ def test_unavailable_personal_section_does_not_invent_empty_current_schedule(tmp
     with sqlite3.connect(path) as db:
         db.executescript("CREATE TABLE users(telegram_id INTEGER,name TEXT); INSERT INTO users VALUES(42,'Synthetic');")
     core = DesktopCore(tmp_path / "app", personal_path=path)
-    reply = core.handle("сегодня")
+    reply = core.handle("сегодня из копии")
     assert "раздел в копии недоступен" in reply.text
     assert "Копия от 10.10.2026" in reply.text
     assert "свободен" not in reply.text

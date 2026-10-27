@@ -138,7 +138,7 @@ def test_history_is_explicitly_opted_in_and_can_be_disabled_without_deleting_loc
     assert len(opener.requests[-1]["messages"]) == 2
     assert len(core.snapshot()["recent"]) == 8
     with core.store.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
 
 
 @pytest.mark.parametrize("history", [

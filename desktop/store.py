@@ -23,11 +23,21 @@ DEFAULT_PREFERENCES = {
     "launch_at_login": False,
     "voice_rate": 185,
     "voice_engine": "auto",
+    "voice_character": "aidar",
+    "multilingual_stt_enabled": False,
+    "activity_monitor_enabled": False,
     "language": "ru",
     "hide_advanced": True,
     "local_chat_enabled": False,
     "local_chat_history": False,
+    "local_chat_plan_context": False,
     "local_chat_model": "qwen3:4b-instruct-2507-q4_K_M",
+    "organizer_enabled": True,
+    "morning_brief_enabled": True,
+    "evening_plan_enabled": True,
+    "evening_plan_time": "22:00",
+    "organizer_paused": False,
+    "organizer_dnd": False,
 }
 
 
@@ -38,7 +48,7 @@ class LocalStore:
         self.path = self.state_dir / "desktop.db"
         with self.connection() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version > 2:
+            if version > 3:
                 raise RuntimeError("Local database is newer than this application")
             if version:
                 self._daily_backup(db, version)
@@ -73,7 +83,57 @@ class LocalStore:
                     delivered_at REAL, cancelled_at REAL
                 );
                 CREATE INDEX IF NOT EXISTS reminders_status_due ON reminders(status,due_at);
-                PRAGMA user_version=2;
+                CREATE TABLE IF NOT EXISTS organizer_routines (
+                    key TEXT PRIMARY KEY, title TEXT NOT NULL, days TEXT NOT NULL,
+                    start_time TEXT, minutes INTEGER, enabled INTEGER NOT NULL DEFAULT 1,
+                    version INTEGER NOT NULL DEFAULT 1, updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS organizer_overrides (
+                    routine_key TEXT NOT NULL REFERENCES organizer_routines(key),
+                    on_date TEXT NOT NULL, patch TEXT NOT NULL DEFAULT '{}',
+                    skipped INTEGER NOT NULL DEFAULT 0, version INTEGER NOT NULL DEFAULT 1,
+                    updated_at REAL NOT NULL, PRIMARY KEY(routine_key,on_date)
+                );
+                CREATE TABLE IF NOT EXISTS organizer_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
+                    on_date TEXT NOT NULL, start_time TEXT, minutes INTEGER,
+                    kind TEXT NOT NULL DEFAULT 'goal', deleted INTEGER NOT NULL DEFAULT 0,
+                    version INTEGER NOT NULL DEFAULT 1, updated_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS organizer_items_date ON organizer_items(on_date,deleted);
+                CREATE TABLE IF NOT EXISTS organizer_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT NOT NULL,
+                    on_date TEXT NOT NULL, status TEXT NOT NULL
+                        CHECK(status IN ('unknown','done','missed')),
+                    minutes INTEGER, provenance TEXT NOT NULL CHECK(provenance='self_report'),
+                    reported_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS organizer_reports_item ON organizer_reports(item_id,id);
+                CREATE TABLE IF NOT EXISTS organizer_deliveries (
+                    event_key TEXT PRIMARY KEY, kind TEXT NOT NULL,
+                    on_date TEXT NOT NULL, claimed_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS observation_buckets (
+                    minute_utc INTEGER NOT NULL CHECK(minute_utc % 60=0),
+                    category TEXT NOT NULL CHECK(category IN ('work','gaming','media','idle','unknown')),
+                    seconds REAL NOT NULL CHECK(seconds>=0 AND seconds<=60),
+                    PRIMARY KEY(minute_utc,category)
+                );
+                CREATE TABLE IF NOT EXISTS local_ai_usage (
+                    on_date TEXT NOT NULL, model TEXT NOT NULL CHECK(length(model) BETWEEN 1 AND 100),
+                    requests INTEGER NOT NULL CHECK(requests>=0),
+                    successful INTEGER NOT NULL CHECK(successful>=0),
+                    failed INTEGER NOT NULL CHECK(failed>=0),
+                    input_tokens INTEGER NOT NULL CHECK(input_tokens>=0),
+                    output_tokens INTEGER NOT NULL CHECK(output_tokens>=0),
+                    input_samples INTEGER NOT NULL CHECK(input_samples>=0),
+                    output_samples INTEGER NOT NULL CHECK(output_samples>=0),
+                    unknown_requests INTEGER NOT NULL CHECK(unknown_requests>=0),
+                    latency_total_ms REAL NOT NULL CHECK(latency_total_ms>=0),
+                    latency_samples INTEGER NOT NULL CHECK(latency_samples>=0),
+                    PRIMARY KEY(on_date,model)
+                );
+                PRAGMA user_version=3;
                 COMMIT;
             """)
 
@@ -92,17 +152,33 @@ class LocalStore:
                 if (existing.execute("PRAGMA quick_check").fetchone()[0] != "ok"
                         or existing.execute("PRAGMA user_version").fetchone()[0] != version):
                     raise RuntimeError("Existing daily backup integrity check failed")
+                has_observations = existing.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='observation_buckets'").fetchone()
+            if has_observations:
+                with closing(sqlite3.connect(destination)) as existing, existing:
+                    self._omit_observations(existing)
             return
         temporary = directory / f"desktop-{stamp}-{uuid.uuid4().hex}.partial"
         try:
             with closing(sqlite3.connect(temporary)) as target:
                 source.backup(target)
+                self._omit_observations(target)
                 if target.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                     raise RuntimeError("Local backup integrity check failed")
             temporary.replace(destination)
         finally:
             if temporary.exists():
                 temporary.unlink()
+
+    @staticmethod
+    def _omit_observations(database):
+        """Short-lived activity hints must not survive in permanent backups."""
+        if database.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='observation_buckets'").fetchone():
+            database.execute("PRAGMA secure_delete=ON")
+            database.execute("DELETE FROM observation_buckets")
+            database.commit()
+            # Rebuild an offline backup rather than retaining telemetry in
+            # copied free pages after logical row deletion.
+            database.execute("VACUUM")
 
     @contextmanager
     def connection(self):
@@ -171,8 +247,14 @@ class LocalStore:
         if "voice_rate" in updates and (type(updates["voice_rate"]) is not int or not 90 <= updates["voice_rate"] <= 240):
             raise ValueError("Voice rate must be 90..240")
         if "voice_engine" in updates and (not isinstance(updates["voice_engine"], str)
-                                          or updates["voice_engine"] not in {"auto", "windows"}):
+                                          or updates["voice_engine"] not in {"auto", "windows", "expressive", "clone"}):
             raise ValueError("Unsupported speech engine")
+        if "voice_character" in updates and (not isinstance(updates["voice_character"], str)
+                                             or updates["voice_character"] not in {"aidar", "eugene"}):
+            raise ValueError("Unsupported voice character")
+        if "evening_plan_time" in updates and (not isinstance(updates["evening_plan_time"], str)
+                or not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", updates["evening_plan_time"])):
+            raise ValueError("Evening planning time must be HH:MM (UTC+5)")
         if "language" in updates and updates["language"] not in {"ru", "en"}:
             raise ValueError("Unsupported language")
         if "local_chat_model" in updates:

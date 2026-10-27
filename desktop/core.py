@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from desktop.actions import ALLOWED_ACTIONS, RISKY_ACTIONS, execute_windows_action
+from desktop.organizer import LocalOrganizer
 from desktop.store import LocalStore
 
 
@@ -23,17 +24,22 @@ class Reply:
     action: str | None = None
     confirmation_id: str | None = None
     speak: bool = True
+    organizer_event: dict | None = None
 
 
 MAX_REPLY_CHARS = 22000
 NOTE_PREVIEW_CHARS = 1200
 PERSONAL_COMMANDS = {
-    "расписание": "schedule", "мое расписание": "schedule", "schedule": "schedule", "my schedule": "schedule",
-    "что у меня сегодня": "today", "сегодня": "today", "today": "today", "my day": "today",
+    "старое расписание": "schedule", "расписание из копии": "schedule", "archived schedule": "schedule",
+    "старое расписание на сегодня": "today", "сегодня из копии": "today", "archived schedule today": "today",
     "дедлайны": "assignments", "мои дедлайны": "assignments", "deadlines": "assignments",
     "моя память": "memory", "что ты обо мне помнишь": "memory", "what do you remember about me": "memory", "my memory": "memory",
 }
 _WEEKDAYS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+_PERSONAL_TOPIC = re.compile(
+    r"\b(?:мой|моего|моей|моему|моем|моя|мое|мои|моих|мне|меня|сегодня|завтра|"
+    r"план|плана|планы|планов|плане|плану|цель|цели|целям|зал|зале|"
+    r"тренировк\w*|дисциплин\w*|скучно|my|me|myself|today|tomorrow|goal|goals|plan|plans|planning)\b", re.I)
 
 
 def _note_previews(notes: list[dict]) -> str:
@@ -55,6 +61,17 @@ def normalize(text: str) -> str:
     text = re.sub(r"^(?:джарвис|джарсис|джарвиз|jarvis)[,\s]+", "", text)
     text = re.sub(r"^пожалуйста[,\s]+|[,\s]+пожалуйста$", "", text)
     return text.strip()
+
+
+def _needs_plan_context(text, history=None):
+    value = normalize(text)
+    if _PERSONAL_TOPIC.search(value):
+        return True
+    if value not in {"почему", "почему так", "а почему", "почему именно так", "как это",
+                     "с чего начать", "что дальше", "why", "why so", "what next", "how so"}:
+        return False
+    questions = [message["content"] for message in (history or []) if message["role"] == "user"]
+    return bool(questions and _PERSONAL_TOPIC.search(normalize(questions[-1])))
 
 
 _ALIASES = {
@@ -88,6 +105,7 @@ HELP = ("Могу открыть YouTube, браузер, блокнот, про
         "«Разверни окно» разворачивает активное окно, «разверни ютуб» — одно найденное окно браузера с YouTube в заголовке. "
         "Попробуй: «добавь задачу закончить проект», «задачи», «готово 1», «следующий шаг», "
         "«запомни важную мысль», «найди проект», «напомни через 10 минут сделать перерыв», "
+        "«план на завтра», «добавь цель на завтра закончить проект», «я хожу в зал во вт чт вс», "
         "«фокус 25 минут», «напоминания», «отмени таймер 1», «расписание», «дедлайны» или «моя память». Управление питанием — только с отдельным подтверждением. "
         "Задачи и заметки сохраняются на этом компьютере; Render и ИИ для этих команд не нужны.")
 
@@ -132,16 +150,96 @@ def _duration(count: str, unit: str) -> int:
 class DesktopCore:
     def __init__(self, state_dir: Path, executor=None, *, personal_path: Path | None = None):
         self.store = LocalStore(state_dir)
+        self.organizer = LocalOrganizer(self.store)
+        from desktop.observations import ObservationMonitor
+        self.observations = ObservationMonitor(self.store)
+        from desktop.usage import UsageLedger
+        self.usage = UsageLedger(self.store)
         self.executor = executor if executor is not None else execute_windows_action
         # A core used in tests/smoke mode never discovers global personal files.
         # Only the actual entry point may opt in with an identified local copy.
         self.personal_path = Path(personal_path) if personal_path is not None else None
 
     def snapshot(self) -> dict:
-        return self.store.snapshot()
+        value = self.store.snapshot()
+        value["observations"] = self.observations.summary(enabled=value["preferences"]["activity_monitor_enabled"])
+        return value
+
+    def observation_summary(self):
+        return self.observations.summary(enabled=self.store.preferences()["activity_monitor_enabled"])
+
+    def usage_snapshot(self):
+        return self.usage.snapshot()
+
+    def _record_chat_usage(self, model, client, *, success):
+        try:
+            self.usage.record(model, getattr(client, "last_usage", None), success=success)
+        except Exception:
+            pass  # Optional accounting must not discard an otherwise usable reply.
+
+    def poll_observations(self):
+        try:
+            return self.observations.tick(enabled=self.store.preferences()["activity_monitor_enabled"])
+        except Exception:
+            # Optional observations must never prevent deterministic commands.
+            self.observations.reset()
+            return False
+
+    def reset_observations(self):
+        self.observations.reset()
+
+    def clear_observations(self):
+        self.observations.clear()
+
+    def _observation_reply(self):
+        data = self.observation_summary()
+        if not data["observed_seconds"]:
+            return Reply("Сохранённых интервалов активности за сегодня пока нет. Наблюдение "
+                         + ("разрешено" if data["enabled"] else "выключено")
+                         + ". По открытому приложению нельзя надёжно подтвердить учёбу или тренировку.")
+        labels = {"work": "рабочие программы", "gaming": "игровые программы", "media": "медиаплееры", "idle": "бездействие", "unknown": "неизвестно"}
+        totals = "; ".join(f"{labels[key]}: {round(seconds / 60, 1)} мин" for key, seconds in data["seconds"].items())
+        return Reply(f"Наблюдения {data['date']} (UTC+5), только за записанные интервалы: {totals}. "
+                     "Это приблизительные категории, а не отчёт о выполнении. Браузер остаётся неизвестным; рабочая программа не доказывает учёбу, компьютер не подтверждает зал. "
+                     + ("Сбор включён." if data["enabled"] else "Сбор приостановлен."))
+
+    def _current_plan_context(self, preferences):
+        """Small explicit model projection; never notes, files or PC authority."""
+        snapshot = self.organizer.snapshot()
+        result = {}
+        for name in ("today", "tomorrow"):
+            day = snapshot[name]
+            result[name] = {"date": day["date"], "items": [
+                {"title": item["title"][:80], "time": item["time"], "status": item["status"],
+                 "provenance": item["provenance"] or "unknown"}
+                for item in day["items"][:6]]}
+        gym = self.organizer.gym_settings()
+        result["gym_days"] = gym["days"] if gym.get("enabled") else []
+        result["observations"] = None
+        if preferences["activity_monitor_enabled"]:
+            hints = self.observation_summary()
+            result["observations"] = {
+                "work_hint_minutes": int(hints["seconds"]["work"] // 60),
+                "gaming_minutes": int(hints["seconds"]["gaming"] // 60),
+                "observed_minutes": int(hints["observed_seconds"] // 60)}
+        return result
 
     def close(self):
+        self.observations.reset()
         self.store.close()
+
+    def due_events(self, now=None, trigger="tick") -> list[Reply]:
+        """Local plan notices are literal data, never passed to handle/model.
+
+        Queued delivery must recheck event_is_current immediately before each
+        notification/speech operation; current rules may have changed meanwhile.
+        """
+        return [self._answer(Reply(event["text"], organizer_event=event))
+                for event in self.organizer.due_events(now=now, trigger=trigger)]
+
+    def event_is_current(self, reply, *, now=None):
+        event = reply.organizer_event if isinstance(reply, Reply) else reply
+        return self.organizer.event_is_current(event, now=now)
 
     def due_reminders(self, now=None) -> list[Reply]:
         """UI polls while running, then displays/speaks literal returned text.
@@ -265,6 +363,8 @@ class DesktopCore:
             return Reply("Нужна непустая команда длиной до 20 000 символов.")
         request_id = self.store.record("user", text.strip())
         value = normalize(text)
+        if value in {"моя активность", "активность", "наблюдения", "что видно по компьютеру", "учусь ли я", "играю ли я"}:
+            return self._answer(self._observation_reply())
         original = re.sub(r"^(?:джарвис|джарсис|джарвиз|jarvis)[,\s]+", "", text.strip(), flags=re.IGNORECASE)
         original = re.sub(r"^пожалуйста[,\s]+", "", original, flags=re.IGNORECASE)
         confirmed = re.fullmatch(r"(?:подтверждаю|подтверди|confirm|/confirm) ([a-f0-9]{32})", value)
@@ -290,6 +390,9 @@ class DesktopCore:
         if value in {"статус", "статус компьютера", "status", "/pcstatus"}:
             return self._answer(Reply("Локальный помощник работает. Задачи и заметки доступны без сети. "
                                       "Доступность микрофона и голоса показана в настройках приложения."))
+        organized = self.organizer.handle(original)
+        if organized is not None:
+            return self._answer(Reply(organized))
         if value in PERSONAL_COMMANDS:
             return self._answer(self._personal_reply(PERSONAL_COMMANDS[value]))
         reminder = re.fullmatch(r"напомни(?: мне)? через " + _DURATION + r"\s+(.+)", original, re.DOTALL | re.IGNORECASE)
@@ -353,8 +456,12 @@ class DesktopCore:
             text = "\n".join(f"#{task['id']} · {task['title']}" for task in tasks[:20]) if tasks else "В локальном списке нет активных задач. Добавь одну конкретную задачу."
             return self._answer(Reply(text))
         if value in {"следующий шаг", "что дальше", "что мне делать", "мне скучно", "next", "/next"}:
+            planned = [item for item in self.organizer.day()["items"] if item["status"] == "unknown"]
             tasks = [task for task in self.snapshot()["tasks"] if not task["done"]]
-            if tasks:
+            if planned:
+                text = (f"В твоём сегодняшнем плане: {planned[0]['title']}. "
+                        "Выбери небольшой первый шаг или перенеси дело, если планы изменились. Результат отметь сам.")
+            elif tasks:
                 text = (f"Следующий шаг: {tasks[0]['title']}. Выдели 10 минут на начало. "
                         "После работы отметь результат сам — я не засчитываю время как выполнение.")
             else:
@@ -373,22 +480,31 @@ class DesktopCore:
             return self._answer(Reply(text))
         preferences = self.store.preferences()
         if preferences["local_chat_enabled"]:
-            from desktop.chat import LocalChat, LocalChatUnavailable
+            from desktop.chat import LocalChat, LocalChatTruncated, LocalChatUnavailable
+            client = None
             try:
                 # A model's result stays display-only. Optional context is
                 # exclusively earlier completed model-chat exchanges, never
                 # note/task/PC-command/personal-data records or the current row.
                 client = LocalChat(preferences["local_chat_model"])
                 options = {"on_chunk": on_chunk} if on_chunk is not None else {}
-                if preferences["local_chat_history"]:
-                    history = self.store.model_chat_history(before_id=request_id)
+                history = self.store.model_chat_history(before_id=request_id) if preferences["local_chat_history"] else None
+                if preferences["local_chat_plan_context"] and _needs_plan_context(text, history):
+                    options["plan_context"] = self._current_plan_context(preferences)
+                if history is not None:
                     answer = client.answer(text, history=history, **options)
                 else:
                     answer = client.answer(text, **options)
             except ValueError:
                 return self._answer(Reply("Для локальной модели сократи вопрос до 8000 символов и проверь имя модели в настройках."))
+            except LocalChatTruncated:
+                self._record_chat_usage(preferences["local_chat_model"], client, success=False)
+                return self._answer(Reply("Ответ достиг лимита длины и не был озвучен. Разбей вопрос на части; готовые команды и план продолжают работать."))
             except LocalChatUnavailable:
+                if client is not None:
+                    self._record_chat_usage(preferences["local_chat_model"], client, success=False)
                 return self._answer(Reply("Локальная модель сейчас недоступна. Проверь, что Ollama запущена и выбранная локальная модель установлена. Команды, задачи и заметки продолжают работать."))
+            self._record_chat_usage(preferences["local_chat_model"], client, success=True)
             return self._answer(Reply("Локальная модель: " + answer))
         return self._answer(Reply("Не распознал точную команду. " + HELP))
 
