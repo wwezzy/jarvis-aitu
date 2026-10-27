@@ -22,7 +22,6 @@ def test_streamed_action_like_text_stays_data_until_validated_reply(tmp_path, mo
     assert "Сначала выбери" in reply.text
     core.close()
 
-
 def test_failed_stream_never_commits_partial_or_reuses_as_dialogue(tmp_path, monkeypatch):
     core = DesktopCore(tmp_path, executor=lambda _: None)
     core.store.set_preferences({"local_chat_enabled": True, "local_chat_history": True})

@@ -1,0 +1,2 @@
+# Preserve upstream legal text; its original spacing is intentional.
+desktop/licenses/*.txt -whitespace
