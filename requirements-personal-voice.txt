@@ -1,0 +1,4 @@
+# Optional personal Silero fallback; its NC model is installed separately.
+# This file is deliberately excluded from normal/public desktop requirements.
+--index-url https://download.pytorch.org/whl/cpu
+torch==2.9.1+cpu

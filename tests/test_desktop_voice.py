@@ -257,6 +257,148 @@ def test_speech_display_prefix_removed_and_queue_uses_generation(tmp_path, monke
     assert queued == ["Начнём. Один шаг."]
 
 
+def test_superseded_plan_event_is_discarded_before_backend_preparation(tmp_path, monkeypatch):
+    from desktop import voice
+    service = VoiceService(lambda _: None, lambda _: None, tmp_path)
+    current = [True]
+    queued = []
+    monkeypatch.setattr(service, "_enqueue_speech", queued.append)
+    service.say_event("Старая тренировка в среду", is_current=lambda: current[0])
+    assert len(queued) == 1
+    current[0] = False
+    monkeypatch.setattr(voice.importlib, "import_module", lambda *_: pytest.fail("Stale plan must not speak"))
+    service._speech.put(queued[0])
+    service._speech.put(None)
+    service._speak_loop()
+    assert service._last_spoken == 0
+
+
+def test_plan_edit_during_pcm_stops_the_remaining_audio(tmp_path, monkeypatch):
+    from desktop import voice
+    service = VoiceService(lambda _: None, lambda _: None, tmp_path)
+    current, writes = [True], []
+    class Output:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            pass
+        def write(self, data):
+            writes.append(len(data))
+            current[0] = False
+        def abort(self):
+            writes.append("aborted")
+    monkeypatch.setattr(voice.importlib, "import_module", lambda _: types.SimpleNamespace(RawOutputStream=lambda **_: Output()))
+    service._play_pcm(b"\x00\x00" * 5000, 24000, is_current=lambda: current[0])
+    assert writes == [2048, "aborted"]
+
+
+def test_personal_eugene_selection_never_loads_piper_or_windows(tmp_path, monkeypatch):
+    from desktop import voice
+    service = VoiceService(lambda _: None, lambda _: None, tmp_path)
+    service.apply_preferences({"voice_engine": "expressive", "voice_character": "eugene"})
+    choices, played = [], []
+    def create(**kwargs):
+        choices.append(kwargs)
+        return types.SimpleNamespace(prepare=lambda **_: True, synthesize=lambda *_a, **_k: (b"\x00\x00" * 100, 24000))
+    monkeypatch.setitem(sys.modules, "desktop.expressive_speech", types.SimpleNamespace(ExpressiveSpeech=create))
+    monkeypatch.setattr(service, "_play_pcm", lambda pcm, rate: played.append(rate))
+    monkeypatch.setattr(voice.importlib, "import_module", lambda _: pytest.fail("No COM for ready personal voice"))
+    service._speech.put("К вашим услугам, сэр.")
+    service._speech.put(None)
+    service._speak_loop()
+    assert choices == [{"voice": "eugene", "personal_use": True}]
+    assert played == [24000] and service.speech_backend == "expressive"
+
+
+def test_idle_hours_do_not_overflow_the_next_bilingual_utterance():
+    from desktop.voice import UtteranceBuffer
+    audio = UtteranceBuffer(16000)
+    for _ in range(72000):
+        audio.append(b"\0\0" * 800, active=False)
+    assert audio.pcm() is None and not audio.overflow
+    audio.append(b"\x01\0" * 800, active=True)
+    assert len(audio.pcm()) == 20 * 1600
+    for _ in range(250):
+        audio.append(b"\x01\0" * 800, active=True)
+    assert audio.overflow and audio.pcm() is None
+    audio.reset()
+    assert not audio.overflow and audio.pcm() is None
+
+
+def test_bilingual_decoder_only_runs_after_explicit_wake_and_never_for_fast_alias(tmp_path, monkeypatch):
+    service = VoiceService(lambda _: None, lambda _: None, tmp_path)
+    service.multilingual_stt_enabled = True
+    calls, heard = [], []
+    service.on_text = heard.append
+    service._stt = types.SimpleNamespace(transcribe=lambda pcm, rate: calls.append(rate) or "Jarvis, what is my plan for tomorrow?")
+    monkeypatch.setattr(service, "say", lambda _: None)
+    service._recognized("посторонний разговор", b"raw", 16000)
+    assert calls == [] and heard == []
+    service._recognized("джарвис открой калькулятор", b"raw", 16000)
+    assert calls == [] and heard == ["открой калькулятор"]
+    service._recognized("джарвис какой план", b"raw", 16000)
+    assert calls == [16000] and heard[-1] == "what is my plan for tomorrow?"
+
+
+def test_stop_during_multilingual_decode_discards_result_and_capture(tmp_path):
+    heard = []
+    service = VoiceService(heard.append, lambda _: None, tmp_path)
+    service.multilingual_stt_enabled = True
+    def decode(*_):
+        service._audio_callback(b"must not queue during transcription", 1, None, None)
+        service.stop()
+        return "open calculator"
+    service._stt = types.SimpleNamespace(transcribe=decode)
+    service._recognized("джарвис какой план", b"raw", 16000)
+    assert heard == [] and service._audio.empty() and not service._transcribing.is_set()
+
+
+def test_exact_personal_ack_does_not_wait_for_dynamic_helper(tmp_path, monkeypatch):
+    from desktop import voice
+    service = VoiceService(lambda _: None, lambda _: None, tmp_path)
+    service.speech_engine = "clone"
+    calls, played = [], []
+    clone = types.SimpleNamespace(is_ready=False,
+        prepare_background=lambda **_: calls.append("background"),
+        fixed_ack=lambda language: (b"\x00\x00" * 100, 24000),
+        stream=lambda *_a, **_k: pytest.fail("Known acknowledgment must not need dynamic inference"),
+        close=lambda: calls.append("closed"))
+    monkeypatch.setitem(sys.modules, "desktop.clone_speech", types.SimpleNamespace(CloneSpeech=lambda **_: clone))
+    monkeypatch.setattr(service, "_play_pcm", lambda pcm, rate, **_: played.append(rate))
+    monkeypatch.setattr(voice.importlib, "import_module", lambda _: pytest.fail("No COM or real output"))
+    service._speech.put(voice._PREPARE_SPEECH)
+    service._speech.put("Да, сэр")
+    service._speech.put(None)
+    service._speak_loop()
+    assert played == [24000] and service.speech_backend == "clone"
+    assert calls == ["background", "background", "closed"]
+
+
+def test_dynamic_audio_chunks_keep_one_output_stream_and_close_generator(tmp_path, monkeypatch):
+    from desktop import voice
+    service = VoiceService(lambda _: None, lambda _: None, tmp_path)
+    calls = []
+    class Output:
+        def __enter__(self):
+            calls.append("open")
+            return self
+        def __exit__(self, *_):
+            calls.append("close")
+        def write(self, data):
+            calls.append(data)
+        def abort(self):
+            calls.append("abort")
+    def chunks():
+        try:
+            yield b"\x01\0" * 50, 24000
+            yield b"\x02\0" * 50, 24000
+        finally:
+            calls.append("generator_closed")
+    monkeypatch.setattr(voice.importlib, "import_module", lambda _: types.SimpleNamespace(RawOutputStream=lambda **_: Output()))
+    service._play_pcm_stream(chunks())
+    assert calls == ["open", b"\x01\0" * 50, b"\x02\0" * 50, "generator_closed", "close"]
+
+
 def test_cached_model_installs_atomically_and_is_reused(tmp_path, monkeypatch):
     archive = archive_file(tmp_path / "model.zip")
     monkeypatch.setattr(model_setup, "MODEL_SHA256", hashlib.sha256(archive.read_bytes()).hexdigest())

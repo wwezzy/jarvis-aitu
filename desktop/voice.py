@@ -9,6 +9,8 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import itertools
+from collections import deque
+from contextlib import ExitStack
 import json
 import os
 import queue
@@ -70,6 +72,59 @@ class WakeDecision:
     text: str = ""
 
 
+@dataclass(frozen=True)
+class _EventSpeech:
+    text: str
+    is_current: Callable[[], bool]
+
+
+def _event_current(validator=None) -> bool:
+    if validator is None:
+        return True
+    try:
+        return validator() is True
+    except Exception:
+        return False
+
+
+class UtteranceBuffer:
+    """One second of preroll, then at most twelve seconds after speech starts.
+
+    Continuous idle microphone samples never grow the command buffer or make
+    the next real command look like an overlong utterance.
+    """
+    def __init__(self, sample_rate):
+        self.maximum = sample_rate * 2 * 12
+        self.reset()
+
+    def reset(self):
+        self._preroll = deque(maxlen=20)
+        self._frames = []
+        self._bytes = 0
+        self.started = self.overflow = False
+
+    def append(self, data, *, active):
+        if self.overflow:
+            return
+        if not self.started:
+            self._preroll.append(data)
+            if not active:
+                return
+            self.started = True
+            self._frames = list(self._preroll)
+            self._preroll.clear()
+            self._bytes = sum(map(len, self._frames))
+        else:
+            self._frames.append(data)
+            self._bytes += len(data)
+        if self._bytes > self.maximum:
+            self._frames.clear()
+            self.overflow = True
+
+    def pcm(self):
+        return b"".join(self._frames) if self.started and not self.overflow else None
+
+
 class WakeGate:
     """Whole-token wake word, one command, bounded follow-up; no fuzzy match."""
 
@@ -124,6 +179,12 @@ class VoiceService:
         self.gate = WakeGate()
         self._stop = threading.Event()
         self._speaking = threading.Event()
+        self._transcribing = threading.Event()
+        self._audio_epoch = 0
+        self.multilingual_stt_enabled = False
+        self._stt = None
+        self._active_backend = None
+        self._utterance_audio_started = False
         self._audio: queue.Queue[bytes] = queue.Queue(maxsize=24)
         self._speech: queue.Queue = queue.Queue(maxsize=5)
         self._thread: threading.Thread | None = None
@@ -131,6 +192,7 @@ class VoiceService:
         self.speech_enabled = True
         self.speech_rate = 185
         self.speech_engine = "auto"
+        self.speech_character = "aidar"
         self.speech_backend = "not_prepared"
         self._halt_speech = threading.Event()
         self._closed = threading.Event()
@@ -201,7 +263,8 @@ class VoiceService:
                 break
 
     def _audio_callback(self, data, frames, timing, status):
-        if self._stop.is_set() or self._speaking.is_set() or time.monotonic() - self._last_spoken < SPEECH_ECHO_TAIL:
+        if (self._stop.is_set() or self._speaking.is_set() or self._transcribing.is_set()
+                or time.monotonic() - self._last_spoken < SPEECH_ECHO_TAIL):
             return
         try:
             self._audio.put_nowait(bytes(data))
@@ -209,8 +272,33 @@ class VoiceService:
             # Drop old audio rather than execute a stale delayed utterance.
             self._clear_audio()
             self.gate.reset()
+            self._audio_epoch += 1
 
-    def _recognized(self, text: str):
+    def _decode_command(self, text, pcm=None, sample_rate=None):
+        if not self.multilingual_stt_enabled or pcm is None or self._stt is None:
+            return text
+        # Existing exact utilities keep their fast, offline Vosk route. A
+        # recognizer does not create capabilities; DesktopCore still owns the
+        # finite action policy and all power confirmations.
+        from desktop.core import ALIASES, normalize
+        if normalize(text) in ALIASES:
+            return text
+        self._transcribing.set()
+        self._clear_audio()
+        try:
+            decoded = self._stt.transcribe(pcm, sample_rate)
+            if self._stop.is_set() or self._closed.is_set():
+                return None
+            decoded = re.sub(r"^(?:джарвис|джарвиз|jarvis)[,.!?\s:—-]+", "", decoded.strip(), flags=re.I)
+            return decoded or None
+        except Exception:
+            self._emit(self.on_state, "Не удалось уверенно распознать команду. Повтори её или напиши текстом.")
+            return None
+        finally:
+            self._clear_audio()
+            self._transcribing.clear()
+
+    def _recognized(self, text: str, pcm=None, sample_rate=None):
         if (self._stop.is_set() or self._speaking.is_set()
                 or time.monotonic() - self._last_spoken < SPEECH_ECHO_TAIL):
             return
@@ -220,7 +308,9 @@ class VoiceService:
             self.say("Да, сэр")
         elif result.kind == "command":
             self._emit(self.on_state, "Обрабатываю команду…")
-            self._emit(self.on_text, result.text)
+            decoded = self._decode_command(result.text, pcm, sample_rate)
+            if decoded is not None and not self._stop.is_set() and not self._closed.is_set():
+                self._emit(self.on_text, decoded)
         elif result.kind == "cancel":
             self._emit(self.on_state, "Ожидаю слово «Джарвис»")
 
@@ -231,6 +321,17 @@ class VoiceService:
             self._emit(self.on_state, "Загружаю локальную модель…")
             vosk.SetLogLevel(-1)
             model = vosk.Model(str(self.model_dir))
+            if self.multilingual_stt_enabled:
+                try:
+                    from desktop.multilingual_stt import MultilingualSTT
+                    self._emit(self.on_state, "Готовлю русское и английское распознавание…")
+                    self._stt = MultilingualSTT()
+                    if not self._stt.prepare():
+                        self._stt = None
+                        self._emit(self.on_state, "Два языка пока недоступны. Русское распознавание продолжает работать.")
+                except Exception:
+                    self._stt = None
+                    self._emit(self.on_state, "Два языка пока недоступны. Русское распознавание продолжает работать.")
             device = sound.query_devices(kind="input")
             sample_rate = int(device["default_samplerate"])
             recognizer = vosk.KaldiRecognizer(model, sample_rate)
@@ -240,15 +341,18 @@ class VoiceService:
                                       dtype="int16", channels=1, callback=self._audio_callback):
                 self._emit(self.on_state, "Ожидаю слово «Джарвис»")
                 reset_after_speech = self._last_spoken
+                audio_epoch, utterance = self._audio_epoch, UtteranceBuffer(sample_rate)
                 while not self._stop.is_set():
                     if self._speaking.is_set():
                         self._clear_audio()
                         self._stop.wait(0.05)
                         continue
-                    if reset_after_speech != self._last_spoken:
+                    if reset_after_speech != self._last_spoken or audio_epoch != self._audio_epoch:
                         recognizer.Reset()
                         self._clear_audio()
                         reset_after_speech = self._last_spoken
+                        audio_epoch = self._audio_epoch
+                        utterance.reset()
                     try:
                         data = self._audio.get(timeout=0.2)
                     except queue.Empty:
@@ -256,9 +360,18 @@ class VoiceService:
                             self.gate.reset()
                             self._emit(self.on_state, "Ожидаю слово «Джарвис»")
                         continue
-                    if recognizer.AcceptWaveform(data):
-                        result = json.loads(recognizer.Result())
-                        self._recognized(result.get("text", ""))
+                    complete = recognizer.AcceptWaveform(data)
+                    result = json.loads(recognizer.Result()) if complete else None
+                    if self.multilingual_stt_enabled:
+                        text = result.get("text", "") if complete else json.loads(recognizer.PartialResult()).get("partial", "")
+                        utterance.append(data, active=bool(text))
+                    if complete:
+                        if utterance.overflow:
+                            self.gate.reset()
+                            self._emit(self.on_state, "Фраза слишком длинная. Повтори короткую команду после «Джарвис».")
+                        else:
+                            self._recognized(result.get("text", ""), utterance.pcm(), sample_rate)
+                        utterance.reset()
         except Exception as error:
             self._emit(self.on_state, f"Голос недоступен ({type(error).__name__}). Текстовый ввод работает.")
         finally:
@@ -269,16 +382,27 @@ class VoiceService:
         """Apply bounded local settings; no model download or recording."""
         engine = preferences.get("voice_engine", self.speech_engine)
         rate = preferences.get("voice_rate", self.speech_rate)
-        if not isinstance(engine, str) or engine not in {"auto", "windows"}:
+        character = preferences.get("voice_character", self.speech_character)
+        multilingual = preferences.get("multilingual_stt_enabled", self.multilingual_stt_enabled)
+        if type(multilingual) is not bool:
+            raise ValueError("Boolean recognition preference required")
+        if not isinstance(engine, str) or engine not in {"auto", "windows", "expressive", "clone"}:
             raise ValueError("Unsupported speech engine")
+        if not isinstance(character, str) or character not in {"aidar", "eugene"}:
+            raise ValueError("Unsupported speech character")
         if type(rate) is not int or not 90 <= rate <= 240:
             raise ValueError("Voice rate must be 90..240")
-        if engine != self.speech_engine or rate != self.speech_rate:
+        if engine != self.speech_engine or rate != self.speech_rate or character != self.speech_character:
             self.interrupt()
+        if engine != self.speech_engine or character != self.speech_character:
+            self._close_backend()
         self.speech_engine, self.speech_rate = engine, rate
+        self.speech_character = character
+        self.multilingual_stt_enabled = multilingual
         self.speech_enabled = bool(preferences.get("speech_enabled", self.speech_enabled))
         if not self.speech_enabled:
             self.interrupt()
+            self._close_backend()
 
     def interrupt(self):
         """Stop old speech without stopping the microphone or authorizing actions."""
@@ -307,18 +431,37 @@ class VoiceService:
         """Warm CPU speech and cache the wake reply, asynchronously and silently."""
         self._enqueue_speech(_PREPARE_SPEECH)
 
-    def say(self, text: str):
-        """Speak bounded plain text. UI labels/Markdown are not read as dialogue."""
+    @staticmethod
+    def _speech_text(text: str) -> str:
         text = re.sub(r"^Локальная модель:\s*", "", str(text).strip())
         text = re.sub(r"(?m)^\s*(?:#{1,6}\s+|[-*]\s+)", "", text)
         text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
-        text = re.sub(r"\s+", " ", text).strip()[:700]
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > 700:
+            short = text[:650]
+            sentence_end = max(short.rfind("."), short.rfind("!"), short.rfind("?"))
+            short = short[:sentence_end + 1] if sentence_end >= 200 else short.rsplit(" ", 1)[0].rstrip(",;:") + "."
+            text = short + " Подробности на экране."
+        return text
+
+    def say(self, text: str):
+        """Speak bounded plain text. UI labels/Markdown are not read as dialogue."""
+        text = self._speech_text(text)
         if text:
             self._enqueue_speech(text)
+
+    def say_event(self, text: str, *, is_current):
+        """Recheck a versioned plan event in the audio worker, never dispatch it."""
+        if not callable(is_current):
+            raise ValueError("A current-event validator is required")
+        text = self._speech_text(text)
+        if text and _event_current(is_current):
+            self._enqueue_speech(_EventSpeech(text, is_current))
 
     def close(self):
         self._closed.set()
         self.stop()
+        self._close_backend()
         try:
             self._speech.put_nowait(None)
         except queue.Full:
@@ -326,63 +469,186 @@ class VoiceService:
         if self._speaker and self._speaker is not threading.current_thread():
             self._speaker.join(timeout=3)
 
-    def _play_pcm(self, pcm: bytes, sample_rate: int):
+    def _close_backend(self):
+        with self._lock:
+            backend, self._active_backend = self._active_backend, None
+        self._dispose_backend(backend)
+
+    @staticmethod
+    def _dispose_backend(backend):
+        close = getattr(backend, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+    def _backend_current(self, generation, engine, character):
+        return (generation == self._speech_generation and not self._closed.is_set()
+                and self.speech_enabled and self.speech_engine == engine
+                and self.speech_character == character)
+
+    def _play_pcm_stream(self, chunks, *, is_current=None):
+        """Keep one audio stream open while the isolated voice yields PCM."""
+        sound, stream, rate, total = None, None, None, 0
+        try:
+            with ExitStack() as stack:
+                for pcm, chunk_rate in chunks:
+                    if (self._halt_speech.is_set() or self._closed.is_set() or not self.speech_enabled
+                            or not _event_current(is_current)):
+                        if stream is not None:
+                            stream.abort()
+                        return
+                    if (not isinstance(pcm, bytes) or not pcm or len(pcm) % 2
+                            or type(chunk_rate) is not int or not 8000 <= chunk_rate <= 48000
+                            or rate is not None and chunk_rate != rate):
+                        raise ValueError("Invalid streamed audio")
+                    rate, total = chunk_rate, total + len(pcm)
+                    if total > rate * 2 * 60:
+                        raise ValueError("Streamed audio exceeded its limit")
+                    if stream is None:
+                        sound = importlib.import_module("sounddevice")
+                        stream = stack.enter_context(sound.RawOutputStream(samplerate=rate, dtype="int16", channels=1,
+                                                                          blocksize=0, latency="low"))
+                    for offset in range(0, len(pcm), 2048):
+                        if (self._halt_speech.is_set() or self._closed.is_set() or not self.speech_enabled
+                                or not _event_current(is_current)):
+                            stream.abort()
+                            return
+                        stream.write(pcm[offset:offset + 2048])
+                        self._utterance_audio_started = True
+        finally:
+            close = getattr(chunks, "close", None)
+            if callable(close):
+                close()
+
+    def _play_pcm(self, pcm: bytes, sample_rate: int, *, is_current=None):
         """Use short output blocks for prompt stop/mute; never store audio."""
         if (not isinstance(pcm, bytes) or not pcm or len(pcm) % 2
                 or type(sample_rate) is not int or not 8000 <= sample_rate <= 48000
                 or len(pcm) > sample_rate * 2 * 120):
             raise ValueError("Invalid synthesized audio")
-        if self._halt_speech.is_set() or not self.speech_enabled or self._closed.is_set():
+        if self._halt_speech.is_set() or not self.speech_enabled or self._closed.is_set() or not _event_current(is_current):
             return
         sound = importlib.import_module("sounddevice")
         with sound.RawOutputStream(samplerate=sample_rate, dtype="int16", channels=1,
                                    blocksize=0, latency="low") as stream:
             for offset in range(0, len(pcm), 2048):
-                if self._halt_speech.is_set() or not self.speech_enabled or self._closed.is_set():
+                if (self._halt_speech.is_set() or not self.speech_enabled or self._closed.is_set()
+                        or not _event_current(is_current)):
                     stream.abort()
                     break
                 stream.write(pcm[offset:offset + 2048])
+                self._utterance_audio_started = True
 
     def _speak_loop(self):
         # Neural synthesis and COM remain on this one worker. Fallback COM is
         # lazy: an unavailable Windows voice cannot prevent neural speech.
-        initialized, speaker, pythoncom, neural = False, None, None, None
+        initialized, speaker, pythoncom, neural, neural_key, fallback = False, None, None, None, None, None
         try:
             while True:
                 item = self._speech.get()
                 if item is None:
                     break
                 generation, text = item if isinstance(item, tuple) else (self._speech_generation, item)
+                validator = text.is_current if isinstance(text, _EventSpeech) else None
+                if validator is not None:
+                    text = text.text
+                if not _event_current(validator):
+                    continue
                 if not self.speech_enabled or self._closed.is_set():
                     continue
-                engine, speech_rate = self.speech_engine, self.speech_rate
+                engine, speech_rate, character = self.speech_engine, self.speech_rate, self.speech_character
                 use_neural = False
-                if engine == "auto":
+                renderer, fixed_audio = None, None
+                if engine in {"auto", "expressive", "clone"}:
                     try:
-                        if neural is None:
-                            from desktop.neural_speech import NeuralSpeech
-                            neural = NeuralSpeech()
-                        use_neural = neural.prepare(rate=speech_rate)
+                        key = (engine, character if engine == "expressive" else None)
+                        if neural is None or neural_key != key or self._active_backend is not neural:
+                            self._close_backend()
+                            if engine == "clone":
+                                from desktop.clone_speech import CloneSpeech
+                                candidate = CloneSpeech(personal_use=True)
+                            elif engine == "expressive":
+                                from desktop.expressive_speech import ExpressiveSpeech
+                                candidate = ExpressiveSpeech(voice=character, personal_use=True)
+                            else:
+                                from desktop.neural_speech import NeuralSpeech
+                                candidate = NeuralSpeech()
+                            with self._lock:
+                                current = self._backend_current(generation, engine, character)
+                                if current:
+                                    neural, neural_key, self._active_backend = candidate, key, candidate
+                            if not current:
+                                self._dispose_backend(candidate)
+                                continue
+                        if engine == "clone":
+                            # Starting an owned helper is a lifecycle mutation:
+                            # serialize its lightweight start with opt-out/close.
+                            with self._lock:
+                                if not self._backend_current(generation, engine, character):
+                                    continue
+                                neural.prepare_background(rate=speech_rate)
+                            if isinstance(text, str) and text.casefold().rstrip(".!?") in {"да сэр", "да, сэр"}:
+                                fixed_audio = neural.fixed_ack("ru")
+                            use_neural = fixed_audio is not None or neural.is_ready
+                            if use_neural:
+                                renderer = neural
+                            elif text is not _PREPARE_SPEECH:
+                                if fallback is None:
+                                    from desktop.expressive_speech import ExpressiveSpeech
+                                    fallback = ExpressiveSpeech(voice="eugene", personal_use=True)
+                                use_neural = fallback.prepare(rate=speech_rate)
+                                renderer = fallback
+                        else:
+                            use_neural = neural.prepare(rate=speech_rate)
+                            renderer = neural
                     except Exception:
                         use_neural = False
+                if not _event_current(validator):
+                    continue
                 with self._lock:
                     if generation != self._speech_generation or self._closed.is_set() or not self.speech_enabled:
                         continue
                     if text is _PREPARE_SPEECH:
-                        self.speech_backend = "neural" if use_neural else "windows"
+                        if engine == "clone":
+                            self.speech_backend = "clone" if use_neural else "clone_warming"
+                        else:
+                            self.speech_backend = ("expressive" if engine == "expressive" else "neural") if use_neural else "windows"
                         continue
                     self._halt_speech.clear()
                     self._speaking.set()
+                    self._utterance_audio_started = False
                 self._clear_audio()
                 self._emit(self.on_state, "Говорю…")
                 try:
                     if use_neural:
                         try:
-                            pcm, rate = neural.synthesize(text, rate=speech_rate)
-                            self.speech_backend = "neural"
-                            self._play_pcm(pcm, rate)
+                            if fixed_audio is not None:
+                                self.speech_backend = "clone"
+                                pcm, rate = fixed_audio
+                                self._play_pcm(pcm, rate, is_current=validator)
+                            elif engine == "clone" and renderer is neural:
+                                self.speech_backend = "clone"
+                                chunks = neural.stream(text, rate=speech_rate,
+                                    cancel=lambda: self._closed.is_set() or self._halt_speech.is_set()
+                                    or not self.speech_enabled or not _event_current(validator))
+                                self._play_pcm_stream(chunks, is_current=validator)
+                            else:
+                                pcm, rate = renderer.synthesize(text, rate=speech_rate)
+                                self.speech_backend = "expressive" if engine in {"expressive", "clone"} else "neural"
+                                if validator is None:
+                                    self._play_pcm(pcm, rate)
+                                else:
+                                    self._play_pcm(pcm, rate, is_current=validator)
                             continue
                         except Exception:
+                            if (self._closed.is_set() or self._halt_speech.is_set() or not self.speech_enabled
+                                    or not _event_current(validator)):
+                                continue
+                            if self._utterance_audio_started:
+                                self._emit(self.on_state, "Озвучивание прервалось. Полный ответ остаётся на экране.")
+                                continue
                             self._emit(self.on_state, "Нейроголос недоступен. Использую голос Windows.")
                     if speaker is None:
                         pythoncom = importlib.import_module("pythoncom")
@@ -391,14 +657,16 @@ class VoiceService:
                         initialized = True
                         speaker = client.Dispatch("SAPI.SpVoice")
                         select_windows_voice(speaker, client)
-                    if self._halt_speech.is_set() or self._closed.is_set() or not self.speech_enabled:
+                    if (self._halt_speech.is_set() or self._closed.is_set() or not self.speech_enabled
+                            or not _event_current(validator)):
                         continue
                     self.speech_backend = "windows"
                     speaker.Rate = max(-4, min(4, round((speech_rate - 165) / 18)))
                     # SVSFlagsAsync=1 + SVSFIsNotXML=16: plain text only.
                     speaker.Speak(text, 17)
                     while not speaker.WaitUntilDone(100):
-                        if self._halt_speech.is_set() or not self.speech_enabled or self._closed.is_set():
+                        if (self._halt_speech.is_set() or not self.speech_enabled or self._closed.is_set()
+                                or not _event_current(validator)):
                             speaker.Speak("", 18)
                             break
                 finally:
@@ -413,6 +681,7 @@ class VoiceService:
             self._speaking.clear()
             self._emit(self.on_state, "Голос недоступен. Ответ показан текстом.")
         finally:
+            self._close_backend()
             if initialized:
                 speaker = None
                 pythoncom.CoUninitialize()
