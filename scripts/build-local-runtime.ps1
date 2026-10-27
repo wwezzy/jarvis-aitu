@@ -3,6 +3,7 @@ param(
     [string]$PythonPath,
     [string]$ModelDir,
     [string]$OllamaPath,
+    [switch]$PersonalVoice,
     [switch]$NoShortcut
 )
 $ErrorActionPreference = 'Stop'
@@ -50,9 +51,23 @@ foreach ($file in @('python.exe', 'pythonw.exe')) {
 
 $packageArguments = @('-m', 'pip', 'install', '--disable-pip-version-check', '--no-compile',
     '--index-url', 'https://pypi.org/simple', '--target', $sitePath,
-    'PySide6-Essentials==6.12.0', 'vosk==0.3.45', 'sounddevice==0.5.6', 'pywin32==312')
+    '-r', (Join-Path $repoPath 'requirements-desktop-runtime.txt'))
 & $PythonPath @packageArguments
 if ($LASTEXITCODE -ne 0) { throw 'Runtime dependency installation failed; no shortcut was created.' }
+if ($PersonalVoice) {
+    & $PythonPath -m pip install --disable-pip-version-check --no-compile --target $sitePath --upgrade -r (Join-Path $repoPath 'requirements-personal-voice.txt')
+    if ($LASTEXITCODE -ne 0) { throw 'Optional personal voice runtime installation failed.' }
+}
+# This is a CPU-only CTranslate2 installation. Its Windows wheel contains an
+# unused cuDNN dispatcher although v4.8.4 is built WITH_CUDNN=OFF. Do not ship
+# that optional NVIDIA binary in the CPU app; retain all source/vendor notices.
+$cpuOptionalDll = [IO.Path]::GetFullPath((Join-Path $sitePath 'ctranslate2\cudnn64_9.dll'))
+$cpuPackageRoot = [IO.Path]::GetFullPath((Join-Path $sitePath 'ctranslate2'))
+if ([IO.Path]::GetDirectoryName($cpuOptionalDll) -ne $cpuPackageRoot) { throw 'Unexpected optional CPU package path.' }
+if (Test-Path -LiteralPath $cpuOptionalDll) {
+    if ((Get-Item -LiteralPath $cpuOptionalDll).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Unexpected linked dependency.' }
+    Remove-Item -LiteralPath $cpuOptionalDll
+}
 Copy-Item -LiteralPath (Join-Path $repoPath 'desktop_app.py') -Destination $appPath
 $desktopPath = Join-Path $appPath 'desktop'
 New-Item -ItemType Directory -Path $desktopPath -Force | Out-Null
@@ -61,6 +76,8 @@ Get-ChildItem -LiteralPath (Join-Path $repoPath 'desktop') -File -Filter '*.py' 
 Copy-Item -LiteralPath (Join-Path $repoPath 'desktop\assets') -Destination $desktopPath -Recurse
 Copy-Item -LiteralPath (Join-Path $repoPath 'desktop\NOTICE.txt') -Destination $desktopPath
 Copy-Item -LiteralPath (Join-Path $repoPath 'desktop\licenses') -Destination $desktopPath -Recurse
+Copy-Item -LiteralPath (Join-Path $repoPath 'desktop\phone_web') -Destination $desktopPath -Recurse
+Copy-Item -LiteralPath (Join-Path $repoPath 'HANDSFREE.md') -Destination $appPath
 if (-not $ModelDir) {
     Push-Location $repoPath
     try { $ModelDir = (& $PythonPath -c 'from desktop.model_setup import default_model_dir; print(default_model_dir())').Trim() }
@@ -132,11 +149,19 @@ runpy.run_path(str(APP / "desktop_app.py"), run_name="__main__")
 $launcherPath = Join-Path $installPath 'launcher.pyw'
 [IO.File]::WriteAllText($launcherPath, $launcher, [Text.UTF8Encoding]::new($false))
 $manifest = @{
-    version = '4.2.0'; kind = 'isolated-source-runtime'; sourceCommit = (& git -C $repoPath rev-parse HEAD).Trim()
+    version = '4.3.0'; kind = 'isolated-source-runtime'; sourceCommit = (& git -C $repoPath rev-parse HEAD).Trim()
     runtimeSigner = $signature.SignerCertificate.Subject
     pythonwSha256 = (Get-FileHash -LiteralPath (Join-Path $runtimePath 'pythonw.exe') -Algorithm SHA256).Hash
     personalDataBundled = $false; cloudCredentialsBundled = $false
+    launcherSha256 = (Get-FileHash -LiteralPath $launcherPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    dataDirectory = (Join-Path $env:USERPROFILE 'JarvisData\Desktop')
 }
+$sourceHashes = @{}
+foreach ($sourceFile in @(Get-Item -LiteralPath (Join-Path $appPath 'desktop_app.py')) + @(Get-ChildItem -LiteralPath $desktopPath -File -Filter '*.py')) {
+    $relativeSource = [IO.Path]::GetRelativePath($appPath, $sourceFile.FullName).Replace('\', '/')
+    $sourceHashes[$relativeSource] = (Get-FileHash -LiteralPath $sourceFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+$manifest.sourceFilesSha256 = $sourceHashes
 if (-not $OllamaPath) {
     $OllamaPath = @(
         (Join-Path $env:USERPROFILE 'Applications\Ollama\ollama.exe'),
@@ -152,6 +177,17 @@ if ($OllamaPath) {
         if ($modelPublisher -in @('Ollama Inc.', 'Ollama Inc')) {
             $manifest.ollamaExe = $modelExecutable
             $manifest.ollamaSha256 = (Get-FileHash -LiteralPath $modelExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+    }
+}
+$musicExecutable = Join-Path $env:LOCALAPPDATA 'Programs\YandexMusic\Яндекс Музыка.exe'
+if (Test-Path -LiteralPath $musicExecutable) {
+    $musicSignature = Get-AuthenticodeSignature -LiteralPath $musicExecutable
+    if ($musicSignature.Status -eq 'Valid') {
+        $musicPublisher = $musicSignature.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+        if ($musicPublisher -eq 'YANDEX LLC') {
+            $manifest.yandexMusicExe = (Resolve-Path -LiteralPath $musicExecutable).Path
+            $manifest.yandexMusicSha256 = (Get-FileHash -LiteralPath $musicExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
         }
     }
 }
@@ -179,7 +215,7 @@ if (-not $NoShortcut) {
     $shortcut.Description = 'JARVIS — локальный голосовой ассистент'
     $shortcut.Save()
     Write-Output ('Start Menu shortcut: ' + $shortcutPath)
-    $downloadPath = Join-Path $env:USERPROFILE 'Downloads\Jarvis-Desktop-4.2.0'
+    $downloadPath = Join-Path $env:USERPROFILE 'Downloads\Jarvis-Desktop-4.3.0'
     New-Item -ItemType Directory -Path $downloadPath -Force | Out-Null
     Copy-Item -LiteralPath $shortcutPath -Destination (Join-Path $downloadPath 'JARVIS.lnk') -Force
     Write-Output ('Ready launch shortcut: ' + (Join-Path $downloadPath 'JARVIS.lnk'))

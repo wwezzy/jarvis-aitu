@@ -12,7 +12,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 for name in list(os.environ):
-    if name.startswith(("GEMINI_", "OPENAI_", "NVIDIA_", "UPSTASH_", "LMS_", "PC_AGENT_", "PC_MONITOR_", "PC_ACTIVITY_", "REDIS_", "GOOGLE_", "ENABLE_", "WEB_RESEARCH_", "AI_PRICE_")):
+    if name.startswith(("GEMINI_", "OPENAI_", "NVIDIA_", "UPSTASH_", "LMS_", "PC_AGENT_", "PC_MONITOR_", "PC_ACTIVITY_", "REDIS_", "GOOGLE_", "ENABLE_", "WEB_RESEARCH_", "AI_PRICE_", "JARVIS_PHONE_", "DESKTOP_TELEGRAM_", "TWILIO_")):
         os.environ.pop(name)
 os.environ.update(
     PYTHON_DOTENV_DISABLED="1",
@@ -31,6 +31,16 @@ os.environ.update(
     NVIDIA_MODEL="offline-nvidia",
     GEMINI_MODEL="offline-gemini",
 )
+
+
+def pytest_collection_modifyitems(items):
+    """Keep the desktop CI group complete when optional adapters are added."""
+    related = {"test_local_recovery.py", "test_local_chat_runtime.py", "test_model_runtime.py",
+               "test_neural_speech.py", "test_expressive_speech.py", "test_clone_speech.py",
+               "test_multilingual_stt.py", "test_phone_delivery.py", "test_voice_lifecycle_review.py"}
+    for item in items:
+        if item.path.name.startswith("test_desktop_") or item.path.name in related:
+            item.add_marker(pytest.mark.desktop)
 
 
 @pytest.fixture(autouse=True)

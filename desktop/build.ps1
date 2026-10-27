@@ -21,6 +21,10 @@ $arguments = @('-m', 'PyInstaller', '--noconfirm', '--clean', '--noupx', '--oned
     '--name', 'JarvisDesktop', '--distpath', $distPath, '--workpath', $workPath,
     '--specpath', $specPath, '--paths', $repoPath,
     '--collect-all', 'vosk', '--collect-all', '_sounddevice_data',
+    '--collect-data', 'piper', '--collect-binaries', 'piper',
+    '--hidden-import', 'piper.voice', '--hidden-import', 'piper.espeakbridge',
+    '--collect-all', 'onnxruntime',
+    '--collect-all', 'ctranslate2', '--collect-all', 'tokenizers',
     '--hidden-import', 'sounddevice', '--hidden-import', 'pythoncom', '--hidden-import', 'win32com.client')
 $fontPath = Join-Path $PSScriptRoot 'assets\Inter.ttf'
 $fontNotice = Join-Path $PSScriptRoot 'assets\OFL-Inter.txt'
@@ -29,6 +33,8 @@ if (-not (Test-Path -LiteralPath $fontPath) -or -not (Test-Path -LiteralPath $fo
 }
 $arguments += @('--add-data', ($fontPath + ';desktop/assets'), '--add-data', ($fontNotice + ';desktop/assets'),
                 '--add-data', ((Join-Path $PSScriptRoot 'NOTICE.txt') + ';desktop'))
+$arguments += @('--add-data', ((Join-Path $PSScriptRoot 'phone_web') + ';desktop/phone_web'),
+                '--add-data', ((Join-Path $repoPath 'HANDSFREE.md') + ';.'))
 $arguments += @('--icon', (Join-Path $PSScriptRoot 'assets\jarvis.ico'))
 $licensePath = Join-Path $outputPath 'licenses'
 $licenseCode = @'
@@ -38,7 +44,9 @@ root = pathlib.Path(sys.argv[1]).resolve()
 root.mkdir(parents=True, exist_ok=True)
 packages = ['PySide6-Essentials', 'shiboken6', 'vosk', 'sounddevice', 'pywin32',
             'cffi', 'pycparser', 'requests', 'certifi', 'charset-normalizer',
-            'idna', 'urllib3', 'srt', 'tqdm', 'websockets', 'pyinstaller']
+            'idna', 'urllib3', 'srt', 'tqdm', 'websockets', 'pyinstaller',
+            'piper-tts', 'onnxruntime', 'numpy', 'pathvalidate', 'flatbuffers', 'packaging',
+            'ctranslate2', 'tokenizers', 'huggingface-hub', 'PyYAML']
 for package in packages:
     try:
         distribution = metadata.distribution(package)
@@ -62,16 +70,16 @@ $arguments += @('--add-data', ($licensePath + ';licenses'),
 $versionPath = Join-Path $outputPath 'version-info.txt'
 @'
 VSVersionInfo(
-  ffi=FixedFileInfo(filevers=(4,2,0,0), prodvers=(4,2,0,0), mask=0x3f, flags=0,
+  ffi=FixedFileInfo(filevers=(4,3,0,0), prodvers=(4,3,0,0), mask=0x3f, flags=0,
                     OS=0x40004, fileType=0x1, subtype=0x0, date=(0,0)),
   kids=[StringFileInfo([StringTable('040904B0', [
     StringStruct('CompanyName','Jarvis personal project'),
     StringStruct('FileDescription','Jarvis local desktop assistant'),
-    StringStruct('FileVersion','4.2.0.0'),
+    StringStruct('FileVersion','4.3.0.0'),
     StringStruct('InternalName','JarvisDesktop'),
     StringStruct('OriginalFilename','JarvisDesktop.exe'),
     StringStruct('ProductName','Jarvis Desktop'),
-    StringStruct('ProductVersion','4.2.0')])]),
+    StringStruct('ProductVersion','4.3.0')])]),
     VarFileInfo([VarStruct('Translation',[1033,1200])])])
 '@ | Set-Content -LiteralPath $versionPath -Encoding utf8
 $arguments += @('--version-file', $versionPath)
@@ -104,6 +112,13 @@ try {
 
 $bundlePath = Join-Path $distPath 'JarvisDesktop'
 if (-not (Test-Path -LiteralPath (Join-Path $bundlePath 'JarvisDesktop.exe'))) { throw 'Built executable not found.' }
+$cpuBundleRoot = [IO.Path]::GetFullPath($bundlePath) + [IO.Path]::DirectorySeparatorChar
+Get-ChildItem -LiteralPath $bundlePath -Recurse -File -Filter 'cudnn64_9.dll' | ForEach-Object {
+    $optionalPath = [IO.Path]::GetFullPath($_.FullName)
+    if (-not $optionalPath.StartsWith($cpuBundleRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        ($_.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Unexpected generated optional CUDA dependency.' }
+    Remove-Item -LiteralPath $optionalPath
+}
 # Qt uses the ICU API provided by supported Windows versions. Do not ship a
 # foreign development-tool ICU or redistribute a copy of the OS component.
 $taskBundleInternal = [IO.Path]::GetFullPath((Join-Path $bundlePath '_internal'))
@@ -133,6 +148,6 @@ if (-not $IsccPath) {
 if (-not $IsccPath) { throw 'Portable build succeeded. Install official Inno Setup or pass -IsccPath to build the per-user installer.' }
 & $IsccPath ('/DBundleDir=' + $bundlePath) ('/DOutputDir=' + $outputPath) (Join-Path $PSScriptRoot 'installer.iss')
 if ($LASTEXITCODE -ne 0) { throw 'Inno Setup compilation failed.' }
-$installer = Join-Path $outputPath 'JarvisDesktop-Setup-4.2.0.exe'
+$installer = Join-Path $outputPath 'JarvisDesktop-Setup-4.3.0.exe'
 if (-not (Test-Path -LiteralPath $installer)) { throw 'Installer output not found.' }
 Get-FileHash -LiteralPath $installer -Algorithm SHA256 | Select-Object Algorithm, Hash, Path

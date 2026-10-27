@@ -26,7 +26,7 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libegl1 libopengl0 libxkbcommon0 libdbus-1-3
       - run: python -m pip install -r requirements-dev.txt -r requirements-desktop.txt
-      - run: python -m pytest -q -ra tests/test_desktop_core.py tests/test_desktop_voice.py tests/test_desktop_ui.py tests/test_desktop_personal.py tests/test_local_recovery.py tests/test_local_chat_runtime.py tests/test_model_runtime.py
+      - run: python -m pytest -q -ra -m desktop
       - run: python desktop_app.py --smoke-test
       - if: runner.os == 'Windows'
         shell: pwsh
@@ -57,7 +57,7 @@ jobs:
           cache: pip
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m ruff check .
-      - run: node --check webapp/static/app.js && node --check webapp/static/v4.js && node --check webapp/static/deadlines.js && node --check webapp/static/assistant.js
+      - run: node --check webapp/static/app.js && node --check webapp/static/v4.js && node --check webapp/static/deadlines.js && node --check webapp/static/assistant.js && node --check desktop/phone_web/app.js && node --check desktop/phone_web/sw.js
       - run: python -m pytest -q -ra -m "not postgres"
   postgres:
     runs-on: ubuntu-latest
@@ -94,6 +94,6 @@ jobs:
           cache: pip
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m playwright install --with-deps chromium
-      - run: python -m pytest -q tests/test_v4_browser.py
+      - run: python -m pytest -q tests/test_v4_browser.py tests/test_desktop_phone.py
         env:
           RUN_BROWSER_TESTS: '1'

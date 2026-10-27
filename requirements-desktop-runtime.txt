@@ -7,3 +7,8 @@ pywin32==312; sys_platform == 'win32'
 piper-tts==1.8.0
 onnxruntime==1.31.1
 numpy==2.5.4
+# Multilingual raw-PCM recognition (no PyAV/Faster-Whisper decoder dependency).
+ctranslate2==4.8.4
+tokenizers==0.23.3
+huggingface-hub==0.36.2
+PyYAML==6.0.3

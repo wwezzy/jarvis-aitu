@@ -1,12 +1,46 @@
-Jarvis Desktop 4.2.0
+Jarvis Desktop 4.3.0
 
 This is an independent local personal assistant. It is not affiliated with
 Marvel, Disney, the Iron Man films or the third-party JARVIS installer.
-It does not contain or clone a film actor's voice.
+The public distribution contains no user reference recordings or private
+voice-model weights. Optional personal voice conditioning uses recordings
+explicitly supplied by the user; no identity, endorsement or commercial
+voice rights are claimed.
 
-The app uses installed Windows speech voices and offline Vosk recognition.
+The app uses offline Vosk recognition and optionally CPU neural Piper speech.
+Installed Windows speech remains an explicit selectable fallback.
+Optional personal Silero v5_6_ru speech is CC-BY-NC-SA-4.0; XTTS-v2 weights
+and outputs are governed by the Coqui Public Model License. They are not
+included in the standard/public installer and require an explicit personal
+setup choice. Recordings, GPU environment and private manifests stay outside
+the repository and distribution. Corresponding official sources and terms:
+https://github.com/snakers4/silero-models/tree/e382298387332f2bf461fe6eadfde99104611b0c
+https://huggingface.co/coqui/XTTS-v2/tree/6c2b0d75eae4b7047358e3b6bd9325f857d43f77
+https://github.com/idiap/coqui-ai-TTS
+
+Optional RU/EN recognition uses pinned Whisper-small (MIT), CTranslate2 (MIT),
+tokenizers (Apache-2.0), NumPy and ONNX Runtime. Model and VAD source licenses
+are installed alongside their verified public files. The CPU build excludes
+the unused cuDNN dispatcher from the CTranslate2 wheel. Full notices and
+version-specific vendor evidence: licenses/THIRD_PARTY_RUNTIME.md.
 Optional model: vosk-model-small-ru-0.22, Alpha Cephei, Apache License 2.0.
 Model source and license: https://alphacephei.com/vosk/models
+
+Optional Piper 1.8.0 and its bundled espeak-ng bridge are GPL-3.0.
+The GPL text is included as licenses/GPL-3.0-only.txt. Corresponding source,
+build instructions and upstream license/copyright notices:
+https://github.com/OHF-Voice/piper1-gpl/tree/v1.8.0
+https://github.com/OHF-Voice/piper1-gpl/blob/v1.8.0/COPYING
+Do not present a distribution containing this engine as proprietary or solely
+permissively licensed; preserve the applicable source/distribution rights.
+Jarvis integration sources and build scripts are available in this repository:
+https://github.com/wwezzy/jarvis-aitu/tree/codex/jarvis-ultimate-v4
+Public voice assets are downloaded separately and verified by SHA-256.
+The pinned Dmitri MODEL_CARD identifies its dataset as CC0; keep that card
+with the model and review voice/engine obligations before redistribution.
+https://huggingface.co/rhasspy/piper-voices/tree/5041a7a49ae5b3a0f30e6837769eb03fdbb231bd/ru/ru_RU/dmitri/medium
+ONNX Runtime is MIT licensed: https://github.com/microsoft/onnxruntime
+NumPy is BSD licensed: https://numpy.org/doc/stable/license.html
 
 Qt for Python / PySide6 is provided under its applicable LGPLv3/GPLv3 or
 commercial terms. The bundled Qt library license notices are retained by
