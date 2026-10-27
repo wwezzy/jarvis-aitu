@@ -1,8 +1,9 @@
 import os
+import uuid
 from datetime import datetime
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -28,9 +29,9 @@ def test_all_models_and_indexes_compile_for_postgres():
     assert "uq_notification_user_event" in str(CreateTable(NotificationLog.__table__).compile(dialect=dialect))
 
 
-async def check_persistence(url):
+async def check_persistence(url, connect_args=None):
     """Independent engines model application restart, without dropping tables."""
-    engine = create_async_engine(url)
+    engine = create_async_engine(url, connect_args=connect_args or {})
     try:
         async with engine.begin() as connection:
             # Model an existing schema before the audit's additive table.
@@ -52,7 +53,7 @@ async def check_persistence(url):
             await session.commit()
     finally:
         await engine.dispose()
-    restarted = create_async_engine(url)
+    restarted = create_async_engine(url, connect_args=connect_args or {})
     try:
         # Startup is idempotent and does not delete state.
         async with restarted.begin() as connection:
@@ -71,10 +72,22 @@ async def test_file_database_survives_engine_restart(tmp_path):
 
 
 @pytest.mark.postgres
-async def test_postgres_survives_engine_restart():
+@pytest.mark.parametrize("attempt", [1, 2])
+async def test_postgres_survives_engine_restart(attempt):
     url = os.getenv("TEST_POSTGRES_URL")
     if not url:
         pytest.skip("Requires disposable loopback PostgreSQL; CI supplies it")
     parsed = make_url(url)
     assert parsed.host in {"127.0.0.1", "::1"} and parsed.database == "jarvis_audit_test"
-    await check_persistence(url)
+    # Independent schemas make repeated suites safe and preserve unrelated
+    # synthetic records in the disposable database's public schema.
+    schema = "persistence_" + uuid.uuid4().hex
+    admin = create_async_engine(url)
+    try:
+        async with admin.begin() as connection:
+            await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        await check_persistence(url, {"server_settings": {"search_path": schema, "timezone": "UTC"}})
+    finally:
+        async with admin.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        await admin.dispose()
