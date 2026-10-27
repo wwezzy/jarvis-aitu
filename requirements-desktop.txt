@@ -1,0 +1,8 @@
+# Optional Windows desktop bundle, isolated from server dependencies.
+# Versions verified against their maintainers' PyPI metadata on 2026-10-27.
+PySide6-Essentials==6.12.0
+vosk==0.3.45
+sounddevice==0.5.6
+pywin32==312; sys_platform == 'win32'
+# Build tool; not imported by the running application.
+pyinstaller==6.22.3

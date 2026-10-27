@@ -1,0 +1,33 @@
+Jarvis Desktop 4.2.0
+
+This is an independent local personal assistant. It is not affiliated with
+Marvel, Disney, the Iron Man films or the third-party JARVIS installer.
+It does not contain or clone a film actor's voice.
+
+The app uses installed Windows speech voices and offline Vosk recognition.
+Optional model: vosk-model-small-ru-0.22, Alpha Cephei, Apache License 2.0.
+Model source and license: https://alphacephei.com/vosk/models
+
+Qt for Python / PySide6 is provided under its applicable LGPLv3/GPLv3 or
+commercial terms. The bundled Qt library license notices are retained by
+the build script; LGPLv3/GPLv3 texts are included under licenses. The Qt
+libraries remain separate replaceable DLLs in the one-directory bundle.
+No restriction on modifying/replacing these libraries or reverse engineering
+for debugging such modifications is imposed by this personal build.
+Corresponding upstream sources:
+https://github.com/qtproject/pyside-pyside-setup/tree/6.12.0
+https://github.com/qt/qtbase/tree/v6.12.0
+A commercial release requires a complete
+license and distribution review; this personal build is not a signed
+commercial product. https://www.qt.io/licensing/open-source-lgpl-obligations
+
+Vosk: Apache License 2.0. https://github.com/alphacep/vosk-api
+sounddevice: MIT. https://github.com/spatialaudio/python-sounddevice
+pywin32: Python Software Foundation License. https://github.com/mhammond/pywin32
+PyInstaller: GPL with a bootloader distribution exception.
+https://pyinstaller.org/en/stable/license.html
+
+Microphone recording starts only after the app's microphone control is
+enabled. Audio is processed locally and not stored or uploaded by this app.
+Local notes, tasks and history remain on this Windows account. Uninstall
+retains them so that a future reinstall does not silently destroy data.
