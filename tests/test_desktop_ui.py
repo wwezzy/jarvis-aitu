@@ -314,3 +314,26 @@ def test_voice_runtime_probe_imports_and_model_load_only(tmp_path, monkeypatch):
     assert report["microphone_started"] is False
     assert loaded == [str(tmp_path / "public-model")]
     assert all(result["ok"] for result in report["imports"].values())
+
+
+def test_smoke_reports_local_database_failure_without_leaking_error_content(app, tmp_path, monkeypatch):
+    import desktop_app
+    import desktop.core
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("private credentials must not be displayed")
+    monkeypatch.setattr(desktop.core, "DesktopCore", broken)
+    path = tmp_path / "private-report.json"
+    assert desktop_app.main(["--smoke-test", "--report", str(path)]) == 6
+    report = json.loads(path.read_text(encoding="utf-8"))
+    assert report["stage"] == "local-data" and report["error_class"] == "RuntimeError"
+    assert "credentials" not in path.read_text(encoding="utf-8")
+    assert report["personal_data_loaded"] is False and report["microphone_started"] is False
+
+
+def test_voice_probe_missing_model_is_not_success(tmp_path, monkeypatch):
+    import desktop_app
+    monkeypatch.setattr(desktop_app, "voice_diagnostics", lambda: {
+        "imports": {"vosk": {"ok": True}}, "model_present": False,
+        "microphone_started": False,
+    })
+    assert desktop_app.main(["--diagnose-voice", "--report", str(tmp_path / "report.json")]) == 5

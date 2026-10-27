@@ -9,7 +9,8 @@ from __future__ import annotations
 import re
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from desktop.actions import ALLOWED_ACTIONS, RISKY_ACTIONS, execute_windows_action
@@ -22,6 +23,31 @@ class Reply:
     action: str | None = None
     confirmation_id: str | None = None
     speak: bool = True
+
+
+MAX_REPLY_CHARS = 22000
+NOTE_PREVIEW_CHARS = 1200
+PERSONAL_COMMANDS = {
+    "расписание": "schedule", "мое расписание": "schedule", "schedule": "schedule", "my schedule": "schedule",
+    "что у меня сегодня": "today", "сегодня": "today", "today": "today", "my day": "today",
+    "дедлайны": "assignments", "мои дедлайны": "assignments", "deadlines": "assignments",
+    "моя память": "memory", "что ты обо мне помнишь": "memory", "what do you remember about me": "memory", "my memory": "memory",
+}
+_WEEKDAYS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+
+
+def _note_previews(notes: list[dict]) -> str:
+    """Bound display only; source notes in SQLite remain complete and literal."""
+    lines = ["Предпросмотр заметок. Полный текст — в разделе «Заметки»."]
+    for note in notes[:10]:
+        content = note["text"]
+        preview = content[:NOTE_PREVIEW_CHARS]
+        if len(content) > NOTE_PREVIEW_CHARS:
+            preview += "… [краткий фрагмент]"
+        lines.append(f"#{note['id']} · {preview}")
+    if len(notes) > 10:
+        lines.append("Показаны первые 10 результатов; уточни запрос для поиска других заметок.")
+    return "\n\n".join(lines)
 
 
 def normalize(text: str) -> str:
@@ -55,7 +81,7 @@ ACTION_LABELS = {"lock": "блокировку компьютера", "shutdown"
 HELP = ("Могу открыть YouTube, браузер, блокнот, проводник и калькулятор; изменить громкость, свернуть окна. "
         "Попробуй: «добавь задачу закончить проект», «задачи», «готово 1», «следующий шаг», "
         "«запомни важную мысль», «найди проект», «напомни через 10 минут сделать перерыв», "
-        "«фокус 25 минут», «напоминания» или «отмени таймер 1». Управление питанием — только с отдельным подтверждением. "
+        "«фокус 25 минут», «напоминания», «отмени таймер 1», «расписание», «дедлайны» или «моя память». Управление питанием — только с отдельным подтверждением. "
         "Задачи и заметки сохраняются на этом компьютере; Render и ИИ для этих команд не нужны.")
 
 _UNITS = {
@@ -97,9 +123,12 @@ def _duration(count: str, unit: str) -> int:
 
 
 class DesktopCore:
-    def __init__(self, state_dir: Path, executor=None):
+    def __init__(self, state_dir: Path, executor=None, *, personal_path: Path | None = None):
         self.store = LocalStore(state_dir)
         self.executor = executor if executor is not None else execute_windows_action
+        # A core used in tests/smoke mode never discovers global personal files.
+        # Only the actual entry point may opt in with an identified local copy.
+        self.personal_path = Path(personal_path) if personal_path is not None else None
 
     def snapshot(self) -> dict:
         return self.store.snapshot()
@@ -125,8 +154,90 @@ class DesktopCore:
         return replies
 
     def _answer(self, reply: Reply) -> Reply:
+        if len(reply.text) > MAX_REPLY_CHARS:
+            label = "\n\n[Краткий фрагмент ответа: достигнут лимит чата. Исходные заметки сохранены полностью в разделе «Заметки».]"
+            reply = replace(reply, text=reply.text[:MAX_REPLY_CHARS - len(label)] + label)
         self.store.record("assistant", reply.text)
         return reply
+
+    def _personal_snapshot(self):
+        if self.personal_path is None:
+            return None
+        from desktop.personal import load_personal_snapshot
+        return load_personal_snapshot(self.personal_path)
+
+    @staticmethod
+    def _personal_label(snapshot):
+        try:
+            date = datetime.strptime(snapshot["snapshot_date"], "%Y-%m-%d").strftime("%d.%m.%Y")
+        except (KeyError, ValueError, TypeError):
+            return "Историческая копия; дата требует проверки. Изменения позже не учтены."
+        return f"Копия от {date}; изменения позже не учтены."
+
+    def _personal_reply(self, kind: str) -> Reply:
+        from desktop.personal import display_due, safe_text
+        snapshot = self._personal_snapshot()
+        if snapshot is None:
+            return Reply("Локальная копия личных данных не подключена. Созданные здесь задачи и заметки доступны отдельно; подключение копии показано в разделе «Мои данные».")
+        status = snapshot.get("status")
+        if status == "selection_required" or status == "identity_missing":
+            return Reply("Не могу безопасно определить владельца личной копии. Данные не показаны; проверь раздел «Мои данные».")
+        if status != "ready":
+            return Reply("Локальная копия личных данных не найдена или недоступна. Проверь раздел «Мои данные». Созданные здесь задачи и заметки продолжают работать.")
+        label = self._personal_label(snapshot)
+        section = "schedule" if kind == "today" else kind
+        if section in snapshot.get("unavailable", []):
+            return Reply(label + "\nЭтот раздел в копии недоступен; данные не подставлены из других источников.")
+        items = snapshot.get(section, [])
+        lines = [label]
+        if kind in {"schedule", "today"}:
+            items = [item for item in items if type(item.get("weekday")) is int and 0 <= item["weekday"] <= 6]
+            if kind == "today":
+                today = datetime.fromtimestamp(time.time(), timezone(timedelta(hours=5)))
+                items = [item for item in items if item["weekday"] == today.weekday()]
+                lines.append(f"Повторяющиеся записи копии на {today:%d.%m.%Y} (UTC+5):")
+            else:
+                lines.append("Повторяющееся расписание из копии:")
+            for item in items[:8]:
+                start, end = str(item.get("start", "")), str(item.get("end", ""))
+                valid = all(re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value) for value in (start, end))
+                hours = f"{start}–{end}" if valid else "время требует проверки"
+                lines.append(f"{_WEEKDAYS[item['weekday']]} · {hours} · {safe_text(item.get('title'), 250)}")
+            if not items:
+                lines.append("Для этого запроса записей в копии нет; это не подтверждает отсутствие занятий сейчас.")
+        elif kind == "assignments":
+            lines.append("Исторические незавершённые задания; проверь актуальность сроков и статусов:")
+            for item in items[:8]:
+                title = safe_text(item.get("title"), 300)
+                course = safe_text(item.get("course"), 80)
+                lines.append(f"{title}" + (f" · {course}" if course else "") + f" · {display_due(item.get('due_at'))}")
+            if not items:
+                lines.append("В копии таких заданий нет; новые дедлайны после её даты неизвестны.")
+        else:
+            if snapshot.get("name"):
+                lines.append("Имя в копии: " + safe_text(snapshot["name"], 100))
+            lines.append("Сохранённые сведения из копии:")
+            for item in items[:8]:
+                lines.append(f"{safe_text(item.get('key'), 120)}: {safe_text(item.get('value'), 350)}")
+            if not items:
+                lines.append("Сохранённых сведений в этом разделе копии нет.")
+        if len(items) > 8:
+            lines.append("Показаны первые 8 записей. Остальные — в разделе «Мои данные».")
+        return Reply("\n".join(lines))
+
+    def _historical_next_step(self):
+        from desktop.personal import safe_text
+        snapshot = self._personal_snapshot()
+        if not snapshot or snapshot.get("status") != "ready":
+            return None
+        pending = [*snapshot.get("tasks", []), *snapshot.get("assignments", [])]
+        if not pending:
+            return None
+        lines = [self._personal_label(snapshot),
+                 "В старой копии есть незавершённые записи. Сначала проверь, какие ещё актуальны; я не считаю их текущими задачами автоматически:"]
+        lines.extend("· " + safe_text(item.get("title"), 250) for item in pending[:3])
+        lines.append("Выбери одну актуальную и добавь её в новый локальный список. Остальные старые записи — в разделе «Мои данные».")
+        return "\n".join(lines)
 
     def _execute(self, action: str) -> Reply:
         if action not in ALLOWED_ACTIONS:
@@ -172,6 +283,8 @@ class DesktopCore:
         if value in {"статус", "статус компьютера", "status", "/pcstatus"}:
             return self._answer(Reply("Локальный помощник работает. Задачи и заметки доступны без сети. "
                                       "Доступность микрофона и голоса показана в настройках приложения."))
+        if value in PERSONAL_COMMANDS:
+            return self._answer(self._personal_reply(PERSONAL_COMMANDS[value]))
         reminder = re.fullmatch(r"напомни(?: мне)? через " + _DURATION + r"\s+(.+)", original, re.DOTALL | re.IGNORECASE)
         timer = re.fullmatch(r"(?:(?:поставь|запусти)\s+)?(таймер|фокус|timer|focus)(?:\s+на)?\s+" + _DURATION + r"[.!?]?(?:\s+(.+))?", original, re.DOTALL | re.IGNORECASE)
         if reminder or timer:
@@ -230,23 +343,26 @@ class DesktopCore:
             return self._answer(Reply("Убрал задачу из списка. Запись сохранена в локальном архиве." if changed else "Такой активной задачи нет."))
         if value in {"задачи", "мои задачи", "список задач", "tasks", "/tasks"}:
             tasks = [task for task in self.snapshot()["tasks"] if not task["done"]]
-            text = "\n".join(f"#{task['id']} · {task['title']}" for task in tasks[:20]) if tasks else "Активных задач нет. Добавь одну конкретную задачу."
+            text = "\n".join(f"#{task['id']} · {task['title']}" for task in tasks[:20]) if tasks else "В локальном списке нет активных задач. Добавь одну конкретную задачу."
             return self._answer(Reply(text))
         if value in {"следующий шаг", "что дальше", "что мне делать", "мне скучно", "next", "/next"}:
             tasks = [task for task in self.snapshot()["tasks"] if not task["done"]]
-            text = (f"Следующий шаг: {tasks[0]['title']}. Выдели 10 минут на начало. "
-                    "После работы отметь результат сам — я не засчитываю время как выполнение.") if tasks else "Выбери одно небольшое дело и добавь его в задачи. Начни с 10 минут; отдых тоже можно запланировать."
+            if tasks:
+                text = (f"Следующий шаг: {tasks[0]['title']}. Выдели 10 минут на начало. "
+                        "После работы отметь результат сам — я не засчитываю время как выполнение.")
+            else:
+                text = self._historical_next_step() or "Выбери одно небольшое дело и добавь его в задачи. Начни с 10 минут; отдых тоже можно запланировать."
             return self._answer(Reply(text))
         search = re.fullmatch(r"(?:найди заметку|найди|find|search)\s+(.+)", value)
         if search:
             if len(search[1]) > 500:
                 return self._answer(Reply("Для поиска достаточно запроса до 500 символов."))
             notes = self.store.search_notes(search[1])
-            text = "\n\n".join(f"#{note['id']} · {note['text'][:1200]}" for note in notes[:10]) if notes else "Подходящих заметок нет."
+            text = _note_previews(notes) if notes else "Подходящих заметок нет."
             return self._answer(Reply(text))
         if value in {"заметки", "мои заметки", "notes", "/notes"}:
             notes = self.snapshot()["notes"]
-            text = "\n\n".join(f"#{note['id']} · {note['text'][:1200]}" for note in notes[:10]) if notes else "Заметок пока нет. Скажи «запомни» и свою мысль."
+            text = _note_previews(notes) if notes else "Заметок пока нет. Скажи «запомни» и свою мысль."
             return self._answer(Reply(text))
         preferences = self.store.preferences()
         if preferences["local_chat_enabled"]:

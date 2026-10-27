@@ -59,7 +59,8 @@ def main(argv=None):
         write_report(args.report, report)
         if sys.stdout is not None:
             print(json.dumps(report, ensure_ascii=False))
-        return 0 if all(item["ok"] for item in report["imports"].values()) else 5
+        return 0 if (all(item["ok"] for item in report["imports"].values())
+                     and report.get("model_loaded") is True) else 5
     diagnostic = {"kind": "ui-smoke", "stage": "qt-import", "microphone_started": False, "os_actions": False, "personal_data_loaded": False}
     if args.smoke_test:
         write_report(args.report, diagnostic)
@@ -68,7 +69,7 @@ def main(argv=None):
     try:
         from PySide6.QtCore import QTimer
         from PySide6.QtNetwork import QLocalServer, QLocalSocket
-        from PySide6.QtWidgets import QApplication
+        from PySide6.QtWidgets import QApplication, QMessageBox
     except (ImportError, OSError) as error:
         diagnostic.update(ok=False, error_class=type(error).__name__, detail=str(error)[:1000])
         write_report(args.report, diagnostic)
@@ -77,7 +78,7 @@ def main(argv=None):
         return 2
     from desktop.core import DesktopCore
     from desktop.ui import MainWindow
-    app = QApplication(sys.argv[:1])
+    app = QApplication.instance() or QApplication(sys.argv[:1])
     app.setApplicationName("JARVIS Desktop")
     app.setOrganizationName("JarvisPersonal")
     temporary = tempfile.TemporaryDirectory(prefix="jarvis-ui-smoke-") if args.smoke_test else None
@@ -98,7 +99,6 @@ def main(argv=None):
         if not server.listen(socket_name):
             print("Cannot start the local application instance.", file=sys.stderr)
             return 3
-    core = DesktopCore(state_dir, executor=(lambda _action: "Smoke-test executor") if args.smoke_test else None)
     class SmokeVoice:
         def __init__(self, **_kwargs):
             pass
@@ -110,9 +110,35 @@ def main(argv=None):
             pass
         def say(self, _text):
             pass
-    window = MainWindow(core, voice_factory=SmokeVoice if args.smoke_test else None,
-                        enable_tray=not args.smoke_test,
-                        personal_path=state_dir / "no-personal-data.sqlite3" if args.smoke_test else None)
+    core = None
+    try:
+        from desktop.personal import default_snapshot_path
+        personal_path = state_dir / "no-personal-data.sqlite3" if args.smoke_test else default_snapshot_path()
+        core = DesktopCore(state_dir, executor=(lambda _action: "Smoke-test executor") if args.smoke_test else None,
+                           personal_path=personal_path)
+        window = MainWindow(core, voice_factory=SmokeVoice if args.smoke_test else None,
+                            enable_tray=not args.smoke_test,
+                            personal_path=personal_path)
+    except Exception as error:
+        # Never reset a newer/corrupt database or silently disappear under
+        # pythonw. Exception messages can contain personal content or paths.
+        diagnostic.update(ok=False, stage="local-data", error_class=type(error).__name__)
+        write_report(args.report, diagnostic)
+        if not args.smoke_test:
+            QMessageBox.critical(None, "Jarvis не запущен",
+                "Не удалось открыть локальные данные или настройки. Данные не сброшены. "
+                "Сохраните папку JarvisDesktop вместе с backups и восстановите проверенную копию. "
+                "Тип ошибки: " + type(error).__name__)
+        if core:
+            try:
+                core.close()
+            except Exception:
+                pass
+        if server:
+            server.close()
+        if temporary:
+            temporary.cleanup()
+        return 6
     if server:
         def activate():
             client = server.nextPendingConnection()
