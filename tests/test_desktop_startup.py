@@ -127,6 +127,97 @@ def test_update_only_matching_owned_task(harness):
     assert not scheduler.deleted
 
 
+@pytest.mark.parametrize("principal", [r"DESKTOP-SAMPLE\sample-user", "sample-user", "sample.user@example.test", "Сергей"])
+@pytest.mark.parametrize("enabled", [True, False])
+def test_windows_normalized_account_names_require_resolved_current_sid(harness, monkeypatch, principal, enabled):
+    scheduler, _, _ = harness
+    scheduler.existing = definition(sid=principal)
+    native_sid, lookups, conversions = object(), [], []
+
+    def lookup(system, name):
+        lookups.append((system, name))
+        return native_sid, "DESKTOP-SAMPLE", 1
+
+    def convert(value):
+        conversions.append(value)
+        return SID
+
+    monkeypatch.setitem(sys.modules, "win32security", SimpleNamespace(LookupAccountName=lookup, ConvertSidToStringSid=convert))
+    assert startup.set_startup_enabled(enabled).success
+    assert lookups == [(None, principal)] and conversions == [native_sid]
+    if enabled:
+        assert scheduler.registered[0][2:6] == (4, SID, None, 3)
+    else:
+        assert scheduler.deleted == [(startup.TASK_NAME, 0)] and not scheduler.registered
+
+
+def test_exact_current_sid_does_not_resolve_account_name(harness, monkeypatch):
+    scheduler, _, _ = harness
+    scheduler.existing = definition()
+
+    def unexpected(*_):
+        pytest.fail("An exact SID should not trigger account lookup")
+
+    monkeypatch.setitem(sys.modules, "win32security", SimpleNamespace(LookupAccountName=unexpected, ConvertSidToStringSid=unexpected))
+    assert startup.set_startup_enabled(True).success
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_same_looking_username_resolving_to_other_sid_is_never_owned(harness, monkeypatch, enabled):
+    scheduler, _, _ = harness
+    scheduler.existing = definition(sid="sample-user")
+    monkeypatch.setitem(sys.modules, "win32security", SimpleNamespace(
+        LookupAccountName=lambda *_: ("other-native-sid", "DOMAIN", 1),
+        ConvertSidToStringSid=lambda _: "S-1-5-21-999-1001"))
+    assert startup.set_startup_enabled(enabled) == startup.StartupResult(False, startup._CONFLICT)
+    assert not scheduler.deleted and not scheduler.new and not scheduler.registered
+
+
+@pytest.mark.parametrize("stage", ["lookup", "conversion"])
+def test_account_resolution_failures_stay_fail_closed(harness, monkeypatch, stage):
+    scheduler, _, _ = harness
+    scheduler.existing = definition(sid="sample-user")
+
+    def fail(*_):
+        raise OSError("private account/Windows diagnostics")
+
+    monkeypatch.setitem(sys.modules, "win32security", SimpleNamespace(
+        LookupAccountName=fail if stage == "lookup" else lambda *_: ("native-sid", "DOMAIN", 1),
+        ConvertSidToStringSid=fail))
+    assert startup.set_startup_enabled(True) == startup.StartupResult(False, startup._CONFLICT)
+    assert not scheduler.new and not scheduler.registered and not scheduler.deleted
+
+
+@pytest.mark.parametrize("principal", [None, 123, {}, [], "", " ", " sample-user", "sample-user ",
+    "sample\nuser", "sample\x00user", "x" * 257, "https://example.test/user", r"\\host\user",
+    r"DOMAIN\user\extra", r".\sample-user", "user@", "@domain", "u@@domain", "@", "...",
+    "user;command", "S-1-5-21-999-1001"])
+def test_malformed_principals_are_refused_before_lookup(harness, monkeypatch, principal):
+    scheduler, _, _ = harness
+    scheduler.existing = definition(sid=principal)
+
+    def unexpected(*_):
+        pytest.fail("Malformed or mismatching SID principal must not be resolved")
+
+    monkeypatch.setitem(sys.modules, "win32security", SimpleNamespace(LookupAccountName=unexpected))
+    assert startup.set_startup_enabled(True) == startup.StartupResult(False, startup._CONFLICT)
+    assert not scheduler.new and not scheduler.registered and not scheduler.deleted
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_foreign_marker_short_circuits_before_reading_or_resolving_principal(harness, monkeypatch, enabled):
+    scheduler, _, _ = harness
+    scheduler.existing = definition(description="foreign task")
+    scheduler.existing.Principal = object()  # Reading UserId would itself fail.
+
+    def unexpected(*_):
+        pytest.fail("Ownership resolution ran before checking the exact marker")
+
+    monkeypatch.setattr(startup, "_principal_matches_current_user", unexpected)
+    assert startup.set_startup_enabled(enabled) == startup.StartupResult(False, startup._CONFLICT)
+    assert not scheduler.new and not scheduler.registered and not scheduler.deleted
+
+
 @pytest.mark.parametrize("enabled", [True, False])
 @pytest.mark.parametrize("description,sid", [("another application", SID),
                                                (startup.OWNERSHIP_MARKER, "S-1-5-21-999-1001")])

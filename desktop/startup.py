@@ -159,6 +159,35 @@ def _existing_task(folder):
         raise
 
 
+def _principal_matches_current_user(principal, current_sid):
+    """Windows may return a bare/domain account name instead of its SID.
+
+    A name is never ownership proof by itself: resolve through Windows and
+    require the exact current token SID. No fallback credentials or privilege
+    changes are attempted if resolution is unavailable or ambiguous.
+    """
+    if not isinstance(principal, str) or not isinstance(current_sid, str):
+        return False
+    if not re.fullmatch(r"S-1-5(?:-\d+)+", current_sid):
+        return False
+    if principal == current_sid:
+        return True
+    if (not 1 <= len(principal) <= 256 or principal != principal.strip()
+            or principal.casefold().startswith("s-1-")
+            or not re.fullmatch(r"[\w .@$-]+(?:\\[\w .@$-]+)?", principal)
+            or principal.count("@") > 1
+            or any(part != part.strip() or not re.search(r"\w", part)
+                   for part in re.split(r"[\\@]", principal))):
+        return False
+    try:
+        import win32security
+
+        resolved_sid = win32security.LookupAccountName(None, principal)[0]
+        return win32security.ConvertSidToStringSid(resolved_sid) == current_sid
+    except Exception:
+        return False
+
+
 def _change_owned_task(scheduler, sid, enabled, launch):
     """Keep every child COM proxy inside a scope that exits before CoUninitialize."""
     try:
@@ -167,7 +196,7 @@ def _change_owned_task(scheduler, sid, enabled, launch):
         if existing is not None:
             definition = existing.Definition
             if (definition.RegistrationInfo.Description != OWNERSHIP_MARKER
-                    or definition.Principal.UserId != sid):
+                    or not _principal_matches_current_user(definition.Principal.UserId, sid)):
                 return StartupResult(False, _CONFLICT)
         if not enabled:
             if existing is not None:
