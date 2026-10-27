@@ -25,7 +25,7 @@ DEFAULT_PREFERENCES = {
     "language": "ru",
     "hide_advanced": True,
     "local_chat_enabled": False,
-    "local_chat_model": "qwen3:4b",
+    "local_chat_model": "qwen3:4b-instruct-2507-q4_K_M",
 }
 
 

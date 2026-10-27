@@ -447,7 +447,7 @@ class MainWindow(QMainWindow):
         chat_layout.addWidget(self.local_chat_toggle)
         chat_layout.addWidget(label("Нужны отдельно установленная Ollama и загруженная модель. Отправляется только текущая фраза; личные заметки и история не передаются. ИИ отвечает текстом и не управляет компьютером.", "muted", True))
         model_row = QHBoxLayout()
-        self.chat_model = QLineEdit(str(self.preferences.get("local_chat_model", "qwen3:4b")))
+        self.chat_model = QLineEdit(str(self.preferences.get("local_chat_model", "qwen3:4b-instruct-2507-q4_K_M")))
         self.chat_model.setPlaceholderText("Имя установленной модели Ollama")
         self.chat_model.setMaxLength(100)
         model_row.addWidget(self.chat_model, 1)

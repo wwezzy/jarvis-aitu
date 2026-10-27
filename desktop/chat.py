@@ -36,8 +36,25 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _final_answer(content: str) -> str:
+    """Accept only the final segment of legacy Qwen reasoning wrappers.
+
+    Some local runtimes put reasoning inside ``content`` (including versions
+    that omit the opening tag), instead of a separate ``thinking`` field.
+    An unfinished wrapper is not a usable final response.
+    """
+    if "</think>" in content:
+        content = content.rsplit("</think>", 1)[1]
+    if "<think>" in content:
+        raise LocalChatUnavailable("Local model did not provide a final answer")
+    content = content.strip()
+    if not content:
+        raise LocalChatUnavailable("Local model did not provide a final answer")
+    return content
+
+
 class LocalChat:
-    def __init__(self, model="qwen3:4b", *, opener=None, timeout=45):
+    def __init__(self, model="qwen3:4b-instruct-2507-q4_K_M", *, opener=None, timeout=45):
         if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,99}", model) or "cloud" in model.casefold() or "://" in model:
             raise ValueError("A local model name is required")
         self.model = model
@@ -68,12 +85,14 @@ class LocalChat:
             message = data.get("message")
             if data.get("done") is not True or not isinstance(message, dict):
                 raise LocalChatUnavailable("Local response was incomplete")
+            if data.get("done_reason") not in {None, "stop"}:
+                raise LocalChatUnavailable("Local model did not complete its answer")
             if message.get("tool_calls"):
                 raise LocalChatUnavailable("Tool responses are not accepted")
             answer = message.get("content")
             if not isinstance(answer, str) or not answer.strip() or len(answer) > 12000 or "\x00" in answer:
                 raise LocalChatUnavailable("Local response had no usable text")
-            return answer.strip()
+            return _final_answer(answer)
         except (urllib.error.URLError, OSError, ValueError, TypeError) as error:
             # No response body, request content or secret-bearing local errors.
             raise LocalChatUnavailable("Local model unavailable") from error

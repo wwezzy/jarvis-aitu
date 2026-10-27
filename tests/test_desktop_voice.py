@@ -208,6 +208,54 @@ def test_existing_incomplete_model_is_never_deleted(tmp_path):
     assert owned.read_text(encoding="utf-8") == "keep"
 
 
+def test_existing_onecore_male_voice_selected_without_creating_tokens():
+    from desktop.voice import select_windows_voice
+    class Token:
+        def __init__(self, gender):
+            self.gender = gender
+        def GetAttribute(self, key):
+            return "419" if key == "Language" else self.gender
+    female, male = Token("Female"), Token("Male")
+    selections = []
+    category = types.SimpleNamespace(SetId=lambda *args: selections.append(args),
+                                     EnumerateTokens=lambda: [male])
+    speaker = types.SimpleNamespace(GetVoices=lambda: [female], Voice=None)
+    client = types.SimpleNamespace(Dispatch=lambda name: category)
+    assert select_windows_voice(speaker, client)
+    assert speaker.Voice is male
+    assert selections == [(r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech_OneCore\Voices", False)]
+
+
+def test_rejected_onecore_engine_falls_back_to_existing_desktop_voice():
+    from desktop.voice import select_windows_voice
+    female = types.SimpleNamespace(GetAttribute=lambda key: "419" if key == "Language" else "Female")
+    male = types.SimpleNamespace(GetAttribute=lambda key: "419" if key == "Language" else "Male")
+    class Speaker:
+        def GetVoices(self):
+            return [female]
+        @property
+        def Voice(self):
+            return self.selected
+        @Voice.setter
+        def Voice(self, token):
+            if token is male:
+                raise RuntimeError("unsupported engine")
+            self.selected = token
+    speaker = Speaker()
+    category = types.SimpleNamespace(SetId=lambda *_args: None, EnumerateTokens=lambda: [male])
+    assert select_windows_voice(speaker, types.SimpleNamespace(Dispatch=lambda _name: category))
+    assert speaker.Voice is female
+
+
+def test_voice_discovery_failures_preserve_system_default():
+    from desktop.voice import select_windows_voice
+    def unavailable(*_args):
+        raise RuntimeError("not installed")
+    speaker = types.SimpleNamespace(GetVoices=unavailable, Voice="existing default")
+    assert not select_windows_voice(speaker, types.SimpleNamespace(Dispatch=unavailable))
+    assert speaker.Voice == "existing default"
+
+
 @pytest.mark.parametrize("name", ["../escape", "/absolute", "C:/windows/evil", "bad\\path",
                                 f"{model_setup.MODEL_NAME}/../../escape",
                                 f"{model_setup.MODEL_NAME}/CON", f"{model_setup.MODEL_NAME}/x. "])

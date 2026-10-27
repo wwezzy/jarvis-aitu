@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import itertools
 import json
 import os
 import queue
@@ -19,6 +20,45 @@ from pathlib import Path
 from typing import Callable
 
 from desktop.model_setup import default_model_dir, model_ready
+
+
+def select_windows_voice(speaker, client):
+    """Prefer an existing Russian male voice, without creating registry tokens.
+
+    Windows exposes some installed voices through OneCore rather than the
+    legacy collection. SetId's final False forbids creating a category. A
+    rejected engine falls back to the next installed Russian voice.
+    """
+    candidates = []
+    try:
+        candidates.extend(itertools.islice(iter(speaker.GetVoices()), 128))
+    except Exception:
+        pass
+    try:
+        category = client.Dispatch("SAPI.SpObjectTokenCategory")
+        category.SetId(r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech_OneCore\Voices", False)
+        candidates.extend(itertools.islice(iter(category.EnumerateTokens()), 128))
+    except Exception:
+        pass
+    russian = []
+    for token in candidates:
+        try:
+            if "419" not in str(token.GetAttribute("Language")).lower().split(";"):
+                continue
+            try:
+                male = str(token.GetAttribute("Gender")).casefold() == "male"
+            except Exception:
+                male = False
+            russian.append((not male, token))
+        except Exception:
+            continue
+    for _, token in sorted(russian, key=lambda item: item[0]):
+        try:
+            speaker.Voice = token
+            return True
+        except Exception:
+            continue
+    return False
 
 
 @dataclass(frozen=True)
@@ -245,11 +285,8 @@ class VoiceService:
             initialized = True
             speaker = client.Dispatch("SAPI.SpVoice")
             speaker.Rate = 0
-            # Prefer an installed Russian voice; no voice copying/download.
-            voices = list(speaker.GetVoices())
-            russian = [v for v in voices if "419" in v.GetAttribute("Language").lower().split(";")]
-            if russian:
-                speaker.Voice = russian[0]
+            # Existing Windows voices only; no actor imitation or token copies.
+            select_windows_voice(speaker, client)
             while True:
                 text = self._speech.get()
                 if not self.speech_enabled:
@@ -280,6 +317,4 @@ class VoiceService:
             if initialized:
                 # Release COM interfaces before uninitializing their apartment.
                 speaker = None
-                voices = []
-                russian = []
                 pythoncom.CoUninitialize()
