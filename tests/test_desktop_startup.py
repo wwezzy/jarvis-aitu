@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 from types import ModuleType, SimpleNamespace
+import weakref
 
 import pytest
 
@@ -17,8 +18,9 @@ _NATIVE_SESSION = startup._scheduler_session
 
 
 class SchedulerError(Exception):
-    def __init__(self, hresult=0x80070002):
+    def __init__(self, hresult=0x80070002, excepinfo=None):
         self.hresult = hresult
+        self.excepinfo = excepinfo
         super().__init__("private Windows details must not reach the UI")
 
 
@@ -102,7 +104,7 @@ def test_enable_interactive_current_user_without_admin_network_battery_or_runtim
     assert result.success and result.message == startup._ENABLED
     assert scheduler.lookups == ["JarvisDesktopLocal"]
     name, task, flags, sid, password, logon = scheduler.registered[0]
-    assert (name, flags, sid, password, logon) == (startup.TASK_NAME, 2, SID, "", 3)
+    assert (name, flags, sid, password, logon) == (startup.TASK_NAME, 2, SID, None, 3)
     assert task.RegistrationInfo.Description == startup.OWNERSHIP_MARKER
     assert vars(task.Principal) == {"UserId": SID, "LogonType": 3, "RunLevel": 0}
     assert vars(task.Triggers.items[0]) == {"Type": 9, "UserId": SID, "Delay": "PT5S", "Enabled": True}
@@ -121,6 +123,7 @@ def test_update_only_matching_owned_task(harness):
     scheduler.existing = definition()
     assert startup.set_startup_enabled(True).success
     assert scheduler.registered[0][2] == 4
+    assert scheduler.registered[0][3:6] == (SID, None, 3)
     assert not scheduler.deleted
 
 
@@ -287,3 +290,118 @@ def test_native_com_adapter_initializes_worker_and_uses_current_token_sid(harnes
         assert actual_scheduler is scheduler and actual_sid == SID
         assert scheduler.connected
     assert events == ["initialized", "token-closed", "uninitialized"]
+
+
+@pytest.mark.parametrize("outer", [0x80020009, 0x80020009 - (1 << 32)])
+@pytest.mark.parametrize("inner", [0x80070002, 0x80070003, 0x80070002 - (1 << 32), 0x80070003 - (1 << 32)])
+@pytest.mark.parametrize("enabled", [True, False])
+def test_real_dispatch_exception_wrapper_unwraps_only_missing_task_codes(harness, outer, inner, enabled):
+    scheduler, _, closed = harness
+    scheduler.get_error = SchedulerError(outer, (0, "Task Scheduler", "private details", None, 0, inner))
+    result = startup.set_startup_enabled(enabled)
+    assert result.success and closed == [True]
+    if enabled:
+        assert scheduler.registered[0][2] == 2  # Missing remains create-only.
+    else:
+        assert not scheduler.deleted and not scheduler.registered
+
+
+@pytest.mark.parametrize("outer,info", [
+    (0x80020009, (0, None, None, None, 0, 0x80070005)),
+    (0x80020009, (0, None, None, None, 0, 0x80070005 - (1 << 32))),
+    (0x80070005, (0, None, None, None, 0, 0x80070002)),
+    (0x80004005, (0, None, None, None, 0, 0x80070002)),
+    (0x80020009, (0, None, None, None, 0, "0x80070002")),
+    (0x80020009, (0, None, None, None, 0, True)),
+    (0x80020009, (0, None, None, None, 0, (1 << 64) + 0x80070002)),
+    (0x80020009, (0, None, None, None, 0, 0x80020009)),
+    (0x80020009, (0, None, None, None, 0)),
+    (0x80020009, (0, None, None, None, 0, 0x80070002, "extra")),
+    (0x80020009, None),
+    ((1 << 64) + 0x80070002, None),
+])
+def test_denied_unknown_or_malformed_wrappers_stay_fail_closed(harness, outer, info):
+    scheduler, _, _ = harness
+    scheduler.get_error = SchedulerError(outer, info)
+    assert startup.set_startup_enabled(True) == startup.StartupResult(False, startup._UNAVAILABLE)
+    assert not scheduler.new and not scheduler.registered and not scheduler.deleted
+
+
+@pytest.mark.parametrize("scenario", ["enable", "update", "conflict", "disable", "register_failed", "connect_failed", "get_denied"])
+def test_all_native_com_proxies_released_before_apartment_uninitialization(monkeypatch, scenario):
+    """Unlike the harness, no external fixture retains any COM-like proxy."""
+    live, live_at_uninit, events = weakref.WeakSet(), [], []
+
+    class Proxy:
+        def __init__(self, kind):
+            self.kind = kind
+            live.add(self)
+
+    class Items(Proxy):
+        def Create(self, _kind):
+            return Proxy(self.kind + "-item")
+
+    def task_definition():
+        value = Proxy("definition")
+        value.RegistrationInfo = Proxy("registration")
+        value.RegistrationInfo.Description = "foreign" if scenario == "conflict" else startup.OWNERSHIP_MARKER
+        value.Principal = Proxy("principal")
+        value.Principal.UserId = SID
+        value.Settings, value.Triggers, value.Actions = Proxy("settings"), Items("triggers"), Items("actions")
+        return value
+
+    class Folder(Proxy):
+        def GetTask(self, _name):
+            if scenario == "get_denied":
+                raise SchedulerError(0x80070005)
+            if scenario in {"update", "conflict", "disable"}:
+                value = Proxy("existing-task")
+                value.Definition = task_definition()
+                return value
+            raise SchedulerError(0x80020009, (0, None, None, None, 0, 0x80070002))
+
+        def RegisterTaskDefinition(self, *_arguments):
+            if scenario == "register_failed":
+                raise SchedulerError(0x80070005)
+            return Proxy("registered-task")
+
+        def DeleteTask(self, *_arguments):
+            events.append("deleted")
+
+    class Scheduler(Proxy):
+        def Connect(self):
+            if scenario == "connect_failed":
+                raise SchedulerError(0x80070005)
+
+        def GetFolder(self, _name):
+            return Folder("folder")
+
+        def NewTask(self, _flags):
+            return task_definition()
+
+    def uninitialize():
+        live_at_uninit.append(sorted(value.kind for value in live))
+        events.append("uninitialized")
+
+    token = SimpleNamespace(Close=lambda: events.append("token-closed"))
+    modules = {
+        "pythoncom": SimpleNamespace(CoInitialize=lambda: events.append("initialized"), CoUninitialize=uninitialize),
+        "win32api": SimpleNamespace(GetCurrentProcess=lambda: "current-process"),
+        "win32con": SimpleNamespace(TOKEN_QUERY=8),
+        "win32security": SimpleNamespace(OpenProcessToken=lambda *_: token, TokenUser=1,
+            GetTokenInformation=lambda *_: ("native-sid", 0), ConvertSidToStringSid=lambda _: SID),
+    }
+    package, client = ModuleType("win32com"), ModuleType("win32com.client")
+    package.__path__ = []
+    client.Dispatch = lambda _name: Scheduler("scheduler")
+    package.client = client
+    modules.update({"win32com": package, "win32com.client": client})
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(startup, "_is_windows", lambda: True)
+    monkeypatch.setattr(startup, "_launch_spec", lambda: startup._LaunchSpec("pythonw.exe", "-I fixed.pyw", "app"))
+    result = startup.set_startup_enabled(scenario != "disable")
+    assert result.success == (scenario in {"enable", "update", "disable"})
+    assert live_at_uninit == [[]]
+    assert events[0] == "initialized" and events[-1] == "uninitialized"
+    assert "token-closed" in events

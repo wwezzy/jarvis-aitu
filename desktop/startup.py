@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
+from numbers import Integral
 from pathlib import Path
 import re
 import subprocess
@@ -98,16 +99,13 @@ def _launch_spec() -> _LaunchSpec | None:
         return None
 
 
-@contextmanager
-def _scheduler_session():
-    # COM must be initialized on the UI worker thread that performs the change.
-    import pythoncom
+def _connect_scheduler():
+    """Keep setup failures' COM traceback references inside the apartment."""
     import win32api
     import win32con
     import win32security
     import win32com.client
 
-    pythoncom.CoInitialize()
     try:
         token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
         try:
@@ -119,8 +117,27 @@ def _scheduler_session():
             raise ValueError("current_user_sid_unavailable")
         scheduler = win32com.client.Dispatch("Schedule.Service")
         scheduler.Connect()
-        yield scheduler, sid
+        return scheduler, sid
+    except Exception:
+        return None
+
+
+@contextmanager
+def _scheduler_session():
+    # COM must be initialized on the UI worker thread that performs the change.
+    import pythoncom
+
+    pythoncom.CoInitialize()
+    binding = None
+    try:
+        binding = _connect_scheduler()
+        if binding is None:
+            raise RuntimeError("scheduler_unavailable")
+        yield binding
     finally:
+        # The caller releases its yielded binding before exiting this context;
+        # drop the session's final proxy before uninitializing this apartment.
+        binding = None
         pythoncom.CoUninitialize()
 
 
@@ -130,9 +147,65 @@ def _existing_task(folder):
     except Exception as error:
         # Access denied or a damaged scheduler must never be mistaken for absence.
         code = getattr(error, "hresult", None)
-        if isinstance(code, int) and (code & 0xFFFFFFFF) in (0x80070002, 0x80070003):
+        if isinstance(code, Integral) and not isinstance(code, bool) and -(1 << 31) <= code <= 0xFFFFFFFF:
+            code &= 0xFFFFFFFF
+            if code == 0x80020009:  # DISP_E_EXCEPTION wraps the actual COM scode.
+                info = getattr(error, "excepinfo", None)
+                code = info[5] if isinstance(info, (tuple, list)) and len(info) == 6 else None
+        if (isinstance(code, Integral) and not isinstance(code, bool)
+                and -(1 << 31) <= code <= 0xFFFFFFFF
+                and (code & 0xFFFFFFFF) in (0x80070002, 0x80070003)):
             return None
         raise
+
+
+def _change_owned_task(scheduler, sid, enabled, launch):
+    """Keep every child COM proxy inside a scope that exits before CoUninitialize."""
+    try:
+        folder = scheduler.GetFolder("\\")
+        existing = _existing_task(folder)
+        if existing is not None:
+            definition = existing.Definition
+            if (definition.RegistrationInfo.Description != OWNERSHIP_MARKER
+                    or definition.Principal.UserId != sid):
+                return StartupResult(False, _CONFLICT)
+        if not enabled:
+            if existing is not None:
+                folder.DeleteTask(TASK_NAME, 0)
+            return StartupResult(True, _DISABLED)
+        definition = scheduler.NewTask(0)
+        definition.RegistrationInfo.Description = OWNERSHIP_MARKER
+        definition.Principal.UserId = sid
+        definition.Principal.LogonType = 3  # TASK_LOGON_INTERACTIVE_TOKEN; no password.
+        definition.Principal.RunLevel = 0  # TASK_RUNLEVEL_LUA; current user's rights.
+        trigger = definition.Triggers.Create(9)  # TASK_TRIGGER_LOGON.
+        trigger.UserId = sid
+        trigger.Delay = "PT5S"
+        trigger.Enabled = True
+        settings = definition.Settings
+        settings.Enabled = True
+        settings.StartWhenAvailable = True
+        settings.RunOnlyIfNetworkAvailable = False
+        settings.RunOnlyIfIdle = False
+        settings.DisallowStartIfOnBatteries = False
+        settings.StopIfGoingOnBatteries = False
+        settings.ExecutionTimeLimit = "PT0S"
+        settings.MultipleInstances = 2  # TASK_INSTANCES_IGNORE_NEW.
+        settings.WakeToRun = False
+        action = definition.Actions.Create(0)  # TASK_ACTION_EXEC; no command shell.
+        action.Path = launch.executable
+        action.Arguments = launch.arguments
+        action.WorkingDirectory = launch.working_directory
+        # Create-only closes the absent-task overwrite race. Update is used
+        # only after the exact ownership marker and current SID matched.
+        # None supplies an absent COM password variant. An empty BSTR can
+        # trigger credential validation even for interactive-token logon.
+        folder.RegisterTaskDefinition(TASK_NAME, definition, 2 if existing is None else 4, sid, None, 3)
+        return StartupResult(True, _ENABLED)
+    except Exception:
+        # Catch here so exception tracebacks cannot retain child COM proxies
+        # until after the session has uninitialized its apartment.
+        return StartupResult(False, _UNAVAILABLE)
 
 
 def set_startup_enabled(enabled: bool) -> StartupResult:
@@ -145,44 +218,10 @@ def set_startup_enabled(enabled: bool) -> StartupResult:
     if enabled and launch is None:
         return StartupResult(False, _UNVERIFIED)
     try:
-        with _LOCK, _scheduler_session() as (scheduler, sid):
-            folder = scheduler.GetFolder("\\")
-            existing = _existing_task(folder)
-            if existing is not None:
-                definition = existing.Definition
-                if (definition.RegistrationInfo.Description != OWNERSHIP_MARKER
-                        or definition.Principal.UserId != sid):
-                    return StartupResult(False, _CONFLICT)
-            if not enabled:
-                if existing is not None:
-                    folder.DeleteTask(TASK_NAME, 0)
-                return StartupResult(True, _DISABLED)
-            definition = scheduler.NewTask(0)
-            definition.RegistrationInfo.Description = OWNERSHIP_MARKER
-            definition.Principal.UserId = sid
-            definition.Principal.LogonType = 3  # TASK_LOGON_INTERACTIVE_TOKEN; no password.
-            definition.Principal.RunLevel = 0  # TASK_RUNLEVEL_LUA; current user's rights.
-            trigger = definition.Triggers.Create(9)  # TASK_TRIGGER_LOGON.
-            trigger.UserId = sid
-            trigger.Delay = "PT5S"
-            trigger.Enabled = True
-            settings = definition.Settings
-            settings.Enabled = True
-            settings.StartWhenAvailable = True
-            settings.RunOnlyIfNetworkAvailable = False
-            settings.RunOnlyIfIdle = False
-            settings.DisallowStartIfOnBatteries = False
-            settings.StopIfGoingOnBatteries = False
-            settings.ExecutionTimeLimit = "PT0S"
-            settings.MultipleInstances = 2  # TASK_INSTANCES_IGNORE_NEW.
-            settings.WakeToRun = False
-            action = definition.Actions.Create(0)  # TASK_ACTION_EXEC; no command shell.
-            action.Path = launch.executable
-            action.Arguments = launch.arguments
-            action.WorkingDirectory = launch.working_directory
-            # Create-only closes the absent-task overwrite race. Update is used
-            # only after the exact ownership marker and current SID matched.
-            folder.RegisterTaskDefinition(TASK_NAME, definition, 2 if existing is None else 4, sid, "", 3)
-            return StartupResult(True, _ENABLED)
+        with _LOCK, _scheduler_session() as session:
+            try:
+                return _change_owned_task(session[0], session[1], enabled, launch)
+            finally:
+                session = None
     except Exception:
         return StartupResult(False, _UNAVAILABLE)
