@@ -49,6 +49,9 @@ def app():
 def isolated_personal_profile(monkeypatch, tmp_path):
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "empty-user-profile"))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "empty-home"))
+    # Proactive plan delivery is covered with a controlled clock in the plan
+    # integration tests; unrelated UI tests must not depend on wall-clock hour.
+    monkeypatch.setattr(DesktopCore, "due_events", lambda *_args, **_kwargs: [], raising=False)
 
 
 @pytest.fixture
@@ -79,11 +82,36 @@ def settled(app, window):
 def test_startup_keeps_microphone_off_and_navigation_simple(app, window):
     assert window.voice.starts == 0
     assert not window.listening
-    assert [item.text() for item in window.nav_buttons] == ["Ассистент", "Мои задачи", "Заметки", "Мои данные", "Настройки"]
+    assert [item.text() for item in window.nav_buttons] == ["Ассистент", "План", "Мои задачи", "Заметки", "Мои данные", "Настройки"]
     window.navigate(1)
     assert window.pages.currentIndex() == 1
     window.navigate(window.SETTINGS_PAGE)
     assert window.pages.currentIndex() == window.SETTINGS_PAGE
+
+
+def test_usage_statistics_distinguish_unavailable_tokens_from_reported_zero(window, monkeypatch):
+    data = {"requests": 1, "successful": 1, "failed": 0,
+            "known_input_tokens": 0, "known_output_tokens": 0,
+            "known_input_requests": 0, "known_output_requests": 0,
+            "unknown_usage_requests": 1, "mean_latency_ms": None}
+    monkeypatch.setattr(window.core, "usage_snapshot", lambda: data, raising=False)
+    window.refresh()
+    assert "вход — / выход —" in window.usage_status.text()
+    assert "Неполные данные: 1" in window.usage_status.text()
+    assert "нет данных" in window.usage_status.text()
+    data.update(known_input_requests=1, known_output_requests=1, unknown_usage_requests=0, mean_latency_ms=20)
+    window.refresh()
+    assert "вход 0 / выход 0" in window.usage_status.text()
+    assert "0.02 с" in window.usage_status.text()
+    assert window._test_executed == []
+
+
+def test_usage_statistics_failure_never_displays_provider_content(window, monkeypatch):
+    monkeypatch.setattr(window.core, "usage_snapshot", lambda: {"requests": "private-provider-error"}, raising=False)
+    window.refresh()
+    assert "недоступна" in window.usage_status.text()
+    assert "private-provider-error" not in window.usage_status.text()
+    assert window.usage_status.textFormat() == Qt.TextFormat.PlainText
 
 
 def test_real_task_add_and_one_click_completion(app, window):
@@ -264,6 +292,21 @@ def test_tts_only_failure_does_not_disable_working_capture(app, window):
     window.voice.on_state("Голос Windows недоступен. Ответ показан текстом.")
     app.processEvents()
     assert window.listening and window.orb.active
+
+
+def test_close_stops_capture_even_if_pending_voice_preference_cannot_save(app, window, monkeypatch):
+    window.start_listening()
+    settled(app, window)
+    assert window.listening
+    window.voice_rate.setValue(window.voice_rate.value() + 1)
+    assert window._voice_rate_timer.isActive()
+    def storage_failure(_updates):
+        raise OSError("synthetic unavailable storage")
+    monkeypatch.setattr(window.core.store, "set_preferences", storage_failure)
+    window.close()
+    app.processEvents()
+    assert not window.listening and window.voice.stops >= 1
+    assert window._resources_closed and not window.isVisible()
 
 
 def test_close_waits_responsively_for_worker_and_stops_capture(app, window, monkeypatch):

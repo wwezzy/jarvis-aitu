@@ -39,7 +39,7 @@ def _warm_local_chat(model):
         pass  # Warm-up failure never prevents commands or application startup.
 
 
-def voice_diagnostics():
+def voice_diagnostics(*, extended=False):
     """Probe bundled native runtimes/model without recording or speaking."""
     report = {"kind": "voice-runtime", "microphone_started": False, "imports": {}}
     for name in ("vosk", "sounddevice", "pythoncom", "win32com.client"):
@@ -73,6 +73,26 @@ def voice_diagnostics():
         report["neural_speech"] = neural
     except Exception as error:
         report["neural_speech"] = {"ready": False, "error_class": type(error).__name__}
+    if extended:
+        # Explicit operator probe only: no capture, speaker output, user texts
+        # or model download. Exercise the actual installed native libraries.
+        for key, module_name, class_name, options in (
+            ("multilingual_stt", "desktop.multilingual_stt", "MultilingualSTT", {}),
+            ("personal_speech", "desktop.expressive_speech", "ExpressiveSpeech", {"voice": "eugene", "personal_use": True}),
+            ("clone_speech", "desktop.clone_speech", "CloneSpeech", {"personal_use": True}),
+        ):
+            backend = None
+            try:
+                backend = getattr(importlib.import_module(module_name), class_name)(**options)
+                ready = bool(backend.prepare())
+                report[key] = {"ready": ready, "reason": backend.reason,
+                               "microphone_started": False, "audio_played": False}
+            except Exception as error:
+                report[key] = {"ready": False, "error_class": type(error).__name__}
+            finally:
+                close = getattr(backend, "close", None)
+                if callable(close):
+                    close()
     return report
 
 
@@ -80,19 +100,26 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="JARVIS local desktop assistant")
     parser.add_argument("--state-dir", type=Path, help="Override local personal-data directory")
     parser.add_argument("--smoke-test", action="store_true", help="Open an isolated offscreen UI, with microphone and OS actions disabled")
+    parser.add_argument("--quiet-start", action="store_true", help="Skip this launch's organizer greeting; retain the selected microphone mode")
     parser.add_argument("--screenshot", type=Path, help="Save a UI screenshot in smoke-test mode")
     parser.add_argument("--diagnose-voice", action="store_true", help="Check voice imports/model without recording or speaking")
+    parser.add_argument("--extended-models", action="store_true", help="Include optional installed RU/EN, personal and clone native probes")
     parser.add_argument("--report", type=Path, help="Write private diagnostic JSON for smoke-test/voice diagnosis")
     args = parser.parse_args(argv)
     if args.screenshot and not args.smoke_test:
         parser.error("--screenshot requires --smoke-test")
     if args.report and not (args.smoke_test or args.diagnose_voice):
         parser.error("--report requires --smoke-test or --diagnose-voice")
+    if args.extended_models and not args.diagnose_voice:
+        parser.error("--extended-models requires --diagnose-voice")
     if args.diagnose_voice:
-        report = voice_diagnostics()
+        report = voice_diagnostics(extended=True) if args.extended_models else voice_diagnostics()
         write_report(args.report, report)
         if sys.stdout is not None:
             print(json.dumps(report, ensure_ascii=False))
+        if args.extended_models and not all(report.get(name, {}).get("ready") is True
+                                            for name in ("multilingual_stt", "personal_speech", "clone_speech")):
+            return 7
         return 0 if (all(item["ok"] for item in report["imports"].values())
                      and report.get("model_loaded") is True) else 5
     diagnostic = {"kind": "ui-smoke", "stage": "qt-import", "microphone_started": False, "os_actions": False, "personal_data_loaded": False}
@@ -146,13 +173,18 @@ def main(argv=None):
             pass
     core = None
     try:
+        if not args.smoke_test:
+            from desktop.runtime_env import create_phone_environment, load_phone_environment
+            create_phone_environment(state_dir)
+            load_phone_environment(state_dir)
         from desktop.personal import default_snapshot_path
         personal_path = state_dir / "no-personal-data.sqlite3" if args.smoke_test else default_snapshot_path()
         core = DesktopCore(state_dir, executor=(lambda _action: "Smoke-test executor") if args.smoke_test else None,
                            personal_path=personal_path)
         window = MainWindow(core, voice_factory=SmokeVoice if args.smoke_test else None,
                             enable_tray=not args.smoke_test,
-                            personal_path=personal_path)
+                            personal_path=personal_path, enable_integrations=not args.smoke_test,
+                            quiet_start=args.quiet_start)
         if not args.smoke_test:
             preferences = core.store.preferences()
             if preferences.get("local_chat_enabled") is True:

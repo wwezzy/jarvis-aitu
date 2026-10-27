@@ -1,14 +1,15 @@
 """Local desktop interface with explicit persisted voice and startup opt-ins."""
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QKeySequence, QLinearGradient, QPainter, QPen, QPixmap, QRadialGradient, QShortcut
+from PySide6.QtCore import QDate, QObject, QRunnable, QTime, Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QKeySequence, QLinearGradient, QPainter, QPen, QPixmap, QRadialGradient, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QApplication, QCheckBox, QComboBox, QDateEdit, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMenu, QPlainTextEdit, QPushButton, QScrollArea, QStackedWidget,
-    QSlider, QSystemTrayIcon, QVBoxLayout, QWidget,
+    QSlider, QSpinBox, QSystemTrayIcon, QTimeEdit, QVBoxLayout, QWidget,
 )
 
 
@@ -36,6 +37,11 @@ QPushButton#nav:hover { background: #122637; color: #e5f4ff; }
 QPushButton#quiet { background: transparent; border-color: #283b50; color: #a8bed1; font-size: 12px; }
 QLineEdit, QPlainTextEdit { background: #0b1523; border: 1px solid #2b4057; border-radius: 9px; padding: 11px; selection-background-color: #286f72; color: #edf7ff; }
 QLineEdit:focus, QPlainTextEdit:focus { border-color: #72d9cc; }
+QDateEdit, QTimeEdit, QSpinBox { background: #0b1523; border: 1px solid #2b4057; border-radius: 8px; padding: 8px; }
+QCalendarWidget QAbstractItemView { background: #101c2c; color: #dbe6f3; selection-background-color: #255253; }
+QCalendarWidget QWidget#qt_calendar_navigationbar { background: #18283c; }
+QMenu { background: #101c2c; color: #dbe6f3; }
+QMenu::item:selected { background: #255253; }
 QScrollArea { border: none; background: transparent; }
 QScrollArea > QWidget > QWidget { background: transparent; }
 QScrollBar:vertical { background: transparent; width: 7px; margin: 4px 0; }
@@ -162,11 +168,445 @@ class Worker(QRunnable):
             self.signals.failed.emit(type(error).__name__)
 
 
+class PlanPanel(QWidget):
+    """Editable, user-owned day plans; a view never reports completion."""
+
+    def __init__(self, core, on_changed):
+        super().__init__()
+        self.core, self.on_changed = core, on_changed
+        self._relative_day = 0
+        self._today = QDate.currentDate()
+        self._editing_id = None
+        self._gym_dirty = False
+        self._loading_gym = False
+        self.items = []
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(label("План", "title"))
+        outer.addWidget(label("Дела с датой и гибкие тренировки. Быстрые задачи остаются в разделе «Мои задачи».", "subtitle", True))
+        dates = QHBoxLayout()
+        self.today_button = button("Сегодня", lambda: self.select_relative(0), "quiet")
+        self.tomorrow_button = button("Завтра", lambda: self.select_relative(1), "quiet")
+        dates.addWidget(self.today_button)
+        dates.addWidget(self.tomorrow_button)
+        self.view_date = QDateEdit(QDate.currentDate())
+        self.view_date.setObjectName("planViewDate")
+        self.view_date.setDisplayFormat("dd.MM.yyyy")
+        self.view_date.setCalendarPopup(True)
+        self.view_date.dateChanged.connect(self._date_selected)
+        dates.addWidget(self.view_date)
+        dates.addStretch()
+        outer.addLayout(dates)
+        self.feedback = label("", "muted", True)
+        self.feedback.setObjectName("planFeedback")
+        outer.addWidget(self.feedback)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        body = QVBoxLayout(content)
+        body.setContentsMargins(0, 5, 7, 0)
+        body.setSpacing(14)
+        self.summary = label("", "muted", True)
+        body.addWidget(self.summary)
+        self.evidence_off_hint = label("Подсказки об активности выключены; их можно включить в настройках.", "muted", True)
+        body.addWidget(self.evidence_off_hint)
+        evidence = QFrame()
+        evidence.setObjectName("card")
+        self.evidence_card = evidence
+        evidence_layout = QVBoxLayout(evidence)
+        evidence_layout.setContentsMargins(16, 12, 16, 12)
+        self.evidence_heading = label("Наблюдения сегодня · по желанию", "section")
+        self.evidence_totals = label("Наблюдение выключено. Его можно включить в настройках.", "muted", True)
+        evidence_layout.addWidget(self.evidence_heading)
+        evidence_layout.addWidget(self.evidence_totals)
+        evidence_layout.addWidget(label("Это подсказки по открытым программам, а не доказательство учёбы или зала. Браузер остаётся неизвестным; выполнение отмечаете только вы.", "muted", True))
+        evidence_actions = QHBoxLayout()
+        self.pause_evidence = button("Пауза наблюдений", self._pause_evidence, "quiet")
+        self.pause_evidence.setEnabled(False)
+        self.clear_evidence = button("Очистить наблюдения", self._clear_evidence, "quiet")
+        self.clear_evidence.setEnabled(False)
+        evidence_actions.addWidget(self.pause_evidence)
+        evidence_actions.addWidget(self.clear_evidence)
+        evidence_actions.addStretch()
+        evidence_layout.addLayout(evidence_actions)
+        body.addWidget(evidence)
+        items_holder = QWidget()
+        self.items_layout = QVBoxLayout(items_holder)
+        self.items_layout.setContentsMargins(0, 0, 0, 0)
+        self.items_layout.setSpacing(10)
+        body.addWidget(items_holder)
+        body.addWidget(self._item_form())
+        body.addWidget(self._gym_form())
+        body.addWidget(label("«Сделано» и «Пропущено» — только ваш явный отчёт. Без отчёта статус остаётся «Не подтверждено»; время за компьютером или окончание таймера не доказывают выполнения.", "muted", True))
+        body.addStretch()
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
+        self.scroll = scroll
+
+    @staticmethod
+    def _set_date(control, value):
+        blocked = control.blockSignals(True)
+        control.setDate(value)
+        control.blockSignals(blocked)
+
+    @staticmethod
+    def _clear(layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().hide()
+                item.widget().deleteLater()
+
+    def refresh_evidence(self, data):
+        date = QDate.fromString(data.get("date", ""), "yyyy-MM-dd")
+        self.evidence_heading.setText("Наблюдения сегодня" + (" · " + date.toString("dd.MM.yyyy") if date.isValid() else ""))
+        enabled = bool(data.get("enabled", False))
+        observed = data.get("observed_seconds", 0)
+        has_records = bool(data.get("has_records", observed > 0))
+        self.evidence_card.setVisible(enabled or has_records)
+        self.evidence_off_hint.setVisible(not enabled and not has_records)
+        if not observed:
+            self.evidence_totals.setText(("Сбор разрешён. " if enabled else "Наблюдение выключено. ")
+                                        + "Записанных интервалов пока нет; это не означает, что вы ничего не делали.")
+        else:
+            names = {"work": "Рабочие программы", "gaming": "Игровые", "media": "Медиаплееры", "idle": "Бездействие", "unknown": "Неизвестно"}
+            values = data.get("seconds", {})
+            totals = " · ".join(f"{title}: {round(values.get(key, 0) / 60, 1)} мин" for key, title in names.items())
+            self.evidence_totals.setText(("Сбор включён. " if enabled else "Сбор приостановлен. ")
+                                        + f"Записано около {round(observed / 60, 1)} мин: " + totals)
+        self.pause_evidence.setEnabled(enabled)
+        self.clear_evidence.setEnabled(has_records)
+
+    def _pause_evidence(self):
+        try:
+            self.core.store.set_preferences({"activity_monitor_enabled": False})
+            self.core.reset_observations()
+        except Exception:
+            self.feedback.setText("Не удалось сохранить паузу наблюдений.")
+            return
+        self.on_changed()
+        self.feedback.setText("Наблюдения приостановлены; сохранённые интервалы можно очистить отдельно.")
+
+    def _clear_evidence(self):
+        try:
+            self.core.clear_observations()
+        except Exception:
+            self.feedback.setText("Не удалось очистить наблюдения. Данные плана не изменены.")
+            return
+        self.on_changed()
+        self.feedback.setText("Наблюдения очищены. Новые интервалы появятся только при включённом сборе.")
+
+    def _item_form(self):
+        card = QFrame()
+        card.setObjectName("card")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 16, 18, 18)
+        self.form_heading = label("Добавить в план", "section")
+        layout.addWidget(self.form_heading)
+        self.item_title = QLineEdit()
+        self.item_title.setObjectName("planItemTitle")
+        self.item_title.setMaxLength(1000)
+        self.item_title.setPlaceholderText("Один понятный следующий шаг")
+        layout.addWidget(self.item_title)
+        row = QGridLayout()
+        row.addWidget(label("Дата плана", "muted"), 0, 0)
+        row.addWidget(label("Тип", "muted"), 0, 1)
+        self.item_date = QDateEdit(QDate.currentDate())
+        self.item_date.setObjectName("planItemDate")
+        self.item_date.setDisplayFormat("dd.MM.yyyy")
+        self.item_date.setCalendarPopup(True)
+        row.addWidget(self.item_date, 1, 0)
+        self.item_kind = QComboBox()
+        for title, value in [("Цель", "goal"), ("Дело", "task"), ("Учёба", "study"), ("Тренировка", "workout"), ("Отдых", "rest")]:
+            self.item_kind.addItem(title, value)
+        row.addWidget(self.item_kind, 1, 1)
+        self.item_has_time = QCheckBox("Указать время")
+        self.item_has_time.setObjectName("planItemHasTime")
+        self.item_time = QTimeEdit(QTime.currentTime())
+        self.item_time.setDisplayFormat("HH:mm")
+        self.item_time.hide()
+        self.item_has_time.toggled.connect(self.item_time.setVisible)
+        row.addWidget(self.item_has_time, 2, 0)
+        row.addWidget(self.item_time, 3, 0)
+        self.item_has_minutes = QCheckBox("Указать длительность")
+        self.item_minutes = QSpinBox()
+        self.item_minutes.setRange(1, 1440)
+        self.item_minutes.setValue(25)
+        self.item_minutes.setSuffix(" мин")
+        self.item_minutes.hide()
+        self.item_has_minutes.toggled.connect(self.item_minutes.setVisible)
+        row.addWidget(self.item_has_minutes, 2, 1)
+        row.addWidget(self.item_minutes, 3, 1)
+        layout.addLayout(row)
+        self.edit_hint = label("Время и длительность необязательны. Дата плана сама по себе не означает жёсткий дедлайн.", "muted", True)
+        layout.addWidget(self.edit_hint)
+        controls = QHBoxLayout()
+        self.save_item = button("Добавить в план", self._save_item, "primary")
+        self.save_item.setObjectName("savePlanItem")
+        self.cancel_edit = button("Отменить изменение", self.reset_form, "quiet")
+        self.cancel_edit.hide()
+        controls.addWidget(self.save_item)
+        controls.addWidget(self.cancel_edit)
+        controls.addStretch()
+        layout.addLayout(controls)
+        return card
+
+    def _gym_form(self):
+        card = QFrame()
+        card.setObjectName("card")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 16, 18, 18)
+        layout.addWidget(label("Тренировки на неделю", "section"))
+        self.gym_enabled = QCheckBox("Планировать тренировки")
+        self.gym_enabled.setObjectName("gymEnabled")
+        layout.addWidget(self.gym_enabled)
+        days = QHBoxLayout()
+        self.gym_days = []
+        for index, title in enumerate(["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]):
+            control = QCheckBox(title)
+            control.setObjectName(f"gymDay{index}")
+            control.toggled.connect(self._gym_changed)
+            self.gym_days.append(control)
+            days.addWidget(control)
+        layout.addLayout(days)
+        row = QGridLayout()
+        self.gym_has_time = QCheckBox("Указать время")
+        self.gym_time = QTimeEdit(QTime.currentTime())
+        self.gym_time.setDisplayFormat("HH:mm")
+        self.gym_time.hide()
+        self.gym_has_time.toggled.connect(self.gym_time.setVisible)
+        self.gym_has_time.toggled.connect(self._gym_changed)
+        self.gym_time.timeChanged.connect(self._gym_changed)
+        row.addWidget(self.gym_has_time, 0, 0)
+        row.addWidget(self.gym_time, 1, 0)
+        self.gym_has_minutes = QCheckBox("Указать длительность")
+        self.gym_minutes = QSpinBox()
+        self.gym_minutes.setRange(1, 1440)
+        self.gym_minutes.setValue(45)
+        self.gym_minutes.setSuffix(" мин")
+        self.gym_minutes.hide()
+        self.gym_has_minutes.toggled.connect(self.gym_minutes.setVisible)
+        self.gym_has_minutes.toggled.connect(self._gym_changed)
+        self.gym_minutes.valueChanged.connect(self._gym_changed)
+        row.addWidget(self.gym_has_minutes, 0, 1)
+        row.addWidget(self.gym_minutes, 1, 1)
+        layout.addLayout(row)
+        layout.addWidget(label("Можно выбрать только дни и оставить время свободным. Перенос или пропуск одной тренировки меняет только выбранный день; остальные недели сохраняются.", "muted", True))
+        self.gym_unsaved = label("Есть несохранённые изменения", "muted")
+        self.gym_unsaved.hide()
+        layout.addWidget(self.gym_unsaved)
+        controls = QHBoxLayout()
+        self.save_gym = button("Сохранить неделю", self._save_gym, "primary")
+        self.save_gym.setObjectName("saveWeeklyGym")
+        self.save_gym.setEnabled(False)
+        controls.addWidget(self.save_gym)
+        controls.addWidget(button("Сбросить изменения", self._reset_gym, "quiet"))
+        controls.addStretch()
+        layout.addLayout(controls)
+        self.gym_enabled.toggled.connect(self._gym_changed)
+        return card
+
+    def _date_selected(self, _date):
+        self._relative_day = None
+        self.refresh()
+
+    def select_relative(self, offset):
+        self._relative_day = offset
+        self.refresh()
+
+    def refresh(self):
+        organizer = getattr(self.core, "organizer", None)
+        if organizer is None:
+            self.feedback.setText("План пока недоступен. Быстрые задачи и заметки сохраняются отдельно.")
+            return
+        try:
+            snapshot = organizer.snapshot()
+            today = QDate.fromString(snapshot["today"]["date"], "yyyy-MM-dd")
+            if not today.isValid():
+                raise ValueError("Invalid plan date")
+            self._today = today
+            if self._relative_day is not None:
+                self._set_date(self.view_date, today.addDays(self._relative_day))
+            if self._editing_id is None and not self.item_title.text().strip():
+                self._set_date(self.item_date, self.view_date.date())
+            day = organizer.day(self.view_date.date().toString("yyyy-MM-dd"))
+            self.items = day["items"]
+            self._render_items()
+            if not self._gym_dirty:
+                self._load_gym(organizer.gym_settings())
+        except Exception:
+            self._clear(self.items_layout)
+            self.items = []
+            self.feedback.setText("Не удалось прочитать текущий план. Данные не подменены исторической копией.")
+
+    def _render_items(self):
+        self._clear(self.items_layout)
+        counts = {status: sum(item["status"] == status for item in self.items) for status in ("done", "missed", "unknown")}
+        self.summary.setText(f"Сделано: {counts['done']} · Пропущено: {counts['missed']} · Не подтверждено: {counts['unknown']}")
+        if not self.items:
+            self.items_layout.addWidget(label("На эту дату пока ничего не запланировано. Можно добавить одно дело или выбрать дни тренировок.", "muted", True))
+        for item in self.items:
+            card = QFrame()
+            card.setObjectName("card")
+            layout = QVBoxLayout(card)
+            layout.setContentsMargins(16, 13, 16, 13)
+            title = label(item["title"], wrap=True)
+            title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            layout.addWidget(title)
+            details = item.get("time") or "Время не задано"
+            if item.get("minutes") is not None:
+                details += f" · План: {item['minutes']} мин"
+            if item.get("reported_minutes") is not None:
+                details += f" · Ваш отчёт: {item['reported_minutes']} мин"
+            layout.addWidget(label(details, "muted", True))
+            actions = QHBoxLayout()
+            status = QComboBox()
+            status.setObjectName("planStatus_" + item["id"])
+            for text, value in [("Не подтверждено", "unknown"), ("Сделано", "done"), ("Пропущено", "missed")]:
+                status.addItem(text, value)
+            status.setCurrentIndex(max(0, status.findData(item["status"])))
+            status.currentIndexChanged.connect(lambda _index, item_id=item["id"], control=status: self._report(item_id, control.currentData()))
+            actions.addWidget(status)
+            edit = button("Изменить", lambda _checked=False, value=dict(item): self.edit_item(value), "quiet")
+            edit.setObjectName("editPlan_" + item["id"])
+            actions.addWidget(edit)
+            remove = button("Убрать", lambda _checked=False, item_id=item["id"]: self._remove(item_id), "quiet")
+            remove.setObjectName("removePlan_" + item["id"])
+            actions.addWidget(remove)
+            actions.addStretch()
+            layout.addLayout(actions)
+            self.items_layout.addWidget(card)
+
+    def edit_item(self, item):
+        self._editing_id = item["id"]
+        self.item_title.setText(item["title"])
+        self._set_date(self.item_date, QDate.fromString(item["date"], "yyyy-MM-dd"))
+        routine = item["kind"] == "routine"
+        self.item_kind.setCurrentIndex(max(0, self.item_kind.findData("workout" if routine else item["kind"])))
+        self.item_kind.setEnabled(False)
+        self.item_has_time.setChecked(item.get("time") is not None)
+        if item.get("time"):
+            self.item_time.setTime(QTime.fromString(item["time"], "HH:mm"))
+        self.item_has_minutes.setChecked(item.get("minutes") is not None)
+        if item.get("minutes") is not None:
+            self.item_minutes.setValue(item["minutes"])
+        self.form_heading.setText("Изменить выбранный день")
+        self.save_item.setText("Сохранить изменения")
+        self.cancel_edit.show()
+        self.edit_hint.setText("Изменение относится только к выбранному дню. Повторяющаяся неделя настраивается ниже." if routine else "Можно изменить дату, время, название и длительность. Выполнение не предполагается автоматически.")
+        self.scroll.ensureWidgetVisible(self.item_title)
+        self.item_title.setFocus()
+
+    def reset_form(self):
+        self._editing_id = None
+        self.item_title.clear()
+        self._set_date(self.item_date, self.view_date.date())
+        self.item_has_time.setChecked(False)
+        self.item_has_minutes.setChecked(False)
+        self.item_kind.setEnabled(True)
+        self.form_heading.setText("Добавить в план")
+        self.save_item.setText("Добавить в план")
+        self.cancel_edit.hide()
+        self.edit_hint.setText("Время и длительность необязательны. Дата плана сама по себе не означает жёсткий дедлайн.")
+
+    def _changed(self, message):
+        self.refresh()
+        self.feedback.setText(message)
+        self.on_changed()
+
+    def _save_item(self):
+        organizer = getattr(self.core, "organizer", None)
+        if organizer is None:
+            return
+        fields = {"title": self.item_title.text().strip(), "on_date": self.item_date.date().toString("yyyy-MM-dd"),
+                  "start_time": self.item_time.time().toString("HH:mm") if self.item_has_time.isChecked() else None,
+                  "minutes": self.item_minutes.value() if self.item_has_minutes.isChecked() else None}
+        try:
+            if self._editing_id is None:
+                organizer.add_item(**fields, kind=self.item_kind.currentData())
+            else:
+                organizer.update_item(self._editing_id, **fields)
+        except ValueError:
+            self.feedback.setText("Проверьте название, дату, время и длительность.")
+            return
+        except Exception:
+            self.feedback.setText("Не удалось сохранить план. Успех не подтверждён.")
+            return
+        self._relative_day = None
+        self._set_date(self.view_date, self.item_date.date())
+        self.reset_form()
+        self._changed("План сохранён. Статус выполнения требует вашего отчёта.")
+
+    def _report(self, item_id, status):
+        try:
+            self.core.organizer.report_item(item_id, status=status)
+        except Exception:
+            self.feedback.setText("Не удалось сохранить отчёт. Статус не подтверждён.")
+            self.refresh()
+            return
+        self._changed("Ваш отчёт сохранён.")
+
+    def _remove(self, item_id):
+        try:
+            changed = self.core.organizer.delete_item(item_id)
+        except Exception:
+            self.feedback.setText("Не удалось убрать запись из плана.")
+            return
+        if not changed:
+            self.feedback.setText("Запись уже изменилась. Обновите план.")
+        if self._editing_id == item_id:
+            self.reset_form()
+        self._changed("Запись убрана только из выбранного дня." if changed else "План обновлён.")
+
+    def _gym_changed(self, *_args):
+        if not self._loading_gym:
+            self._gym_dirty = True
+            self.gym_unsaved.show()
+            self.save_gym.setEnabled(True)
+
+    def _load_gym(self, value):
+        self._loading_gym = True
+        try:
+            self.gym_enabled.setChecked(value["enabled"])
+            for index, control in enumerate(self.gym_days):
+                control.setChecked(index in value["days"])
+            self.gym_has_time.setChecked(value.get("time") is not None)
+            if value.get("time"):
+                self.gym_time.setTime(QTime.fromString(value["time"], "HH:mm"))
+            self.gym_has_minutes.setChecked(value.get("minutes") is not None)
+            if value.get("minutes") is not None:
+                self.gym_minutes.setValue(value["minutes"])
+        finally:
+            self._loading_gym = False
+        self.gym_unsaved.hide()
+        self.save_gym.setEnabled(False)
+
+    def _reset_gym(self):
+        self._gym_dirty = False
+        self.refresh()
+
+    def _save_gym(self):
+        try:
+            self.core.organizer.set_weekly_gym(days=[index for index, control in enumerate(self.gym_days) if control.isChecked()],
+                time=self.gym_time.time().toString("HH:mm") if self.gym_has_time.isChecked() else None,
+                minutes=self.gym_minutes.value() if self.gym_has_minutes.isChecked() else None,
+                enabled=self.gym_enabled.isChecked())
+        except ValueError:
+            self.feedback.setText("Выберите дни тренировок или отключите планирование. Проверьте время и длительность.")
+            return
+        except Exception:
+            self.feedback.setText("Не удалось сохранить тренировочную неделю.")
+            return
+        self._gym_dirty = False
+        self._changed("Тренировочная неделя сохранена. Время можно оставить свободным.")
+
+
 class MainWindow(QMainWindow):
     SETTINGS_PAGE = 4
+    PLAN_PAGE = 5
     MAX_PREVIEW_CHARS = 22000
 
-    def __init__(self, core, voice_factory=None, model_dir: Path | None = None, enable_tray: bool = True, personal_path: Path | None = None):
+    def __init__(self, core, voice_factory=None, model_dir: Path | None = None, enable_tray: bool = True, personal_path: Path | None = None, *, enable_integrations: bool = False, quiet_start: bool = False):
         super().__init__()
         load_application_font()
         self.core = core
@@ -176,6 +616,15 @@ class MainWindow(QMainWindow):
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(1)
         self._workers = set()
+        self._integrations_enabled = bool(enable_integrations)
+        self._integration_pool = QThreadPool(self)
+        self._integration_pool.setMaxThreadCount(1)
+        self._integration_workers = set()
+        self._integration_busy = False
+        self._phone_server = self._phone_delivery = None
+        self._phone_state, self._delivery_state = {}, {}
+        self._phone_notifications = []
+        self._phone_stop_complete = not self._integrations_enabled
         self.busy = False
         self.listening = False
         self._capture_session = 0
@@ -235,8 +684,16 @@ class MainWindow(QMainWindow):
         self._reminder_timer.setInterval(1000)
         self._reminder_timer.timeout.connect(self._poll_reminders)
         self._reminder_timer.start()
+        self._integration_timer = QTimer(self)
+        self._integration_timer.setInterval(5000)
+        self._integration_timer.timeout.connect(self._poll_phone_integrations)
+        if self._integrations_enabled:
+            self._start_phone_integrations()
+            self._integration_timer.start()
         if self.preferences.get("voice_enabled", False):
             QTimer.singleShot(0, self.start_listening)
+        if not quiet_start:
+            QTimer.singleShot(0, lambda: self._poll_organizer_events("startup"))
 
     def _new_voice(self):
         factory = self.voice_factory
@@ -280,7 +737,8 @@ class MainWindow(QMainWindow):
         side.addWidget(label("ЛИЧНЫЙ АССИСТЕНТ", "eyebrow"))
         side.addSpacing(35)
         self.nav_buttons = []
-        for index, text in enumerate(["Ассистент", "Мои задачи", "Заметки", "Мои данные", "Настройки"]):
+        self.nav_targets = [(0, "Ассистент"), (self.PLAN_PAGE, "План"), (1, "Мои задачи"), (2, "Заметки"), (3, "Мои данные"), (self.SETTINGS_PAGE, "Настройки")]
+        for index, text in self.nav_targets:
             nav = button(text, lambda _checked=False, value=index: self.navigate(value), "nav")
             nav.setCheckable(True)
             self.nav_buttons.append(nav)
@@ -289,7 +747,7 @@ class MainWindow(QMainWindow):
         side.addWidget(label("НА ЭТОМ КОМПЬЮТЕРЕ", "eyebrow"))
         side.addWidget(label("Задачи и заметки доступны\nбез интернета.", "muted", True))
         side.addSpacing(15)
-        side.addWidget(label("DESKTOP 4.2", "eyebrow"))
+        side.addWidget(label("DESKTOP 4.3", "eyebrow"))
         shell.addWidget(sidebar)
         content = QWidget()
         main = QVBoxLayout(content)
@@ -308,6 +766,8 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._notes_page())
         self.pages.addWidget(self._personal_page())
         self.pages.addWidget(self._settings_page())
+        self.plan = PlanPanel(self.core, self._plan_changed)
+        self.pages.addWidget(self.plan)
         main.addWidget(self.pages, 1)
         footer = QHBoxLayout()
         footer.addWidget(label("Управление голосом — только после включения микрофона", "muted"))
@@ -478,11 +938,26 @@ class MainWindow(QMainWindow):
         self.voice_engine.setObjectName("voiceEngineChoice")
         self.voice_engine.addItem("Локальный нейроголос, иначе Windows", "auto")
         self.voice_engine.addItem("Голос Windows", "windows")
+        self.voice_engine.addItem("Выразительный голос (личное использование)", "expressive")
+        self.voice_engine.addItem("Голос по личному образцу (RU/EN)", "clone")
         engine_index = self.voice_engine.findData(self.preferences.get("voice_engine", "auto"))
         self.voice_engine.setCurrentIndex(max(0, engine_index))
-        self.voice_engine.currentIndexChanged.connect(lambda _index: self.save_preference("voice_engine", self.voice_engine.currentData()))
+        self.voice_engine.currentIndexChanged.connect(self._voice_engine_changed)
         engine_row.addWidget(self.voice_engine, 1)
         content.addLayout(engine_row)
+        self.voice_character_label = label("Тембр выразительного голоса", "muted")
+        self.voice_character = QComboBox()
+        self.voice_character.setObjectName("voiceCharacterChoice")
+        self.voice_character.addItem("Айдар", "aidar")
+        self.voice_character.addItem("Евгений", "eugene")
+        self.voice_character.setCurrentIndex(max(0, self.voice_character.findData(self.preferences.get("voice_character", "aidar"))))
+        self.voice_character.currentIndexChanged.connect(lambda _index: self.save_preference("voice_character", self.voice_character.currentData()))
+        self.voice_personal_license = label("Этот вариант предназначен только для личного использования. Модель имеет некоммерческую лицензию и не подходит для публичной продажи приложения.", "muted", True)
+        for widget in (self.voice_character_label, self.voice_character):
+            widget.setVisible(self.voice_engine.currentData() == "expressive")
+            content.addWidget(widget)
+        self.voice_personal_license.setVisible(self.voice_engine.currentData() in {"expressive", "clone"})
+        content.addWidget(self.voice_personal_license)
         content.addWidget(label("Нейроголос используется только при наличии установленной локальной модели. Иначе отвечает установленный голос Windows. Это не копия голоса актёра.", "muted", True))
         self.voice_backend_status = label("Источник голоса определяется при подготовке.", "muted", True)
         self.voice_backend_status.setObjectName("voiceBackendStatus")
@@ -515,6 +990,11 @@ class MainWindow(QMainWindow):
         self.auto_listen_toggle.setChecked(bool(self.preferences.get("voice_enabled", False)))
         self.auto_listen_toggle.toggled.connect(self._auto_listen_changed)
         content.addWidget(self.auto_listen_toggle)
+        self.multilingual_toggle = QCheckBox("Понимать русскую и английскую речь")
+        self.multilingual_toggle.setChecked(bool(self.preferences.get("multilingual_stt_enabled", False)))
+        self.multilingual_toggle.toggled.connect(self._multilingual_changed)
+        content.addWidget(self.multilingual_toggle)
+        content.addWidget(label("Двуязычный режим использует отдельно установленную локальную модель. Если её нет, продолжает работать русский режим; аудио не отправляется в облако.", "muted", True))
         self.launch_at_login_toggle = QCheckBox("Запускать JARVIS при входе в Windows")
         self.launch_at_login_toggle.setObjectName("launchAtLoginToggle")
         self.launch_at_login_toggle.setChecked(bool(self.preferences.get("launch_at_login", False)))
@@ -530,6 +1010,50 @@ class MainWindow(QMainWindow):
         content.addWidget(self.model_button, alignment=Qt.AlignmentFlag.AlignLeft)
         content.addWidget(label("Однократная загрузка модели Vosk с официального сайта. После установки распознавание работает без интернета; звук в облако не отправляется.", "muted", True))
         outer.addWidget(card)
+        daily = QFrame()
+        daily.setObjectName("card")
+        daily_layout = QVBoxLayout(daily)
+        daily_layout.setContentsMargins(22, 20, 22, 20)
+        daily_layout.addWidget(label("Утро и вечер", "section"))
+        self.organizer_toggle = QCheckBox("Помогать с дневным планом")
+        self.morning_toggle = QCheckBox("Утренний обзор при начале дня")
+        self.evening_toggle = QCheckBox("Вечером предложить обсудить завтра")
+        self.organizer_pause_toggle = QCheckBox("Пауза инициативных обращений")
+        self.organizer_dnd_toggle = QCheckBox("Не беспокоить")
+        for key, control, default in [
+            ("organizer_enabled", self.organizer_toggle, True),
+            ("morning_brief_enabled", self.morning_toggle, True),
+            ("evening_plan_enabled", self.evening_toggle, True),
+            ("organizer_paused", self.organizer_pause_toggle, False),
+            ("organizer_dnd", self.organizer_dnd_toggle, False),
+        ]:
+            control.setChecked(bool(self.preferences.get(key, default)))
+            control.toggled.connect(lambda value, name=key: self._organizer_preference_changed(name, value))
+            daily_layout.addWidget(control)
+        evening_row = QHBoxLayout()
+        evening_row.addWidget(label("Время вечернего обращения", "muted"))
+        self.evening_time = QTimeEdit(QTime.fromString(self.preferences.get("evening_plan_time", "22:00"), "HH:mm"))
+        self.evening_time.setObjectName("eveningPlanTime")
+        self.evening_time.setDisplayFormat("HH:mm")
+        self.evening_time.timeChanged.connect(lambda value: self._organizer_preference_changed("evening_plan_time", value.toString("HH:mm")))
+        evening_row.addWidget(self.evening_time)
+        evening_row.addStretch()
+        daily_layout.addLayout(evening_row)
+        daily_layout.addWidget(label("Утром — разово при запуске или первом обращении. Вечером — в выбранное время. JARVIS должен быть запущен, а ноутбук — включён. План формируется из ваших актуальных записей, без выдуманных занятий или выполнения.", "muted", True))
+        outer.addWidget(daily)
+        observations = QFrame()
+        observations.setObjectName("card")
+        observation_layout = QVBoxLayout(observations)
+        observation_layout.setContentsMargins(22, 20, 22, 20)
+        observation_layout.addWidget(label("Подсказки об активности · по желанию", "section"))
+        self.activity_monitor_toggle = QCheckBox("Учитывать категории активности на компьютере")
+        self.activity_monitor_toggle.setObjectName("activityMonitorToggle")
+        self.activity_monitor_toggle.setChecked(bool(self.preferences.get("activity_monitor_enabled", False)))
+        self.activity_monitor_toggle.toggled.connect(self._activity_monitor_changed)
+        observation_layout.addWidget(self.activity_monitor_toggle)
+        observation_layout.addWidget(label("Раз в 5 секунд определяется категория активного приложения и бездействие. Сохраняются только секунды категорий по минутам, на 7 дней. Названия приложений сразу отбрасываются; заголовки окон, адреса сайтов, снимки экрана и нажатия клавиш не читаются. Эти интервалы не включаются в резервные копии приложения.", "muted", True))
+        observation_layout.addWidget(label("Рабочая программа не доказывает учёбу. Браузер остаётся неизвестным; чтение, видео и геймпад могут выглядеть как бездействие. Компьютер не подтверждает посещение зала, а игровые минуты не означают пропущенной цели.", "muted", True))
+        outer.addWidget(observations)
         data = QFrame()
         data.setObjectName("card")
         data_layout = QVBoxLayout(data)
@@ -537,6 +1061,20 @@ class MainWindow(QMainWindow):
         data_layout.addWidget(label("Личные данные остаются здесь", "section"))
         data_layout.addWidget(label("Задачи, заметки и история хранятся на этом компьютере. Telegram и облачные сервисы не нужны для основных команд. Удаление приложения не удаляет ваши данные.", "muted", True))
         outer.addWidget(data)
+        phone = QFrame()
+        phone.setObjectName("card")
+        phone_layout = QVBoxLayout(phone)
+        phone_layout.setContentsMargins(22, 20, 22, 20)
+        phone_layout.addWidget(label("iPhone и уведомления · по желанию", "section"))
+        self.phone_status = label("Локальный мост не настроен.", "muted", True)
+        self.phone_status.setObjectName("phoneIntegrationStatus")
+        self.phone_delivery_status = label("Telegram: не подключён. Звонки: не подключены.", "muted", True)
+        self.phone_delivery_status.setObjectName("phoneDeliveryStatus")
+        phone_layout.addWidget(self.phone_status)
+        phone_layout.addWidget(self.phone_delivery_status)
+        phone_layout.addWidget(label("План доступен на телефоне, пока ноутбук включён и работает защищённое соединение. Готовность моста не подтверждает подключение телефона. Отправка сообщения или звонка не означает, что вы его прочитали или услышали.", "muted", True))
+        phone_layout.addWidget(button("Настройка iPhone и уведомлений", self._open_phone_setup, "quiet"), alignment=Qt.AlignmentFlag.AlignLeft)
+        outer.addWidget(phone)
         local_chat = QFrame()
         local_chat.setObjectName("card")
         chat_layout = QVBoxLayout(local_chat)
@@ -553,6 +1091,11 @@ class MainWindow(QMainWindow):
         self.local_chat_history_toggle.toggled.connect(lambda value: self.save_preference("local_chat_history", value))
         chat_layout.addWidget(self.local_chat_history_toggle)
         chat_layout.addWidget(label("До 6 сообщений, только этот компьютер; команды, заметки и личная копия автоматически не передаются.", "muted", True))
+        self.local_chat_plan_toggle = QCheckBox("Разрешить локальному ИИ видеть актуальный план")
+        self.local_chat_plan_toggle.setChecked(bool(self.preferences.get("local_chat_plan_context", False)))
+        self.local_chat_plan_toggle.toggled.connect(lambda value: self.save_preference("local_chat_plan_context", value))
+        chat_layout.addWidget(self.local_chat_plan_toggle)
+        chat_layout.addWidget(label("Только план на сегодня и завтра с явными статусами. Заметки, архив и управление компьютером не передаются; ИИ не получает права выполнять команды.", "muted", True))
         model_row = QHBoxLayout()
         self.chat_model = QLineEdit(str(self.preferences.get("local_chat_model", "qwen3:4b-instruct-2507-q4_K_M")))
         self.chat_model.setPlaceholderText("Имя установленной модели Ollama")
@@ -560,6 +1103,10 @@ class MainWindow(QMainWindow):
         model_row.addWidget(self.chat_model, 1)
         model_row.addWidget(button("Сохранить модель", lambda: self.save_preference("local_chat_model", self.chat_model.text().strip())))
         chat_layout.addLayout(model_row)
+        self.usage_status = label("Статистика локального ИИ пока недоступна.", "muted", True)
+        self.usage_status.setObjectName("localAIUsageStatus")
+        chat_layout.addWidget(self.usage_status)
+        chat_layout.addWidget(label("Учёт хранит только числа, без текстов бесед. Недоступные значения не считаются нулевыми; стоимость не оценивается.", "muted", True))
         outer.addWidget(local_chat)
         outer.addStretch()
         scroll = QScrollArea()
@@ -640,8 +1187,8 @@ class MainWindow(QMainWindow):
     def navigate(self, index):
         self._view_index = index
         self.pages.setCurrentIndex(index)
-        for position, nav in enumerate(self.nav_buttons):
-            nav.setChecked(position == index)
+        for (target, _title), nav in zip(self.nav_targets, self.nav_buttons):
+            nav.setChecked(target == index)
         if hasattr(self, "voice"):
             self.refresh()
 
@@ -650,6 +1197,7 @@ class MainWindow(QMainWindow):
         while layout.count():
             item = layout.takeAt(0)
             if item.widget():
+                item.widget().hide()
                 item.widget().deleteLater()
 
     def _message(self, role, text):
@@ -680,6 +1228,11 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda: self.history_scroll.verticalScrollBar().setValue(self.history_scroll.verticalScrollBar().maximum()))
         self.refresh_tasks(snapshot)
         self.refresh_notes(snapshot=snapshot)
+        self.plan.refresh()
+        self.plan.refresh_evidence(snapshot.get("observations", {}))
+        self._sync_organizer_preferences()
+        self._set_checked_silently(self.activity_monitor_toggle, self.preferences.get("activity_monitor_enabled", False))
+        self._refresh_usage_status()
         if hasattr(self, "voice"):
             state = self.voice.available()
             self._update_voice_backend_status(state)
@@ -729,6 +1282,171 @@ class MainWindow(QMainWindow):
             self.note_layout.addWidget(card)
         self.note_layout.addStretch()
 
+    def _refresh_usage_status(self):
+        reader = getattr(self.core, "usage_snapshot", None)
+        if not callable(reader):
+            return
+        try:
+            data = reader()
+            names = ("requests", "successful", "failed", "known_input_tokens", "known_output_tokens",
+                     "known_input_requests", "known_output_requests", "unknown_usage_requests")
+            if not isinstance(data, dict) or any(type(data.get(key)) is not int or data[key] < 0 for key in names):
+                raise ValueError("Invalid usage counters")
+            inputs = str(data["known_input_tokens"]) if data["known_input_requests"] else "—"
+            outputs = str(data["known_output_tokens"]) if data["known_output_requests"] else "—"
+            latency = data.get("mean_latency_ms")
+            timing = (f"{latency / 1000:.2f} с" if type(latency) in {int, float} and math.isfinite(latency)
+                      and latency >= 0 else "нет данных")
+            self.usage_status.setText(
+                f"Локальный ИИ · сегодня · UTC+5\nЗапросы: {data['requests']} · Успешно: {data['successful']} · Ошибки: {data['failed']}\n"
+                f"Известные токены: вход {inputs} / выход {outputs} · Неполные данные: {data['unknown_usage_requests']}\n"
+                f"Среднее время ответа: {timing}")
+        except Exception:
+            self.usage_status.setText("Статистика локального ИИ недоступна. Основные команды продолжают работать.")
+
+    def _run_integration(self, function, done):
+        """Keep optional provider I/O off both Qt and the command worker."""
+        if self._integration_busy:
+            return False
+        self._integration_busy = True
+        worker = Worker(function)
+        self._integration_workers.add(worker)
+
+        def finished(value):
+            self._integration_workers.discard(worker)
+            self._integration_busy = False
+            done(value)
+            if self._quitting:
+                self._stop_phone_integrations()
+
+        def failed(_error_class):
+            self._integration_workers.discard(worker)
+            self._integration_busy = False
+            self._phone_state = {"reason": "unavailable"}
+            self._delivery_state = {"telegram": "unavailable", "calls": "unavailable"}
+            if self._quitting:
+                self._stop_phone_integrations()
+            else:
+                self._update_phone_status()
+
+        worker.signals.done.connect(finished)
+        worker.signals.failed.connect(failed)
+        self._integration_pool.start(worker)
+        return True
+
+    def _start_phone_integrations(self):
+        def initialize():
+            from desktop.phone import OrganizerPhoneAdapter, PhoneServer
+            from desktop.phone_delivery import PhoneDelivery
+            server = PhoneServer(api=OrganizerPhoneAdapter(self.core.organizer), state_dir=self.core.store.state_dir)
+            delivery = PhoneDelivery(self.core.store.state_dir)
+            if not self._quitting:
+                server.start()  # An absent/invalid opt-in leaves this disabled.
+            return server, delivery, server.status(), delivery.status()
+
+        def ready(result):
+            self._phone_server, self._phone_delivery, self._phone_state, self._delivery_state = result
+            if not self._quitting:
+                self._update_phone_status()
+                self._schedule_phone_work()
+
+        self.phone_status.setText("Проверяю настройки локального моста…")
+        self._run_integration(initialize, ready)
+
+    def _update_phone_status(self):
+        # Project fixed labels only. Provider dictionaries can contain URLs;
+        # none of their values are copied verbatim into the interface or logs.
+        if self._phone_state.get("running"):
+            message = ("Локальный мост готов; защищённое подключение ещё не проверено."
+                       if self._phone_state.get("transport") == "https_proxy_not_verified" else
+                       "Локальный мост готов; для iPhone нужно зашифрованное подключение.")
+        elif self._phone_state.get("enabled") or self._phone_state.get("reason") == "unavailable":
+            message = "Локальный мост недоступен. Проверьте его настройку по инструкции."
+        else:
+            message = "Локальный мост не настроен. Основные функции JARVIS работают без телефона."
+        self.phone_status.setText(message)
+        telegram = ("Telegram: настроен для отправки; получение не подтверждено."
+                    if self._delivery_state.get("telegram") == "configured" else "Telegram: не подключён.")
+        calls = ("Звонки: настроены; ответ и прослушивание не подтверждены."
+                 if self._delivery_state.get("calls") == "configured" else "Звонки: не подключены.")
+        self.phone_delivery_status.setText(telegram + "\n" + calls)
+
+    def _open_phone_setup(self):
+        path = Path(__file__).resolve().parent.parent / "HANDSFREE.md"
+        if not path.is_file() or not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            self.status.setText("Инструкция HANDSFREE.md должна находиться в комплекте приложения.")
+
+    def _poll_phone_integrations(self):
+        if self._quitting or not self._integrations_enabled:
+            return
+        if self._phone_state.get("running") and self._view_index == self.PLAN_PAGE:
+            # PlanPanel preserves unsaved item/routine editors. Phone mutations
+            # only refresh the actual dated plan, not the whole chat or form.
+            self.plan.refresh()
+        self._schedule_phone_work()
+
+    def _schedule_phone_work(self):
+        if self._quitting or self._integration_busy or self._phone_delivery is None:
+            return
+        configured = any(self._delivery_state.get(key) == "configured" for key in ("telegram", "calls"))
+        if not configured:
+            self._phone_notifications.clear()
+            return
+        pending = self._delivery_state.get("counts", {}).get("pending", 0)
+        if not self._phone_notifications and not (type(pending) is int and pending > 0):
+            return
+        notifications, self._phone_notifications = self._phone_notifications, []
+        delivery = self._phone_delivery
+
+        def deliver():
+            state = delivery.status()
+            for event_id, text, validator, evening in notifications:
+                if validator():
+                    delivery.enqueue(event_id, text, is_current=validator,
+                                     call=evening and state.get("calls") == "configured")
+            state = delivery.status()
+            if (any(state.get(key) == "configured" for key in ("telegram", "calls"))
+                    and state.get("counts", {}).get("pending", 0) > 0):
+                state = delivery.process_pending()
+            return state
+
+        def delivered(state):
+            self._delivery_state = state
+            if not self._quitting:
+                self._update_phone_status()
+                if self._phone_notifications:
+                    self._schedule_phone_work()
+
+        self._run_integration(deliver, delivered)
+
+    def _stop_phone_integrations(self):
+        if self._phone_stop_complete or self._integration_busy:
+            return
+        if self._phone_server is None:
+            self._phone_stop_complete = True
+            return
+
+        def stopped(_result):
+            self._phone_stop_complete = True
+
+        def stop():
+            try:
+                self._phone_server.stop()
+            except Exception:
+                pass  # Optional cleanup must not trap the window in shutdown.
+
+        self._run_integration(stop, stopped)
+
+    def _multilingual_changed(self, enabled):
+        previous = bool(self.preferences.get("multilingual_stt_enabled", False))
+        was_listening = self.listening or self._capture_requested
+        if was_listening:
+            self.stop_listening()  # Invalidate callbacks from the old ASR session.
+        if not self.save_preference("multilingual_stt_enabled", enabled):
+            self._set_checked_silently(self.multilingual_toggle, previous)
+        if was_listening:
+            self.start_listening()
+
     def save_preference(self, key, value):
         try:
             self.preferences = self.core.store.set_preferences({key: value})
@@ -741,7 +1459,7 @@ class MainWindow(QMainWindow):
         if key == "speech_enabled" and hasattr(self, "voice"):
             self.voice.speech_enabled = bool(value)
             self.voice_sample.setEnabled(bool(value))
-        if key in {"speech_enabled", "voice_engine", "voice_rate"} and hasattr(self, "voice"):
+        if key in {"speech_enabled", "voice_engine", "voice_character", "voice_rate", "multilingual_stt_enabled"} and hasattr(self, "voice"):
             apply_preferences = getattr(self.voice, "apply_preferences", None)
             if callable(apply_preferences):
                 apply_preferences(dict(self.preferences))
@@ -749,6 +1467,43 @@ class MainWindow(QMainWindow):
             if callable(prepare):
                 prepare()
         return True
+
+    def _voice_engine_changed(self, _index):
+        personal = self.voice_engine.currentData() == "expressive"
+        for widget in (self.voice_character_label, self.voice_character):
+            widget.setVisible(personal)
+        self.voice_personal_license.setVisible(self.voice_engine.currentData() in {"expressive", "clone"})
+        self.save_preference("voice_engine", self.voice_engine.currentData())
+
+    def _activity_monitor_changed(self, enabled):
+        previous = bool(self.preferences.get("activity_monitor_enabled", False))
+        if self.save_preference("activity_monitor_enabled", enabled):
+            self.core.reset_observations()
+            self.plan.refresh_evidence(self.core.observation_summary())
+        else:
+            self._set_checked_silently(self.activity_monitor_toggle, previous)
+
+    def _plan_changed(self):
+        self.refresh()
+        self._poll_organizer_events("interaction")
+
+    def _organizer_preference_changed(self, key, value):
+        if self.save_preference(key, value):
+            self._sync_organizer_preferences()
+            self._poll_organizer_events("interaction")
+
+    def _sync_organizer_preferences(self):
+        controls = [("organizer_enabled", self.organizer_toggle, True),
+                    ("morning_brief_enabled", self.morning_toggle, True),
+                    ("evening_plan_enabled", self.evening_toggle, True),
+                    ("organizer_paused", self.organizer_pause_toggle, False),
+                    ("organizer_dnd", self.organizer_dnd_toggle, False)]
+        for key, control, default in controls:
+            self._set_checked_silently(control, self.preferences.get(key, default))
+        blocked = self.evening_time.blockSignals(True)
+        self.evening_time.setTime(QTime.fromString(self.preferences.get("evening_plan_time", "22:00"), "HH:mm"))
+        self.evening_time.blockSignals(blocked)
+        self.evening_time.setEnabled(self.preferences.get("evening_plan_enabled", True))
 
     @staticmethod
     def _set_checked_silently(control, value):
@@ -820,6 +1575,8 @@ class MainWindow(QMainWindow):
             "not_prepared": "Голос ещё подготавливается; ответы доступны текстом.",
             "neural": "Используется локальный нейроголос.",
             "windows": "Используется установленный голос Windows.",
+            "expressive": "Используется выразительный голос для личного использования.",
+            "clone": "Используется голос по личному образцу (личное использование).",
             "unavailable": "Озвучивание недоступно; ответ доступен текстом.",
         }
         self.voice_backend_status.setText(labels.get(state.get("speech_backend"), "Источник голоса определяется при подготовке."))
@@ -859,26 +1616,73 @@ class MainWindow(QMainWindow):
         self.status.setText("Формирую ответ…")
 
     def _poll_reminders(self):
-        if self._quitting or self.busy:
+        if self._quitting:
+            return
+        sample = getattr(self.core, "poll_observations", None)
+        if callable(sample):
+            changed = sample()
+            if changed and self._view_index == self.PLAN_PAGE:
+                self.plan.refresh_evidence(self.core.observation_summary())
+        if self.busy:
             return
         due = getattr(self.core, "due_reminders", None)
-        if due is None:
-            return
         try:
-            replies = due()
+            replies = due() if callable(due) else []
         except Exception:
             self.status.setText("Не удалось проверить напоминания")
+            replies = []
+        self._deliver_notifications(replies)
+        self._poll_organizer_events("tick")
+
+    def _poll_organizer_events(self, trigger="tick"):
+        if self._quitting or self.busy:
             return
-        if not replies:
+        due = getattr(self.core, "due_events", None)
+        if not callable(due):
             return
-        # Reminders are data. Never send their text back through command
-        # authorization and never disturb a pending PC confirmation card.
+        try:
+            replies = due(trigger=trigger)
+        except Exception:
+            self.status.setText("Не удалось подготовить обращение по плану")
+            return
+        self._deliver_notifications(replies)
+
+    def _deliver_notifications(self, replies):
+        if not replies or self._quitting:
+            return
         self.refresh()
         for reply in replies:
+            event = getattr(reply, "organizer_event", None)
+            def is_current(message=reply):
+                if self._quitting:
+                    return False
+                checker = getattr(self.core, "event_is_current", None)
+                if not callable(checker):
+                    return False
+                try:
+                    return bool(checker(message))
+                except Exception:
+                    return False
+            if event is not None and not is_current():
+                continue
+            if (self._integrations_enabled and isinstance(event, dict)
+                    and isinstance(event.get("id"), str)):
+                # Only explicit organizer events are forwarded. No commands,
+                # notes, model previews or general chat enter this outbox.
+                self._phone_notifications.append((event["id"], reply.text, is_current, event.get("kind") == "evening"))
+                self._phone_notifications = self._phone_notifications[-100:]
             if self.tray:
-                self.tray.showMessage("JARVIS · напоминание", reply.text[:500], QSystemTrayIcon.MessageIcon.Information, 8000)
+                title = "JARVIS · план" if event is not None else "JARVIS · напоминание"
+                self.tray.showMessage(title, reply.text[:500], QSystemTrayIcon.MessageIcon.Information, 8000)
             if reply.speak and self.preferences.get("speech_enabled", True):
-                self.voice.say(reply.text)
+                say_event = getattr(self.voice, "say_event", None)
+                if event is not None and callable(say_event):
+                    say_event(reply.text, is_current=is_current)
+                else:
+                    # Legacy/fake voices still receive only events validated
+                    # immediately above; current speech backends recheck at play.
+                    self.voice.say(reply.text)
+        self._schedule_phone_work()
 
     def _run(self, function, done, *, on_error=None):
         worker = Worker(function)
@@ -954,6 +1758,7 @@ class MainWindow(QMainWindow):
         if reply.speak and self.preferences.get("speech_enabled", True):
             self.voice.say(reply.text)
         self.command.setFocus()
+        self._poll_organizer_events("interaction")
 
     def confirm_action(self):
         if not self._confirmation or self.busy:
@@ -1062,6 +1867,8 @@ class MainWindow(QMainWindow):
         self.mic_button.setText("Выключить микрофон" if self.listening else "Микрофон")
         if self.listening:
             self.status.setText("Ожидаю «Джарвис»")
+        elif not self._capture_failed and self.status.text() == "Запускаю микрофон…":
+            self.status.setText("Микрофон не запущен. Повторите включение, когда прежний сеанс завершится.")
 
     def stop_listening(self):
         self._capture_requested = False
@@ -1110,7 +1917,7 @@ class MainWindow(QMainWindow):
         self.close()
 
     def _finish_close(self):
-        if self.pool.activeThreadCount() == 0:
+        if self.pool.activeThreadCount() == 0 and not self._integration_workers and self._phone_stop_complete:
             self._close_timer.stop()
             self.close()
 
@@ -1124,17 +1931,25 @@ class MainWindow(QMainWindow):
             return
         self._quitting = True
         self._reminder_timer.stop()
+        self._integration_timer.stop()
+        self._phone_notifications.clear()
+        self._stop_phone_integrations()
         self._clear_stream_preview()
+        self.stop_listening()
         if self._voice_rate_timer.isActive():
             self._voice_rate_timer.stop()
             # Save the final slider position without queueing voice warmup
             # while the application is shutting down.
-            self.preferences = self.core.store.set_preferences({"voice_rate": self.voice_rate.value()})
-        self.stop_listening()
+            try:
+                self.preferences = self.core.store.set_preferences({"voice_rate": self.voice_rate.value()})
+            except Exception:
+                # An optional final preference must not keep capture running
+                # or prevent shutdown when local storage is unavailable.
+                pass
         # Stop queued work immediately; let an already-running bounded adapter
         # finish without freezing the UI or closing its database under it.
         self.pool.clear()
-        if self.pool.activeThreadCount():
+        if self.pool.activeThreadCount() or self._integration_workers or not self._phone_stop_complete:
             self.setEnabled(False)
             self.status.setText("Завершаю текущее действие. Микрофон выключен.")
             self._close_timer.start()
