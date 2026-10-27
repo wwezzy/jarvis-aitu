@@ -1,4 +1,4 @@
-"""Local, explicitly activated desktop interface. No cloud or microphone at startup."""
+"""Local desktop interface with explicit persisted voice and startup opt-ins."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -6,9 +6,9 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QKeySequence, QLinearGradient, QPainter, QPen, QPixmap, QRadialGradient, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMenu, QPlainTextEdit, QPushButton, QScrollArea, QStackedWidget,
-    QSystemTrayIcon, QVBoxLayout, QWidget,
+    QSlider, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
 
@@ -44,6 +44,10 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QCheckBox { spacing: 10px; padding: 8px 0; }
 QCheckBox::indicator { width: 18px; height: 18px; border: 1px solid #4d6880; border-radius: 4px; background: #0b1523; }
 QCheckBox::indicator:checked { background: #79e2d2; border-color: #79e2d2; }
+QComboBox { background: #0b1523; border: 1px solid #2b4057; border-radius: 9px; padding: 9px; }
+QComboBox QAbstractItemView { background: #101c2c; color: #dbe6f3; selection-background-color: #255253; }
+QSlider::groove:horizontal { height: 4px; background: #2b4057; border-radius: 2px; }
+QSlider::handle:horizontal { background: #79e2d2; border: 1px solid #a4f5e8; width: 16px; margin: -6px 0; border-radius: 8px; }
 QToolTip { background: #18283c; color: #edf7ff; border: 1px solid #375572; padding: 6px; }
 """
 
@@ -133,9 +137,10 @@ class Orb(QWidget):
 
 
 class Events(QObject):
-    recognized = Signal(str)
+    recognized = Signal(int, str)
     voice_state = Signal(str)
     progress = Signal(str)
+    stream_chunk = Signal(int, str)
 
 
 class WorkerSignals(QObject):
@@ -159,6 +164,7 @@ class Worker(QRunnable):
 
 class MainWindow(QMainWindow):
     SETTINGS_PAGE = 4
+    MAX_PREVIEW_CHARS = 22000
 
     def __init__(self, core, voice_factory=None, model_dir: Path | None = None, enable_tray: bool = True, personal_path: Path | None = None):
         super().__init__()
@@ -172,15 +178,30 @@ class MainWindow(QMainWindow):
         self._workers = set()
         self.busy = False
         self.listening = False
+        self._capture_session = 0
+        self._capture_requested = False
         self._quitting = False
+        self._resources_closed = False
         self._capture_failed = False
         self._capture_error = None
+        self._request_serial = 0
+        self._active_stream_id = None
+        self._stream_buffer = ""
+        self._stream_timer = QTimer(self)
+        self._stream_timer.setSingleShot(True)
+        self._stream_timer.setInterval(50)
+        self._stream_timer.timeout.connect(self._flush_stream_preview)
+        self._voice_rate_timer = QTimer(self)
+        self._voice_rate_timer.setSingleShot(True)
+        self._voice_rate_timer.setInterval(200)
+        self._voice_rate_timer.timeout.connect(self._commit_voice_rate)
         self._close_timer = QTimer(self)
         self._close_timer.setInterval(100)
         self._close_timer.timeout.connect(self._finish_close)
         self._confirmation = None
         self._tray_notice_shown = False
         self._view_index = 0
+        self._startup_pending = False
         self.tray = None
         self.voice_factory = voice_factory
         self.preferences = self.core.snapshot().get("preferences", {})
@@ -190,9 +211,10 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(860, 620)
         self.setStyleSheet(STYLE)
         self._build()
-        self.events.recognized.connect(self._voice_command)
+        self.events.recognized.connect(self._recognized_for_session)
         self.events.voice_state.connect(self._voice_state)
         self.events.progress.connect(self._model_progress)
+        self.events.stream_chunk.connect(self._receive_stream_chunk)
         self.voice = self._new_voice()
         if enable_tray and QSystemTrayIcon.isSystemTrayAvailable():
             self.tray = QSystemTrayIcon(self.windowIcon(), self)
@@ -213,15 +235,33 @@ class MainWindow(QMainWindow):
         self._reminder_timer.setInterval(1000)
         self._reminder_timer.timeout.connect(self._poll_reminders)
         self._reminder_timer.start()
+        if self.preferences.get("voice_enabled", False):
+            QTimer.singleShot(0, self.start_listening)
 
     def _new_voice(self):
         factory = self.voice_factory
         if factory is None:
             from desktop.voice import VoiceService
             factory = VoiceService
-        voice = factory(on_text=self.events.recognized.emit, on_state=self.events.voice_state.emit, model_dir=self.model_dir)
+        voice = factory(on_text=self._recognition_callback(self._capture_session), on_state=self.events.voice_state.emit, model_dir=self.model_dir)
         voice.speech_enabled = bool(self.preferences.get("speech_enabled", True))
+        apply_preferences = getattr(voice, "apply_preferences", None)
+        if callable(apply_preferences):
+            apply_preferences(dict(self.preferences))
+        prepare = getattr(voice, "prepare", None)
+        if callable(prepare):
+            prepare()
         return voice
+
+    def _recognition_callback(self, session_id):
+        def recognized(text):
+            if isinstance(text, str):
+                self.events.recognized.emit(session_id, text)
+        return recognized
+
+    def _recognized_for_session(self, session_id, text):
+        if session_id == self._capture_session:
+            self._voice_command(text)
 
     def _build(self):
         root = QWidget()
@@ -309,6 +349,22 @@ class MainWindow(QMainWindow):
         self.history_layout.addStretch()
         self.history_scroll.setWidget(self.history_container)
         layout.addWidget(self.history_scroll, 1)
+        self.stream_preview = QFrame()
+        self.stream_preview.setObjectName("message")
+        preview_layout = QVBoxLayout(self.stream_preview)
+        preview_layout.setContentsMargins(16, 12, 16, 12)
+        preview_layout.addWidget(label("ПРЕДВАРИТЕЛЬНЫЙ ТЕКСТ · ОТВЕТ ЕЩЁ ФОРМИРУЕТСЯ", "eyebrow", True))
+        preview_scroll = QScrollArea()
+        preview_scroll.setWidgetResizable(True)
+        preview_scroll.setMinimumHeight(48)
+        preview_scroll.setMaximumHeight(150)
+        self.stream_text = label("", wrap=True)
+        self.stream_text.setObjectName("streamPreviewText")
+        self.stream_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        preview_scroll.setWidget(self.stream_text)
+        preview_layout.addWidget(preview_scroll)
+        self.stream_preview.hide()
+        layout.addWidget(self.stream_preview)
         self.confirmation = QFrame()
         self.confirmation.setObjectName("confirmation")
         confirm_layout = QVBoxLayout(self.confirmation)
@@ -416,11 +472,56 @@ class MainWindow(QMainWindow):
         self.speech_toggle.setChecked(bool(self.preferences.get("speech_enabled", True)))
         self.speech_toggle.toggled.connect(lambda value: self.save_preference("speech_enabled", value))
         content.addWidget(self.speech_toggle)
+        engine_row = QHBoxLayout()
+        engine_row.addWidget(label("Голос", "muted"))
+        self.voice_engine = QComboBox()
+        self.voice_engine.setObjectName("voiceEngineChoice")
+        self.voice_engine.addItem("Локальный нейроголос, иначе Windows", "auto")
+        self.voice_engine.addItem("Голос Windows", "windows")
+        engine_index = self.voice_engine.findData(self.preferences.get("voice_engine", "auto"))
+        self.voice_engine.setCurrentIndex(max(0, engine_index))
+        self.voice_engine.currentIndexChanged.connect(lambda _index: self.save_preference("voice_engine", self.voice_engine.currentData()))
+        engine_row.addWidget(self.voice_engine, 1)
+        content.addLayout(engine_row)
+        content.addWidget(label("Нейроголос используется только при наличии установленной локальной модели. Иначе отвечает установленный голос Windows. Это не копия голоса актёра.", "muted", True))
+        self.voice_backend_status = label("Источник голоса определяется при подготовке.", "muted", True)
+        self.voice_backend_status.setObjectName("voiceBackendStatus")
+        content.addWidget(self.voice_backend_status)
+        self.voice_rate_label = label("Темп речи", "muted")
+        content.addWidget(self.voice_rate_label)
+        speed_row = QHBoxLayout()
+        speed_row.addWidget(label("Медленнее", "muted"))
+        self.voice_rate = QSlider(Qt.Orientation.Horizontal)
+        self.voice_rate.setObjectName("voiceRateSlider")
+        self.voice_rate.setRange(90, 240)
+        self.voice_rate.setSingleStep(5)
+        self.voice_rate.setPageStep(15)
+        self.voice_rate.setValue(int(self.preferences.get("voice_rate", 185)))
+        self.voice_rate.valueChanged.connect(lambda _value: self._voice_rate_timer.start())
+        self.voice_rate.sliderReleased.connect(self._commit_voice_rate)
+        speed_row.addWidget(self.voice_rate, 1)
+        speed_row.addWidget(label("Быстрее", "muted"))
+        content.addLayout(speed_row)
+        self.voice_sample = button("Послушать пример голоса", self._sample_voice, "quiet")
+        self.voice_sample.setObjectName("voiceSampleButton")
+        self.voice_sample.setEnabled(bool(self.preferences.get("speech_enabled", True)))
+        content.addWidget(self.voice_sample, alignment=Qt.AlignmentFlag.AlignLeft)
         self.tray_toggle = QCheckBox("При закрытии оставлять JARVIS в трее")
         self.tray_toggle.setChecked(bool(self.preferences.get("close_to_tray", True)))
         self.tray_toggle.toggled.connect(lambda value: self.save_preference("close_to_tray", value))
         content.addWidget(self.tray_toggle)
-        content.addWidget(label("Микрофон всегда выключен при запуске. Включите его кнопкой, скажите «Джарвис», затем команду. Голосовое выключение компьютера потребует нажатия подтверждения.", "muted", True))
+        self.auto_listen_toggle = QCheckBox("Слушать «Джарвис» автоматически после запуска")
+        self.auto_listen_toggle.setObjectName("autoListenToggle")
+        self.auto_listen_toggle.setChecked(bool(self.preferences.get("voice_enabled", False)))
+        self.auto_listen_toggle.toggled.connect(self._auto_listen_changed)
+        content.addWidget(self.auto_listen_toggle)
+        self.launch_at_login_toggle = QCheckBox("Запускать JARVIS при входе в Windows")
+        self.launch_at_login_toggle.setObjectName("launchAtLoginToggle")
+        self.launch_at_login_toggle.setChecked(bool(self.preferences.get("launch_at_login", False)))
+        self.launch_at_login_toggle.toggled.connect(self._configure_startup_setting)
+        content.addWidget(self.launch_at_login_toggle)
+        content.addWidget(label("Без автослушания микрофон включается только кнопкой. Автослушание работает, пока JARVIS запущен в вашей пользовательской сессии. Ноутбук должен быть включён: голос не будит его из сна и не включает выключенный компьютер. Микрофон можно выключить кнопкой или в трее.", "muted", True))
+        content.addWidget(label("После включения скажите «Джарвис», затем команду. Распознавание работает локально. Голосовое выключение компьютера потребует отдельного нажатия подтверждения.", "muted", True))
         content.addSpacing(8)
         self.model_status = label("Офлайн-модель распознавания устанавливается отдельно.", "muted", True)
         content.addWidget(self.model_status)
@@ -581,6 +682,7 @@ class MainWindow(QMainWindow):
         self.refresh_notes(snapshot=snapshot)
         if hasattr(self, "voice"):
             state = self.voice.available()
+            self._update_voice_backend_status(state)
             self.model_status.setText("Офлайн-модель установлена. Можно включить микрофон." if state.get("model") else "Для голосового вызова нужна русская офлайн-модель.")
             self.model_button.setEnabled(not state.get("model", False))
 
@@ -632,9 +734,129 @@ class MainWindow(QMainWindow):
             self.preferences = self.core.store.set_preferences({key: value})
         except ValueError:
             self.status.setText("Проверьте значение настройки")
-            return
+            return False
+        except Exception:
+            self.status.setText("Не удалось сохранить настройку")
+            return False
         if key == "speech_enabled" and hasattr(self, "voice"):
             self.voice.speech_enabled = bool(value)
+            self.voice_sample.setEnabled(bool(value))
+        if key in {"speech_enabled", "voice_engine", "voice_rate"} and hasattr(self, "voice"):
+            apply_preferences = getattr(self.voice, "apply_preferences", None)
+            if callable(apply_preferences):
+                apply_preferences(dict(self.preferences))
+            prepare = getattr(self.voice, "prepare", None)
+            if callable(prepare):
+                prepare()
+        return True
+
+    @staticmethod
+    def _set_checked_silently(control, value):
+        blocked = control.blockSignals(True)
+        control.setChecked(bool(value))
+        control.blockSignals(blocked)
+
+    def _auto_listen_changed(self, enabled):
+        previous = bool(self.preferences.get("voice_enabled", False))
+        if not enabled:
+            self.stop_listening()
+        if not self.save_preference("voice_enabled", enabled):
+            self._set_checked_silently(self.auto_listen_toggle, previous)
+            if not enabled:
+                self.status.setText("Микрофон выключен, но настройку автослушания не удалось сохранить")
+            return
+        if enabled:
+            self.start_listening()
+
+    def _configure_startup_setting(self, enabled):
+        if self._startup_pending:
+            return
+        previous = bool(self.preferences.get("launch_at_login", False))
+        self._startup_pending = True
+        self.launch_at_login_toggle.setEnabled(False)
+        self.status.setText("Настраиваю запуск при входе в Windows…")
+        def configure():
+            from desktop.startup import set_startup_enabled
+            result = set_startup_enabled(enabled)
+            if not result.success:
+                return False, result.message, None
+            try:
+                preferences = self.core.store.set_preferences({"launch_at_login": enabled})
+            except Exception:
+                try:
+                    reverted = set_startup_enabled(previous).success
+                except Exception:
+                    reverted = False
+                message = ("Автозапуск возвращён к прежнему состоянию: настройку не удалось сохранить." if reverted else
+                           "Не удалось сохранить настройку и проверить автозапуск. Проверьте его перед повторным входом.")
+                return False, message, None
+            return True, result.message, preferences
+        self._run(configure, lambda result: self._startup_configured(enabled, previous, result),
+                  on_error=lambda _error: self._startup_configured(enabled, previous, (False, "Не удалось подтвердить настройку автозапуска.", None)))
+
+    def _startup_configured(self, enabled, previous, result):
+        self._startup_pending = False
+        success, message, preferences = result
+        if success:
+            self.preferences = preferences
+        if self._quitting:
+            return
+        self._set_checked_silently(self.launch_at_login_toggle, enabled if success else previous)
+        self.launch_at_login_toggle.setEnabled(True)
+        self.status.setText(str(message)[:300])
+
+    def _sample_voice(self):
+        if not self.preferences.get("speech_enabled", True):
+            self.status.setText("Включите голосовые ответы для проверки")
+            return
+        self._commit_voice_rate()
+        self.voice.say("К вашим услугам, сэр. С чего начнём?")
+
+    def _update_voice_backend_status(self, state=None):
+        if not hasattr(self, "voice"):
+            return
+        state = self.voice.available() if state is None else state
+        labels = {
+            "not_prepared": "Голос ещё подготавливается; ответы доступны текстом.",
+            "neural": "Используется локальный нейроголос.",
+            "windows": "Используется установленный голос Windows.",
+            "unavailable": "Озвучивание недоступно; ответ доступен текстом.",
+        }
+        self.voice_backend_status.setText(labels.get(state.get("speech_backend"), "Источник голоса определяется при подготовке."))
+
+    def _commit_voice_rate(self):
+        self._voice_rate_timer.stop()
+        value = self.voice_rate.value()
+        if value != self.preferences.get("voice_rate", 185):
+            self.save_preference("voice_rate", value)
+
+    def _clear_stream_preview(self):
+        self._active_stream_id = None
+        self._stream_timer.stop()
+        self._stream_buffer = ""
+        self.stream_text.setText("")
+        self.stream_preview.hide()
+
+    def _receive_stream_chunk(self, request_id, delta):
+        if self._quitting or not self.busy or request_id != self._active_stream_id:
+            return
+        if not isinstance(delta, str) or not delta:
+            return
+        remaining = self.MAX_PREVIEW_CHARS - len(self._stream_buffer)
+        if remaining <= 0:
+            return
+        self._stream_buffer += delta[:remaining]
+        if not self._stream_timer.isActive():
+            self._stream_timer.start()
+
+    def _flush_stream_preview(self):
+        if self._quitting or not self.busy or self._active_stream_id is None or not self._stream_buffer:
+            return
+        # This is literal, provisional display only: no persistence, speech,
+        # confirmation metadata or command dispatch can originate here.
+        self.stream_text.setText(self._stream_buffer)
+        self.stream_preview.show()
+        self.status.setText("Формирую ответ…")
 
     def _poll_reminders(self):
         if self._quitting or self.busy:
@@ -658,7 +880,7 @@ class MainWindow(QMainWindow):
             if reply.speak and self.preferences.get("speech_enabled", True):
                 self.voice.say(reply.text)
 
-    def _run(self, function, done):
+    def _run(self, function, done, *, on_error=None):
         worker = Worker(function)
         self._workers.add(worker)
         def finished(value):
@@ -668,6 +890,10 @@ class MainWindow(QMainWindow):
             self._workers.discard(worker)
             if self._quitting:
                 return
+            if on_error is not None:
+                on_error(_error_class)
+                return
+            self._clear_stream_preview()
             self.busy = False
             self.send_button.setEnabled(True)
             self.command.setEnabled(True)
@@ -687,15 +913,32 @@ class MainWindow(QMainWindow):
     def submit(self, text, source="typed"):
         if self.busy or not text.strip():
             return
+        interrupt = getattr(self.voice, "interrupt", None)
+        if callable(interrupt):
+            interrupt()
         self.busy = True
         self.command.setEnabled(False)
         self.send_button.setEnabled(False)
         self.status.setText("Выполняю…")
-        self._run(lambda: self.core.handle(text, source=source), self._reply)
+        self._clear_stream_preview()
+        self._request_serial += 1
+        request_id = self._request_serial
+        self._active_stream_id = request_id
+        # Echo the original request immediately. The next persisted refresh
+        # replaces this temporary card without duplicating database records.
+        self.history_layout.addWidget(self._message("user", text))
+        QTimer.singleShot(0, lambda: self.history_scroll.verticalScrollBar().setValue(self.history_scroll.verticalScrollBar().maximum()))
+        def on_chunk(delta):
+            if self._quitting:
+                return False
+            if isinstance(delta, str) and delta:
+                self.events.stream_chunk.emit(request_id, delta[:self.MAX_PREVIEW_CHARS])
+        self._run(lambda: self.core.handle(text, source=source, on_chunk=on_chunk), self._reply)
 
     def _reply(self, reply):
         if self._quitting:
             return
+        self._clear_stream_preview()
         self.busy = False
         self.command.setEnabled(True)
         self.send_button.setEnabled(True)
@@ -746,6 +989,8 @@ class MainWindow(QMainWindow):
             self.submit("запомни " + text)
 
     def _voice_command(self, text):
+        if self._quitting or not self.listening:
+            return
         if self.busy:
             self.status.setText("Дождитесь завершения текущего действия")
             return
@@ -760,12 +1005,14 @@ class MainWindow(QMainWindow):
             # only means the listener thread started, not that capture works.
             self._capture_failed = True
             self._capture_error = text
+            self._capture_requested = False
             self.listening = False
             self.orb.active = False
             self.orb.update()
             self.mic_button.setText("Микрофон")
             self.mic_button.setEnabled(True)
         self.status.setText(text)
+        self._update_voice_backend_status()
         if self.tray:
             self.tray.setToolTip("JARVIS · " + text[:90])
 
@@ -784,14 +1031,32 @@ class MainWindow(QMainWindow):
             self.status.setText(reasons.get(state.get("reason"), "Голос пока недоступен — можно писать команды"))
             return
         self.mic_button.setEnabled(False)
+        self._capture_requested = True
+        self._capture_session += 1
+        session_id = self._capture_session
+        self.voice.on_text = self._recognition_callback(session_id)
         self._capture_failed = False
         self._capture_error = None
         self.status.setText("Запускаю микрофон…")
-        self._run(self.voice.start, self._microphone_started)
+        def start_capture():
+            if self._quitting or session_id != self._capture_session:
+                return False
+            return self.voice.start()
+        self._run(start_capture, lambda result: self._microphone_started(result, session_id))
 
-    def _microphone_started(self, result):
+    def start_listening(self):
+        if self._quitting or self.listening or self._capture_requested:
+            return
+        self.toggle_listening()
+
+    def _microphone_started(self, result, session_id=None):
+        if self._quitting or (session_id is not None and session_id != self._capture_session):
+            if not self._capture_requested:
+                self.voice.stop()
+            return
         self.mic_button.setEnabled(True)
         self.listening = bool(result) and not self._capture_failed
+        self._capture_requested = self.listening
         self.orb.active = self.listening
         self.orb.update()
         self.mic_button.setText("Выключить микрофон" if self.listening else "Микрофон")
@@ -799,6 +1064,9 @@ class MainWindow(QMainWindow):
             self.status.setText("Ожидаю «Джарвис»")
 
     def stop_listening(self):
+        self._capture_requested = False
+        self._capture_session += 1
+        self.listening = False
         self.voice.stop()
         self._capture_error = None
         self.listening = False
@@ -823,7 +1091,10 @@ class MainWindow(QMainWindow):
     def _model_installed(self, path):
         if self._quitting:
             return
-        self.voice.stop()
+        self.stop_listening()
+        close_voice = getattr(self.voice, "close", None)
+        if callable(close_voice):
+            close_voice()
         self.model_dir = Path(path)
         self.voice = self._new_voice()
         self.refresh()
@@ -853,6 +1124,12 @@ class MainWindow(QMainWindow):
             return
         self._quitting = True
         self._reminder_timer.stop()
+        self._clear_stream_preview()
+        if self._voice_rate_timer.isActive():
+            self._voice_rate_timer.stop()
+            # Save the final slider position without queueing voice warmup
+            # while the application is shutting down.
+            self.preferences = self.core.store.set_preferences({"voice_rate": self.voice_rate.value()})
         self.stop_listening()
         # Stop queued work immediately; let an already-running bounded adapter
         # finish without freezing the UI or closing its database under it.
@@ -863,7 +1140,12 @@ class MainWindow(QMainWindow):
             self._close_timer.start()
             event.ignore()
             return
-        self.core.close()
+        if not self._resources_closed:
+            close_voice = getattr(self.voice, "close", None)
+            if callable(close_voice):
+                close_voice()
+            self.core.close()
+            self._resources_closed = True
         if self.tray:
             self.tray.hide()
         event.accept()

@@ -213,3 +213,233 @@ def test_current_question_is_not_paired_with_a_prior_unanswered_user_row(tmp_pat
         {"role": "user", "content": "First completed model question"},
         {"role": "assistant", "content": "First answer"},
     ]
+
+
+def stream_event(content="", *, done=False, reason=None, **message_fields):
+    message = {"role": "assistant", "content": content, **message_fields}
+    result = {"done": done, "message": message}
+    if reason is not None:
+        result["done_reason"] = reason
+    return result
+
+
+class StreamResponse:
+    status = 200
+
+    def __init__(self, events, after_read=None):
+        self.lines = [event if isinstance(event, bytes) else json.dumps(event, ensure_ascii=False).encode() + b"\n"
+                      for event in events]
+        self.read_count = 0
+        self.after_read = after_read
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.closed = True
+
+    def geturl(self):
+        return ENDPOINT
+
+    def read1(self, limit):
+        self.read_count += 1
+        if self.after_read:
+            self.after_read(self.read_count)
+        if not self.lines:
+            return b""
+        line = self.lines.pop(0)
+        if len(line) > limit:
+            self.lines.insert(0, line[limit:])
+        return line[:limit]
+
+
+class StreamOpener:
+    def __init__(self, response):
+        self.response = response
+        self.requests = []
+
+    def open(self, request, timeout):
+        self.requests.append(json.loads(request.data))
+        return self.response
+
+
+def test_stream_delivers_early_deltas_and_returns_validated_final_with_original_context():
+    response = StreamResponse([stream_event("Привет"), stream_event(", сэр."), stream_event(done=True, reason="stop")])
+    opener = StreamOpener(response)
+    received = []
+    history = [{"role": "user", "content": "Earlier question"}, {"role": "assistant", "content": "Earlier answer"}]
+    result = LocalChat(opener=opener).answer("Original followup", history=history,
+        on_chunk=lambda delta: received.append((delta, response.read_count)))
+    assert result == "Привет, сэр."
+    assert received == [("Привет", 1), (", сэр.", 2)]
+    assert response.closed
+    payload = opener.requests[0]
+    assert payload["stream"] is True and payload["think"] is False
+    assert payload["keep_alive"] == "30m" and "tools" not in payload
+    assert payload["messages"][1:-1] == history
+    assert payload["messages"][-1] == {"role": "user", "content": "Original followup"}
+
+
+def test_stream_ignores_thinking_field_and_holds_split_reasoning_wrapper():
+    received = []
+    events = [stream_event(thinking="NEVER SHOW thinking field"), stream_event("<thi"),
+              stream_event("nk>NEVER SHOW wrapped draft"), stream_event("</think>Готовый ответ."),
+              stream_event(done=True, reason="stop")]
+    result = LocalChat(opener=StreamOpener(StreamResponse(events))).answer("Question", on_chunk=received.append)
+    assert result == "Готовый ответ." and received == [result]
+    # Known legacy runtime without an opening tag must not leak its draft.
+    received.clear()
+    legacy = [stream_event("NEVER SHOW unwrapped draft"), stream_event("</think>Final answer"),
+              stream_event(done=True, reason="stop")]
+    result = LocalChat("qwen3:4b", opener=StreamOpener(StreamResponse(legacy))).answer("Question", on_chunk=received.append)
+    assert result == "Final answer" and received == [result]
+
+
+@pytest.mark.parametrize("events", [
+    [b"not JSON\n"], [b"[]\n"], [b'{"done":0,"message":{"content":"bad"}}\n'],
+    [stream_event("partial")],
+    [stream_event("partial"), stream_event(done=True, reason="length")],
+    [stream_event("partial"), stream_event(done=True, reason="cancelled")],
+    [stream_event("partial"), stream_event(done=True, reason="stop", tool_calls=[{"function": {"name": "shutdown"}}])],
+    [stream_event("bad", role="tool")], [stream_event("bad\x00")],
+    [stream_event("<think>unfinished"), stream_event(done=True, reason="stop")],
+    [stream_event("Final", done=True, reason="stop"), stream_event("Extra data after final")],
+    [{"error": "PRIVATE raw diagnostic", "done": True, "message": {"content": "bad"}}],
+], ids=["malformed-json", "array", "wrong-done-type", "no-final", "truncated", "cancelled", "late-tool-call",
+        "wrong-role", "nul", "unfinished-thought", "data-after-final", "error-envelope"])
+def test_invalid_stream_never_returns_a_completed_answer_and_closes_transport(events):
+    response = StreamResponse(events)
+    received = []
+    with pytest.raises(LocalChatUnavailable) as failure:
+        LocalChat(opener=StreamOpener(response)).answer("Question", on_chunk=received.append)
+    assert "PRIVATE" not in str(failure.value)
+    assert response.closed
+
+
+def test_stream_byte_event_and_content_bounds_are_independent(monkeypatch):
+    from desktop import chat
+    received = []
+    monkeypatch.setattr(chat, "MAX_STREAM_LINE_BYTES", 100)
+    with pytest.raises(LocalChatUnavailable, match="byte limit"):
+        LocalChat(opener=StreamOpener(StreamResponse([stream_event("a" * 200)]))).answer("Question", on_chunk=received.append)
+    monkeypatch.setattr(chat, "MAX_STREAM_LINE_BYTES", 65536)
+    monkeypatch.setattr(chat, "MAX_STREAM_BYTES", 100)
+    with pytest.raises(LocalChatUnavailable, match="byte limit"):
+        LocalChat(opener=StreamOpener(StreamResponse([stream_event("first"), stream_event("second")]))).answer("Question", on_chunk=received.append)
+    monkeypatch.setattr(chat, "MAX_STREAM_BYTES", 262144)
+    monkeypatch.setattr(chat, "MAX_STREAM_EVENTS", 2)
+    with pytest.raises(LocalChatUnavailable, match="event limit"):
+        LocalChat(opener=StreamOpener(StreamResponse([stream_event("1"), stream_event("2"), stream_event("3")]))).answer("Question", on_chunk=received.append)
+    # Exactly the maximum number of events is accepted when followed by EOF.
+    assert LocalChat(opener=StreamOpener(StreamResponse([stream_event("OK"), stream_event(done=True)]))).answer("Question", on_chunk=lambda _: None) == "OK"
+    monkeypatch.setattr(chat, "MAX_STREAM_EVENTS", 2048)
+    with pytest.raises(LocalChatUnavailable, match="content limit"):
+        LocalChat(opener=StreamOpener(StreamResponse([stream_event("a" * 8000), stream_event("b" * 5000)]))).answer("Question", on_chunk=received.append)
+
+
+def test_stream_has_whole_response_deadline_not_reset_per_event(monkeypatch):
+    from desktop import chat
+    clock = [1000.0]
+    monkeypatch.setattr(chat.time, "monotonic", lambda: clock[0])
+
+    def advance(count):
+        clock[0] += 0.6
+
+    response = StreamResponse([stream_event("first"), stream_event("second"), stream_event(done=True)], after_read=advance)
+    received = []
+    with pytest.raises(LocalChatUnavailable, match="time limit"):
+        LocalChat(timeout=1, opener=StreamOpener(response)).answer("Question", on_chunk=received.append)
+    assert received == ["first"]
+    assert response.closed
+
+
+def test_stream_callback_cancellation_or_failure_aborts_without_raw_error_disclosure():
+    for callback in (lambda _: False, lambda _: (_ for _ in ()).throw(RuntimeError("PRIVATE callback details"))):
+        response = StreamResponse([stream_event("first"), stream_event(done=True)])
+        with pytest.raises(LocalChatUnavailable) as failure:
+            LocalChat(opener=StreamOpener(response)).answer("Question", on_chunk=callback)
+        assert "PRIVATE" not in str(failure.value)
+        assert response.closed and response.read_count == 1
+
+
+def test_prewarm_uses_only_model_metadata_and_no_prompt_or_history():
+    opener = FakeOpener("", "load")
+    assert LocalChat(opener=opener).prewarm() is True
+    payload = opener.requests[0]
+    assert payload["messages"] == []
+    assert payload["stream"] is False and payload["think"] is False
+    assert payload["keep_alive"] == "30m" and "tools" not in payload
+    opener = FakeOpener("Unexpected generated answer", "stop")
+    assert LocalChat(opener=opener).prewarm() is False
+    opener = FakeOpener("", "unknown")
+    assert LocalChat(opener=opener).prewarm() is False
+
+
+def test_stream_applies_deadline_to_real_http_socket_and_rejects_wrong_origin():
+    from types import SimpleNamespace
+    from desktop import chat
+    timeouts = []
+    response = StreamResponse([stream_event("OK", done=True)])
+    response.fp = SimpleNamespace(raw=SimpleNamespace(_sock=SimpleNamespace(settimeout=timeouts.append)))
+    assert LocalChat(opener=StreamOpener(response)).answer("Question", on_chunk=lambda _: None) == "OK"
+    assert timeouts and all(0 < value <= 45 for value in timeouts)
+    response = StreamResponse([stream_event("Do not use", done=True)])
+    response.geturl = lambda: "https://external.invalid"
+    with pytest.raises(LocalChatUnavailable, match="Unexpected"):
+        chat.LocalChat(opener=StreamOpener(response)).answer("Question", on_chunk=lambda _: None)
+    assert response.read_count == 0
+
+
+def test_incremental_ndjson_handles_split_utf8_and_multiple_events_in_one_body_read():
+    raw = b"".join(json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n" for event in [
+        stream_event("Привет"), stream_event(", сэр."), stream_event(done=True, reason="stop")])
+    # A UTF-8 character and the JSON framing are both split across raw reads.
+    first_cyrillic = raw.index("П".encode("utf-8"))
+    blocks = [raw[:first_cyrillic + 1], raw[first_cyrillic + 1:first_cyrillic + 2], raw[first_cyrillic + 2:]]
+    response = StreamResponse(blocks)
+    received = []
+    assert LocalChat(opener=StreamOpener(response)).answer("Question", on_chunk=received.append) == "Привет, сэр."
+    assert "".join(received) == "Привет, сэр."
+
+
+def test_real_dribbling_http_body_cannot_extend_whole_stream_deadline(monkeypatch):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+    import time
+    from desktop import chat
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            body = json.dumps(stream_event("slow synthetic body", done=True, reason="stop")).encode() + b"\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                for byte in body:
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                    time.sleep(0.03)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, *_):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setattr(chat, "ENDPOINT", f"http://127.0.0.1:{server.server_port}/api/chat")
+    received = []
+    started = time.monotonic()
+    try:
+        with pytest.raises(chat.LocalChatUnavailable):
+            chat.LocalChat(timeout=1).answer("Synthetic benchmark only", on_chunk=received.append)
+        assert time.monotonic() - started < 2.5
+        assert received == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)

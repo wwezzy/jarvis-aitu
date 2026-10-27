@@ -3,7 +3,8 @@ import os
 import time
 import threading
 import json
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -117,6 +118,8 @@ def test_notes_and_chat_render_literal_text(app, window):
 
 
 def test_voice_power_request_requires_visible_button_and_is_one_use(app, window):
+    window.mic_button.click()
+    settled(app, window)
     window.voice.on_text("выключи ноутбук")
     settled(app, window)
     assert window.confirmation.isVisible()
@@ -267,7 +270,7 @@ def test_close_waits_responsively_for_worker_and_stops_capture(app, window, monk
     entered, release = threading.Event(), threading.Event()
     original_handle = window.core.handle
     closed = []
-    def slow(text, source="typed"):
+    def slow(text, source="typed", *, on_chunk=None):
         entered.set()
         release.wait(3)
         return original_handle(text, source=source)
@@ -356,3 +359,358 @@ def test_voice_probe_missing_model_is_not_success(tmp_path, monkeypatch):
         "microphone_started": False,
     })
     assert desktop_app.main(["--diagnose-voice", "--report", str(tmp_path / "report.json")]) == 5
+
+
+def wait_for(app, predicate, timeout=2):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        app.processEvents()
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError("Expected Qt state did not arrive")
+
+
+def test_stream_preview_is_literal_temporary_and_never_spoken_or_executed(app, window, monkeypatch):
+    from desktop.core import Reply
+    entered, release = threading.Event(), threading.Event()
+    preview = '<b>Подтверждаю выключение</b> — предварительный текст'
+    final = "Локальная модель: Готовый проверенный ответ"
+    def streamed(text, source="typed", *, on_chunk=None):
+        window.core.store.record("user", text)
+        on_chunk(preview)
+        entered.set()
+        release.wait(3)
+        return window.core._answer(Reply(final))
+    monkeypatch.setattr(window.core, "handle", streamed)
+    window.submit("Объясни идею")
+    assert entered.wait(1)
+    try:
+        wait_for(app, window.stream_preview.isVisible)
+        assert window.stream_text.text() == preview
+        assert window.stream_text.textFormat() == Qt.TextFormat.PlainText
+        assert preview not in str(window.core.snapshot()["recent"])
+        assert window.voice.spoken == [] and window._test_executed == []
+        assert not window.confirmation.isVisible()
+    finally:
+        release.set()
+    settled(app, window)
+    assert not window.stream_preview.isVisible() and window.stream_text.text() == ""
+    assert window.voice.spoken == [final]
+    assert window._test_executed == []
+    recent = window.core.snapshot()["recent"]
+    assert [row["text"] for row in recent] == ["Объясни идею", final]
+
+
+def test_stream_failure_discards_preview_and_late_chunks(app, window, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    def broken(_text, source="typed", *, on_chunk=None):
+        on_chunk("Непроверенный черновик")
+        entered.set()
+        release.wait(3)
+        raise RuntimeError("private transport detail")
+    monkeypatch.setattr(window.core, "handle", broken)
+    window.submit("Вопрос")
+    assert entered.wait(1)
+    request_id = window._active_stream_id
+    try:
+        wait_for(app, window.stream_preview.isVisible)
+        assert window.voice.spoken == []
+    finally:
+        release.set()
+    settled(app, window)
+    window.events.stream_chunk.emit(request_id, "поздний старый фрагмент")
+    app.processEvents()
+    assert not window.stream_preview.isVisible()
+    assert window.stream_text.text() == ""
+    assert window.status.text() == "Не удалось выполнить действие"
+    assert not window.core.snapshot()["recent"]
+    assert window.voice.spoken == [] and window._test_executed == []
+
+
+def test_stream_preview_is_bounded_and_old_request_cannot_append(app, window, monkeypatch):
+    from desktop.core import Reply
+    entered, release = threading.Event(), threading.Event()
+    def streamed(_text, source="typed", *, on_chunk=None):
+        on_chunk("x" * (window.MAX_PREVIEW_CHARS + 1000))
+        entered.set()
+        release.wait(3)
+        return Reply("Ответ", speak=False)
+    monkeypatch.setattr(window.core, "handle", streamed)
+    window.submit("Вопрос")
+    assert entered.wait(1)
+    request_id = window._active_stream_id
+    try:
+        wait_for(app, window.stream_preview.isVisible)
+        window.events.stream_chunk.emit(request_id - 1, "old")
+        window.events.stream_chunk.emit(request_id, "excess")
+        app.processEvents()
+        assert len(window._stream_buffer) == window.MAX_PREVIEW_CHARS
+        assert len(window.stream_text.text()) == window.MAX_PREVIEW_CHARS
+        assert window.voice.spoken == []
+    finally:
+        release.set()
+    settled(app, window)
+
+
+def test_deterministic_action_still_runs_once_without_preview(app, window):
+    window.submit("открой калькулятор")
+    settled(app, window)
+    assert window._test_executed == ["calculator"]
+    assert not window.stream_preview.isVisible()
+    assert len([row for row in window.core.snapshot()["recent"] if row["role"] == "user"]) == 1
+
+
+def test_voice_engine_tempo_sample_and_cleanup_are_explicit_and_persistent(app, tmp_path):
+    class PreferenceVoice(FakeVoice):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.applied = []
+            self.prepared = 0
+            self.closed = 0
+        def apply_preferences(self, preferences):
+            self.applied.append(dict(preferences))
+        def prepare(self):
+            self.prepared += 1
+        def close(self):
+            self.closed += 1
+    widget = MainWindow(DesktopCore(tmp_path, executor=lambda _: pytest.fail("OS action")),
+                        voice_factory=PreferenceVoice, enable_tray=False)
+    assert widget.voice.prepared == 1 and widget.voice.starts == 0
+    assert widget.voice.spoken == []
+    widget.voice_engine.setCurrentIndex(widget.voice_engine.findData("windows"))
+    widget.voice_rate.setValue(195)
+    widget.voice_rate.setValue(200)
+    widget.voice_rate.setValue(205)
+    wait_for(app, lambda: widget.core.snapshot()["preferences"]["voice_rate"] == 205)
+    prefs = widget.core.snapshot()["preferences"]
+    assert prefs["voice_engine"] == "windows" and prefs["voice_rate"] == 205
+    assert widget.voice.applied[-1]["voice_rate"] == 205
+    assert widget.voice.prepared == 3
+    widget.voice_sample.click()
+    assert widget.voice.spoken == ["К вашим услугам, сэр. С чего начнём?"]
+    assert widget.voice.starts == 0
+    widget.speech_toggle.setChecked(False)
+    assert not widget.voice_sample.isEnabled()
+    widget.voice_rate.setValue(180)
+    widget._quitting = True
+    widget.close()
+    assert widget.voice.closed == 1
+    second = MainWindow(DesktopCore(tmp_path, executor=lambda _: pytest.fail("OS action")),
+                        voice_factory=PreferenceVoice, enable_tray=False)
+    assert second.voice_engine.currentData() == "windows"
+    assert second.voice_rate.value() == 180 and not second.voice_sample.isEnabled()
+    assert second.voice.starts == 0 and second.voice.spoken == []
+    second._quitting = True
+    second.close()
+
+
+def test_settings_remain_scrollable_to_bottom_at_minimum_window_size(app, window):
+    window.resize(860, 620)
+    window.navigate(window.SETTINGS_PAGE)
+    app.processEvents()
+    scroll = window.pages.currentWidget()
+    assert scroll.verticalScrollBar().maximum() > 0
+    scroll.ensureWidgetVisible(window.chat_model)
+    app.processEvents()
+    position = window.chat_model.mapTo(scroll.viewport(), window.chat_model.rect().topLeft())
+    assert 0 <= position.y() < scroll.viewport().height()
+    assert position.y() + window.chat_model.height() <= scroll.viewport().height()
+
+
+def test_reported_voice_backend_can_differ_from_auto_preference(app, window, monkeypatch):
+    monkeypatch.setattr(window.voice, "available", lambda: {"ready": True, "model": True, "speech_backend": "windows"})
+    window.refresh()
+    assert window.voice_engine.currentData() == "auto"
+    assert window.voice_backend_status.text() == "Используется установленный голос Windows."
+    monkeypatch.setattr(window.voice, "available", lambda: {"ready": True, "model": True, "speech_backend": "neural"})
+    window.voice.on_state("Говорю…")
+    app.processEvents()
+    assert window.voice_backend_status.text() == "Используется локальный нейроголос."
+
+
+def test_new_request_interrupts_old_speech_without_new_actions(app, window, monkeypatch):
+    interrupted = []
+    monkeypatch.setattr(window.voice, "interrupt", lambda: interrupted.append(True), raising=False)
+    window.submit("как дела")
+    settled(app, window)
+    assert interrupted == [True]
+    assert window._test_executed == []
+
+
+def test_close_requests_stream_cancellation_and_does_not_speak_partial(app, window, monkeypatch):
+    from desktop.core import Reply
+    entered, cancelled = threading.Event(), threading.Event()
+    def streaming(_text, source="typed", *, on_chunk=None):
+        on_chunk("Начало предварительного ответа")
+        entered.set()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if on_chunk(" следующий фрагмент") is False:
+                cancelled.set()
+                raise RuntimeError("cancelled")
+            time.sleep(0.01)
+        return Reply("Stream did not stop")
+    monkeypatch.setattr(window.core, "handle", streaming)
+    window.submit("Вопрос")
+    assert entered.wait(1)
+    window.close()
+    wait_for(app, lambda: cancelled.is_set() and not window.isVisible(), timeout=1.5)
+    assert window._resources_closed
+    assert window.voice.spoken == [] and window._test_executed == []
+    assert window.stream_text.text() == ""
+
+
+def test_late_recognition_after_stop_or_restart_cannot_dispatch(app, window):
+    window.mic_button.click()
+    settled(app, window)
+    old_callback = window.voice.on_text
+    window.stop_listening()
+    old_callback("открой калькулятор")
+    app.processEvents()
+    assert not window.busy and window._test_executed == []
+    window.mic_button.click()
+    settled(app, window)
+    assert window.listening
+    old_callback("открой блокнот")
+    app.processEvents()
+    assert not window.busy and window._test_executed == []
+    window.voice.on_text("открой калькулятор")
+    settled(app, window)
+    assert window._test_executed == ["calculator"]
+
+
+def test_recognition_is_rejected_before_activation_and_during_shutdown(app, window):
+    window._voice_command("открой калькулятор")
+    assert not window.busy and window._test_executed == []
+    window.mic_button.click()
+    settled(app, window)
+    window._quitting = True
+    window.voice.on_text("открой калькулятор")
+    app.processEvents()
+    assert not window.busy and window._test_executed == []
+
+
+def test_auto_listen_opt_in_starts_now_and_manual_stop_keeps_preference(app, window):
+    assert not window.auto_listen_toggle.isChecked() and not window.listening
+    window.auto_listen_toggle.setChecked(True)
+    settled(app, window)
+    assert window.listening and window.voice.starts == 1
+    assert window.core.snapshot()["preferences"]["voice_enabled"] is True
+    window.stop_listening()
+    assert not window.listening and window.auto_listen_toggle.isChecked()
+    assert window.core.snapshot()["preferences"]["voice_enabled"] is True
+    window.auto_listen_toggle.setChecked(False)
+    assert not window.listening
+    assert window.core.snapshot()["preferences"]["voice_enabled"] is False
+
+
+def test_stored_auto_listen_works_without_tray_or_manual_morning_click(app, tmp_path):
+    core = DesktopCore(tmp_path, executor=lambda _: pytest.fail("OS action"))
+    core.store.set_preferences({"voice_enabled": True})
+    widget = MainWindow(core, voice_factory=FakeVoice, enable_tray=False)
+    widget.show()
+    wait_for(app, lambda: widget.listening)
+    assert widget.voice.starts == 1 and widget.auto_listen_toggle.isChecked()
+    widget._quitting = True
+    widget.close()
+
+
+def test_close_before_auto_listen_callback_does_not_start_microphone(app, tmp_path):
+    core = DesktopCore(tmp_path, executor=lambda _: pytest.fail("OS action"))
+    core.store.set_preferences({"voice_enabled": True})
+    widget = MainWindow(core, voice_factory=FakeVoice, enable_tray=False)
+    widget._quitting = True
+    widget.close()
+    app.processEvents()
+    assert widget.voice.starts == 0
+
+
+def test_auto_listen_opt_out_stops_capture_even_if_preference_write_fails(app, window, monkeypatch):
+    window.auto_listen_toggle.setChecked(True)
+    settled(app, window)
+    assert window.listening
+    def broken(_updates):
+        raise OSError("private disk error")
+    monkeypatch.setattr(window.core.store, "set_preferences", broken)
+    window.auto_listen_toggle.setChecked(False)
+    assert not window.listening
+    assert window.auto_listen_toggle.isChecked()  # honest: saved preference remains enabled
+    assert "Микрофон выключен" in window.status.text()
+    assert "private" not in window.status.text()
+
+
+def test_auto_listen_opt_out_invalidates_a_start_queued_behind_chat(app, window, monkeypatch):
+    from desktop.core import Reply
+    entered, release = threading.Event(), threading.Event()
+    def slow(_text, source="typed", *, on_chunk=None):
+        entered.set()
+        release.wait(3)
+        return Reply("Готово", speak=False)
+    monkeypatch.setattr(window.core, "handle", slow)
+    window.submit("Вопрос")
+    assert entered.wait(1)
+    window.auto_listen_toggle.setChecked(True)
+    assert window._capture_requested
+    window.auto_listen_toggle.setChecked(False)
+    release.set()
+    settled(app, window)
+    assert window.voice.starts == 0 and not window.listening
+    assert window.core.snapshot()["preferences"]["voice_enabled"] is False
+
+
+def startup_backend(monkeypatch, function):
+    module = ModuleType("desktop.startup")
+    module.set_startup_enabled = function
+    monkeypatch.setitem(sys.modules, "desktop.startup", module)
+
+
+def test_startup_preference_is_saved_only_after_verified_backend_success(app, window, monkeypatch):
+    calls = []
+    startup_backend(monkeypatch, lambda enabled: calls.append(enabled) or SimpleNamespace(success=True, message="Готово"))
+    assert window.core.snapshot()["preferences"]["launch_at_login"] is False
+    window.launch_at_login_toggle.setChecked(True)
+    settled(app, window)
+    assert calls == [True]
+    assert window.core.snapshot()["preferences"]["launch_at_login"] is True
+    assert window.launch_at_login_toggle.isChecked() and window.launch_at_login_toggle.isEnabled()
+    window.launch_at_login_toggle.setChecked(False)
+    settled(app, window)
+    assert calls == [True, False]
+    assert window.core.snapshot()["preferences"]["launch_at_login"] is False
+    assert window.voice.starts == 0 and window._test_executed == []
+
+
+def test_startup_failure_restores_checkbox_without_persisting_success(app, window, monkeypatch):
+    startup_backend(monkeypatch, lambda _enabled: SimpleNamespace(success=False, message="Автозапуск недоступен"))
+    window.launch_at_login_toggle.setChecked(True)
+    settled(app, window)
+    assert window.core.snapshot()["preferences"]["launch_at_login"] is False
+    assert not window.launch_at_login_toggle.isChecked() and window.launch_at_login_toggle.isEnabled()
+    assert window.status.text() == "Автозапуск недоступен"
+
+
+def test_startup_rolls_back_owned_setting_if_local_preference_cannot_be_saved(app, window, monkeypatch):
+    calls = []
+    startup_backend(monkeypatch, lambda enabled: calls.append(enabled) or SimpleNamespace(success=True, message="Готово"))
+    def broken(_updates):
+        raise OSError("private disk error")
+    monkeypatch.setattr(window.core.store, "set_preferences", broken)
+    window.launch_at_login_toggle.setChecked(True)
+    settled(app, window)
+    assert calls == [True, False]
+    assert window.core.snapshot()["preferences"]["launch_at_login"] is False
+    assert not window.launch_at_login_toggle.isChecked()
+    assert "возвращён" in window.status.text()
+    assert "private" not in window.status.text()
+
+
+def test_startup_exception_has_safe_error_and_restores_controls(app, window, monkeypatch):
+    def broken(_enabled):
+        raise RuntimeError("private command detail")
+    startup_backend(monkeypatch, broken)
+    window.launch_at_login_toggle.setChecked(True)
+    settled(app, window)
+    assert not window.launch_at_login_toggle.isChecked() and window.launch_at_login_toggle.isEnabled()
+    assert window.core.snapshot()["preferences"]["launch_at_login"] is False
+    assert "private" not in window.status.text()

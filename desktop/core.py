@@ -63,6 +63,9 @@ _ALIASES = {
     "explorer": ("открой проводник", "открой файлы", "open explorer", "open files"),
     "youtube": ("открой ютуб", "открой youtube", "открой ютьюб", "open youtube"),
     "browser": ("открой браузер", "запусти браузер", "open browser"),
+    "music_open": ("открой яндекс музыку", "открой яндекс музыку в браузере", "open yandex music"),
+    "music_play": ("включи музыку", "включить музыку", "возобнови музыку", "play music", "resume music"),
+    "music_morning": ("включи утреннюю музыку", "утренняя музыка", "play morning music"),
     "volume_up": ("громче", "сделай громче", "увеличь громкость", "volume up", "louder"),
     "volume_down": ("тише", "сделай тише", "уменьши громкость", "volume down", "quieter"),
     "volume_mute": ("без звука", "выключи звук", "отключи звук", "mute"),
@@ -81,6 +84,7 @@ ALIASES = {alias: action for action, aliases in _ALIASES.items() for alias in al
 ACTION_LABELS = {"lock": "блокировку компьютера", "shutdown": "выключение компьютера",
                  "restart": "перезагрузку компьютера", "hibernate": "гибернацию компьютера"}
 HELP = ("Могу открыть YouTube, браузер, блокнот, проводник и калькулятор; изменить громкость, свернуть окна. "
+        "«Открой Яндекс Музыку», «включи музыку» и «включи утреннюю музыку» различают открытие плеера и подтверждённое воспроизведение. "
         "«Разверни окно» разворачивает активное окно, «разверни ютуб» — одно найденное окно браузера с YouTube в заголовке. "
         "Попробуй: «добавь задачу закончить проект», «задачи», «готово 1», «следующий шаг», "
         "«запомни важную мысль», «найди проект», «напомни через 10 минут сделать перерыв», "
@@ -254,7 +258,7 @@ class DesktopCore:
             result = "Обработчик завершился без подтверждения результата. Проверь действие на компьютере."
         return self._answer(Reply(result, action=action))
 
-    def handle(self, text: str, source: str = "typed") -> Reply:
+    def handle(self, text: str, source: str = "typed", *, on_chunk=None) -> Reply:
         if source not in {"typed", "voice"}:
             return Reply("Импортированный текст и ответы ИИ не могут запускать команды компьютера.")
         if not isinstance(text, str) or not text.strip() or len(text) > 20000 or "\x00" in text:
@@ -375,11 +379,12 @@ class DesktopCore:
                 # exclusively earlier completed model-chat exchanges, never
                 # note/task/PC-command/personal-data records or the current row.
                 client = LocalChat(preferences["local_chat_model"])
+                options = {"on_chunk": on_chunk} if on_chunk is not None else {}
                 if preferences["local_chat_history"]:
                     history = self.store.model_chat_history(before_id=request_id)
-                    answer = client.answer(text, history=history)
+                    answer = client.answer(text, history=history, **options)
                 else:
-                    answer = client.answer(text)
+                    answer = client.answer(text, **options)
             except ValueError:
                 return self._answer(Reply("Для локальной модели сократи вопрос до 8000 символов и проверь имя модели в настройках."))
             except LocalChatUnavailable:

@@ -17,6 +17,28 @@ def write_report(path, report):
         path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _warm_local_chat(model):
+    """Optional model load with no question/history and no UI/database access."""
+    try:
+        import socket
+        import time
+        from desktop.chat import LocalChat
+        # The verified launcher may have just started Ollama. Wait only on
+        # this loopback port, on the daemon worker, never on the GUI thread.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", 11434), timeout=0.3):
+                    break
+            except OSError:
+                time.sleep(0.2)
+        else:
+            return
+        LocalChat(model, timeout=20).prewarm()
+    except Exception:
+        pass  # Warm-up failure never prevents commands or application startup.
+
+
 def voice_diagnostics():
     """Probe bundled native runtimes/model without recording or speaking."""
     report = {"kind": "voice-runtime", "microphone_started": False, "imports": {}}
@@ -39,6 +61,18 @@ def voice_diagnostics():
         report["model_loaded"] = False
         report["model_error_class"] = type(error).__name__
         report["model_error_detail"] = str(error)[:700]
+    try:
+        from desktop.neural_speech import NeuralSpeech
+        speech = NeuralSpeech()
+        neural_ready = speech.available() and speech.prepare(rate=185)
+        neural = {"ready": bool(neural_ready), "reason": speech.reason,
+                  "microphone_started": False, "audio_played": False}
+        if neural_ready:
+            pcm, sample_rate = speech.synthesize("Да, сэр", rate=185)
+            neural.update(sample_rate=sample_rate, samples=len(pcm) // 2)
+        report["neural_speech"] = neural
+    except Exception as error:
+        report["neural_speech"] = {"ready": False, "error_class": type(error).__name__}
     return report
 
 
@@ -119,6 +153,12 @@ def main(argv=None):
         window = MainWindow(core, voice_factory=SmokeVoice if args.smoke_test else None,
                             enable_tray=not args.smoke_test,
                             personal_path=personal_path)
+        if not args.smoke_test:
+            preferences = core.store.preferences()
+            if preferences.get("local_chat_enabled") is True:
+                from threading import Thread
+                Thread(target=_warm_local_chat, args=(preferences["local_chat_model"],),
+                       name="JarvisModelWarmup", daemon=True).start()
     except Exception as error:
         # Never reset a newer/corrupt database or silently disappear under
         # pythonw. Exception messages can contain personal content or paths.
