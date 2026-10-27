@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import subprocess
 import uuid
 from pathlib import Path
@@ -11,7 +12,7 @@ from pathlib import Path
 ALLOWED_ACTIONS = frozenset({
     "calculator", "notepad", "explorer", "youtube", "browser", "volume_up",
     "volume_down", "volume_mute", "volume_unmute", "minimize", "minimize_all", "lock",
-    "shutdown", "restart", "hibernate", "cancel_shutdown",
+    "shutdown", "restart", "hibernate", "cancel_shutdown", "maximize", "maximize_youtube",
 })
 RISKY_ACTIONS = frozenset({"lock", "shutdown", "restart", "hibernate"})
 
@@ -95,6 +96,83 @@ def read_audio_status() -> dict:
         return endpoint.read()
 
 
+def _maximize_window(user32, *, youtube_only=False) -> str:
+    """Finite window geometry action; never sends guessed browser/video keys.
+
+    Window class and title identify a candidate, not a verified web origin.
+    Captions are inspected transiently and are not returned, logged or stored.
+    https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-enumwindows
+    """
+    for name in ("GetForegroundWindow", "ShowWindow", "IsZoomed", "SetForegroundWindow"):
+        method = getattr(user32, name)
+        method.restype = ctypes.c_void_p if name == "GetForegroundWindow" else ctypes.c_int
+        method.argtypes = [] if name == "GetForegroundWindow" else [ctypes.c_void_p, ctypes.c_int] if name == "ShowWindow" else [ctypes.c_void_p]
+
+    def youtube_candidate(window):
+        if not user32.IsWindowVisible(window):
+            return False
+        class_name = ctypes.create_unicode_buffer(256)
+        if not user32.GetClassNameW(window, class_name, len(class_name)):
+            return False
+        if class_name.value not in {"Chrome_WidgetWin_1", "MozillaWindowClass"}:
+            return False
+        title = ctypes.create_unicode_buffer(513)
+        if not user32.GetWindowTextW(window, title, len(title)):
+            return False
+        return bool(re.search(r"\byoutube\b|\bютуб\b", title.value, re.IGNORECASE))
+
+    if youtube_only:
+        user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+        user32.IsWindowVisible.restype = ctypes.c_int
+        for name in ("GetClassNameW", "GetWindowTextW"):
+            method = getattr(user32, name)
+            method.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+            method.restype = ctypes.c_int
+        candidates = []
+        inspected, limited = 0, False
+        callback_type = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_ssize_t)
+
+        @callback_type
+        def inspect(window, _parameter):
+            nonlocal inspected, limited
+            inspected += 1
+            if inspected > 512:
+                limited = True
+                return 0
+            if youtube_candidate(window):
+                candidates.append(window)
+            return 1
+
+        user32.EnumWindows.argtypes = [callback_type, ctypes.c_ssize_t]
+        user32.EnumWindows.restype = ctypes.c_int
+        if not user32.EnumWindows(inspect, 0) or limited:
+            return "Не удалось полностью проверить окна. Выбери нужное окно и скажи «разверни окно»."
+        if not candidates:
+            return "Не нашёл видимое окно браузера с «YouTube» в заголовке. Открой нужную вкладку и повтори команду."
+        if len(candidates) != 1:
+            return "Нашёл несколько окон браузера с «YouTube» в заголовке. Выбери нужное и скажи «разверни окно»."
+        window = candidates[0]
+        # Recheck after enumeration in case the selected browser changed tabs
+        # or closed before the geometry action.
+        if not youtube_candidate(window):
+            return "Выбранное окно изменилось. Разворачивание не выполнено; повтори команду."
+    else:
+        window = user32.GetForegroundWindow()
+        if not window:
+            return "Не нашёл активное окно для разворачивания."
+    # ShowWindow returns prior visibility, not operation success. Read back
+    # IsZoomed before claiming a maximized window.
+    user32.ShowWindow(window, 3)
+    if not user32.IsZoomed(window):
+        return "Windows не подтвердила разворачивание окна. Проверь его состояние."
+    user32.SetForegroundWindow(window)
+    target = "окно браузера с «YouTube» в заголовке" if youtube_only else "активное окно"
+    result = f"Развернул {target}."
+    if user32.GetForegroundWindow() != window:
+        result += " Вывод на передний план Windows не подтвердила."
+    return result
+
+
 def execute_windows_action(action: str) -> str:
     if action not in ALLOWED_ACTIONS:
         raise ValueError("Unsupported desktop action")
@@ -113,6 +191,8 @@ def execute_windows_action(action: str) -> str:
         os.startfile("https://www.youtube.com" if action == "youtube" else "https://www.google.com")
         return "Передал открытие YouTube браузеру." if action == "youtube" else "Передал открытие браузеру."
     user32 = ctypes.windll.user32
+    if action in {"maximize", "maximize_youtube"}:
+        return _maximize_window(user32, youtube_only=action == "maximize_youtube")
     if action in {"volume_up", "volume_down", "volume_mute", "volume_unmute"}:
         with _AudioEndpoint() as endpoint:
             before = endpoint.read()

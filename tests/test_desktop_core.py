@@ -34,6 +34,8 @@ def local(tmp_path):
     ("включи звук", "volume_unmute"),
     ("сверни всё", "minimize_all"),
     ("сверни видео", "minimize"),
+    ("Джарвис, разверни ютуб", "maximize_youtube"),
+    ("maximize window", "maximize"),
     ("отмени выключение", "cancel_shutdown"),
 ])
 def test_direct_requests_work_offline_and_reply_after_execution(local, command, action):
@@ -746,3 +748,126 @@ def test_unavailable_personal_section_does_not_invent_empty_current_schedule(tmp
     assert "раздел в копии недоступен" in reply.text
     assert "Копия от 10.10.2026" in reply.text
     assert "свободен" not in reply.text
+
+
+class FakeWindowFunction:
+    def __init__(self, callback):
+        self.callback = callback
+
+    def __call__(self, *args):
+        return self.callback(*args)
+
+
+def fake_window_api(monkeypatch, windows, *, foreground=1, zoom_succeeds=True, focus_succeeds=True):
+    from types import SimpleNamespace
+    from desktop import actions
+    state = {"foreground": foreground, "shown": [], "zoomed": set(), "focus_calls": [], "captions": 0}
+
+    def enumerate_windows(callback, parameter):
+        for handle in windows:
+            if not callback(handle, parameter):
+                return 0
+        return 1
+
+    def fill_text(handle, buffer, maximum, key):
+        if key == "title":
+            state["captions"] += 1
+        buffer.value = windows[handle][key][:maximum - 1]
+        return len(buffer.value)
+
+    def show(handle, command):
+        state["shown"].append((handle, command))
+        if zoom_succeeds:
+            state["zoomed"].add(handle)
+        return 0  # Previously hidden is not a failed operation.
+
+    def foreground_window(handle):
+        state["focus_calls"].append(handle)
+        if focus_succeeds:
+            state["foreground"] = handle
+        return int(focus_succeeds)
+
+    methods = {
+        "GetForegroundWindow": lambda: state["foreground"],
+        "ShowWindow": show, "IsZoomed": lambda handle: handle in state["zoomed"],
+        "SetForegroundWindow": foreground_window,
+        "EnumWindows": enumerate_windows,
+        "IsWindowVisible": lambda handle: windows[handle].get("visible", True),
+        "GetClassNameW": lambda h, b, m: fill_text(h, b, m, "class"),
+        "GetWindowTextW": lambda h, b, m: fill_text(h, b, m, "title"),
+    }
+    api = SimpleNamespace(**{name: FakeWindowFunction(callback) for name, callback in methods.items()})
+    # Pure fake callback wrapper also runs these tests on Ubuntu. No real
+    # user32 entry point or browser state is touched on either platform.
+    monkeypatch.setattr(actions.ctypes, "WINFUNCTYPE", lambda *args: lambda callback: callback, raising=False)
+    return api, state
+
+
+def test_maximize_unique_youtube_browser_class_window_and_readback(monkeypatch):
+    from desktop.actions import _maximize_window
+    windows = {
+        1: {"class": "OtherApp", "title": "Private unrelated title"},
+        2: {"class": "Chrome_WidgetWin_1", "title": "Synthetic clip - YouTube - Browser"},
+        3: {"class": "OtherApp", "title": "YouTube spoofed in unrelated application"},
+        4: {"class": "MozillaWindowClass", "title": "YouTube", "visible": False},
+    }
+    api, state = fake_window_api(monkeypatch, windows)
+    reply = _maximize_window(api, youtube_only=True)
+    assert state["shown"] == [(2, 3)] and state["focus_calls"] == [2]
+    assert "Развернул окно браузера с «YouTube» в заголовке" in reply
+    assert "Synthetic clip" not in reply and "Private unrelated title" not in reply
+    assert "полноэкран" not in reply
+
+
+def test_maximize_youtube_ambiguous_or_missing_does_not_touch_windows(monkeypatch):
+    from desktop.actions import _maximize_window
+    for windows, expected in (
+        ({1: {"class": "OtherApp", "title": "YouTube"}}, "Не нашёл"),
+        ({1: {"class": "Chrome_WidgetWin_1", "title": "YouTube A"},
+          2: {"class": "MozillaWindowClass", "title": "YouTube B"}}, "несколько"),
+    ):
+        api, state = fake_window_api(monkeypatch, windows)
+        assert expected in _maximize_window(api, youtube_only=True)
+        assert state["shown"] == [] and state["focus_calls"] == []
+
+
+def test_maximize_only_claims_zoom_and_focus_when_read_back(monkeypatch):
+    from desktop.actions import _maximize_window
+    windows = {2: {"class": "Chrome_WidgetWin_1", "title": "YouTube"}}
+    api, state = fake_window_api(monkeypatch, windows, zoom_succeeds=False)
+    reply = _maximize_window(api, youtube_only=True)
+    assert "не подтвердила разворачивание" in reply
+    assert state["focus_calls"] == []
+    api, state = fake_window_api(monkeypatch, windows, focus_succeeds=False)
+    reply = _maximize_window(api, youtube_only=True)
+    assert "Развернул" in reply and "Вывод на передний план Windows не подтвердила" in reply
+
+
+def test_maximize_current_window_does_not_enumerate_or_inspect_captions(monkeypatch):
+    from desktop.actions import _maximize_window
+    api, state = fake_window_api(monkeypatch, {7: {"class": "AnyApp", "title": "Do not inspect"}}, foreground=7)
+    assert "Развернул активное окно" in _maximize_window(api)
+    assert state["shown"] == [(7, 3)] and state["captions"] == 0
+    state["foreground"] = 0
+    assert "Не нашёл активное окно" in _maximize_window(api)
+    assert len(state["shown"]) == 1
+
+
+def test_maximize_youtube_rechecks_caption_and_fails_closed_on_scan_limit(monkeypatch):
+    from desktop.actions import _maximize_window
+    windows = {1: {"class": "Chrome_WidgetWin_1", "title": "YouTube"}}
+    api, state = fake_window_api(monkeypatch, windows)
+    original = api.GetWindowTextW.callback
+
+    def changing_caption(handle, buffer, maximum):
+        if state["captions"]:
+            windows[handle]["title"] = "Other page"
+        return original(handle, buffer, maximum)
+
+    api.GetWindowTextW.callback = changing_caption
+    assert "окно изменилось" in _maximize_window(api, youtube_only=True)
+    assert state["shown"] == []
+    windows = {index: {"class": "OtherApp", "title": ""} for index in range(1, 515)}
+    api, state = fake_window_api(monkeypatch, windows)
+    assert "Не удалось полностью проверить" in _maximize_window(api, youtube_only=True)
+    assert state["shown"] == []
