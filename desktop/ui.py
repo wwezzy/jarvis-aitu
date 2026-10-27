@@ -958,7 +958,7 @@ class MainWindow(QMainWindow):
             content.addWidget(widget)
         self.voice_personal_license.setVisible(self.voice_engine.currentData() in {"expressive", "clone"})
         content.addWidget(self.voice_personal_license)
-        content.addWidget(label("Нейроголос используется только при наличии установленной локальной модели. Иначе отвечает установленный голос Windows. Это не копия голоса актёра.", "muted", True))
+        content.addWidget(label("Нейроголос работает с установленной локальной моделью. При подготовке или отказе доступен резервный голос. Сходство с личным образцом и произношение проверяются на слух.", "muted", True))
         self.voice_backend_status = label("Источник голоса определяется при подготовке.", "muted", True)
         self.voice_backend_status.setObjectName("voiceBackendStatus")
         content.addWidget(self.voice_backend_status)
