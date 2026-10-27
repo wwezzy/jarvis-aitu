@@ -2,6 +2,7 @@
 import hashlib
 import io
 import stat
+import sys
 import types
 import zipfile
 
@@ -130,6 +131,7 @@ def test_sapi_uses_plain_text_and_always_cleans_up_com(tmp_path, monkeypatch):
     from desktop import voice
     calls, states = [], []
     service = VoiceService(lambda x: None, states.append, tmp_path)
+    service.speech_engine = "windows"
     class Speaker:
         def GetVoices(self):
             return []
@@ -159,6 +161,7 @@ def test_disabling_speech_purges_playback_on_its_com_thread(tmp_path, monkeypatc
     from desktop import voice
     calls = []
     service = VoiceService(lambda x: None, lambda x: None, tmp_path)
+    service.speech_engine = "windows"
     class Speaker:
         def GetVoices(self):
             return []
@@ -176,6 +179,82 @@ def test_disabling_speech_purges_playback_on_its_com_thread(tmp_path, monkeypatc
     service._speak_loop()
     assert calls == [("answer", 17), ("", 18)]
     assert not service._speaking.is_set()
+
+
+def test_neural_preparation_is_silent_and_ack_never_uses_sapi(tmp_path, monkeypatch):
+    from desktop import voice
+    calls = []
+    service = VoiceService(lambda _: None, lambda _: None, tmp_path)
+    neural = types.SimpleNamespace(
+        prepare=lambda **kwargs: calls.append(("prepare", kwargs["rate"])) or True,
+        synthesize=lambda text, **kwargs: (b"\x00\x00" * 100, 22050),
+    )
+    monkeypatch.setitem(sys.modules, "desktop.neural_speech", types.SimpleNamespace(NeuralSpeech=lambda: neural))
+    monkeypatch.setattr(service, "_play_pcm", lambda pcm, rate: calls.append(("play", rate, service._speaking.is_set())))
+    monkeypatch.setattr(voice.importlib, "import_module", lambda name: pytest.fail("Neural voice must not require COM"))
+    service._speech.put(voice._PREPARE_SPEECH)
+    service._speech.put("Да, сэр")
+    service._speech.put(None)
+    service._speak_loop()
+    assert calls == [("prepare", 185), ("prepare", 185), ("play", 22050, True)]
+    assert service.speech_backend == "neural" and not service._speaking.is_set()
+
+
+def test_interrupt_during_neural_prepare_discards_old_utterance(tmp_path, monkeypatch):
+    from desktop import voice
+    service = VoiceService(lambda _: None, lambda _: None, tmp_path)
+    def prepare(**_kwargs):
+        service.interrupt()
+        service._speech.put(None)
+        return True
+    neural = types.SimpleNamespace(prepare=prepare, synthesize=lambda *_a, **_k: pytest.fail("Cancelled speech"))
+    monkeypatch.setitem(sys.modules, "desktop.neural_speech", types.SimpleNamespace(NeuralSpeech=lambda: neural))
+    monkeypatch.setattr(voice.importlib, "import_module", lambda name: pytest.fail("No fallback for cancelled speech"))
+    service._speech.put((0, "Old utterance"))
+    service._speak_loop()
+    assert not service._speaking.is_set()
+
+
+def test_interrupt_during_synthesis_never_opens_audio_device(tmp_path, monkeypatch):
+    from desktop import voice
+    service = VoiceService(lambda _: None, lambda _: None, tmp_path)
+    def synthesize(*_args, **_kwargs):
+        service.interrupt()
+        service._speech.put(None)
+        return b"\x00\x00" * 100, 22050
+    neural = types.SimpleNamespace(prepare=lambda **_k: True, synthesize=synthesize)
+    monkeypatch.setitem(sys.modules, "desktop.neural_speech", types.SimpleNamespace(NeuralSpeech=lambda: neural))
+    monkeypatch.setattr(voice.importlib, "import_module", lambda name: pytest.fail("No output device after interrupt"))
+    service._speech.put((0, "Old utterance"))
+    service._speak_loop()
+    assert not service._speaking.is_set()
+
+
+def test_pcm_playback_stops_between_short_output_blocks(tmp_path, monkeypatch):
+    from desktop import voice
+    service = VoiceService(lambda _: None, lambda _: None, tmp_path)
+    played = []
+    class Output:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            pass
+        def write(self, chunk):
+            played.append(len(chunk))
+            service._halt_speech.set()
+        def abort(self):
+            played.append("abort")
+    monkeypatch.setattr(voice.importlib, "import_module", lambda _: types.SimpleNamespace(RawOutputStream=lambda **_k: Output()))
+    service._play_pcm(b"\x00\x00" * 5000, 22050)
+    assert played == [2048, "abort"]
+
+
+def test_speech_display_prefix_removed_and_queue_uses_generation(tmp_path, monkeypatch):
+    service = VoiceService(lambda _: None, lambda _: None, tmp_path)
+    queued = []
+    monkeypatch.setattr(service, "_enqueue_speech", queued.append)
+    service.say("Локальная модель: **Начнём.**\n- Один шаг.")
+    assert queued == ["Начнём. Один шаг."]
 
 
 def test_cached_model_installs_atomically_and_is_reused(tmp_path, monkeypatch):

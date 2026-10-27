@@ -21,7 +21,8 @@ DEFAULT_PREFERENCES = {
     "voice_enabled": False,
     "close_to_tray": True,
     "launch_at_login": False,
-    "voice_rate": 165,
+    "voice_rate": 185,
+    "voice_engine": "auto",
     "language": "ru",
     "hide_advanced": True,
     "local_chat_enabled": False,
@@ -169,6 +170,9 @@ class LocalStore:
                 raise ValueError("Boolean setting required")
         if "voice_rate" in updates and (type(updates["voice_rate"]) is not int or not 90 <= updates["voice_rate"] <= 240):
             raise ValueError("Voice rate must be 90..240")
+        if "voice_engine" in updates and (not isinstance(updates["voice_engine"], str)
+                                          or updates["voice_engine"] not in {"auto", "windows"}):
+            raise ValueError("Unsupported speech engine")
         if "language" in updates and updates["language"] not in {"ru", "en"}:
             raise ValueError("Unsupported language")
         if "local_chat_model" in updates:

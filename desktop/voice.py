@@ -21,6 +21,9 @@ from typing import Callable
 
 from desktop.model_setup import default_model_dir, model_ready
 
+_PREPARE_SPEECH = object()
+SPEECH_ECHO_TAIL = 0.25
+
 
 def select_windows_voice(speaker, client):
     """Prefer an existing Russian male voice, without creating registry tokens.
@@ -122,11 +125,16 @@ class VoiceService:
         self._stop = threading.Event()
         self._speaking = threading.Event()
         self._audio: queue.Queue[bytes] = queue.Queue(maxsize=24)
-        self._speech: queue.Queue[str] = queue.Queue(maxsize=5)
+        self._speech: queue.Queue = queue.Queue(maxsize=5)
         self._thread: threading.Thread | None = None
         self._speaker: threading.Thread | None = None
         self.speech_enabled = True
+        self.speech_rate = 185
+        self.speech_engine = "auto"
+        self.speech_backend = "not_prepared"
         self._halt_speech = threading.Event()
+        self._closed = threading.Event()
+        self._speech_generation = 0
         self._last_spoken = 0.0
         self._lock = threading.Lock()
 
@@ -153,10 +161,12 @@ class VoiceService:
         return {"ready": dependencies and model and microphone, "model": model,
                 "dependencies": dependencies, "microphone": microphone, "reason": reason,
                 "running": bool(self._thread and self._thread.is_alive()),
-                "speaking": self._speaking.is_set()}
+                "speaking": self._speaking.is_set(), "speech_backend": self.speech_backend}
 
     def start(self) -> bool:
         with self._lock:
+            if self._closed.is_set():
+                return False
             if self._thread and self._thread.is_alive():
                 return not self._stop.is_set()
             report = self.available()
@@ -175,12 +185,7 @@ class VoiceService:
 
     def stop(self):
         self._stop.set()
-        self._halt_speech.set()
-        while True:
-            try:
-                self._speech.get_nowait()
-            except queue.Empty:
-                break
+        self.interrupt()
         thread = self._thread
         if thread and thread is not threading.current_thread():
             thread.join(timeout=3)
@@ -196,7 +201,7 @@ class VoiceService:
                 break
 
     def _audio_callback(self, data, frames, timing, status):
-        if self._stop.is_set() or self._speaking.is_set() or time.monotonic() - self._last_spoken < 0.6:
+        if self._stop.is_set() or self._speaking.is_set() or time.monotonic() - self._last_spoken < SPEECH_ECHO_TAIL:
             return
         try:
             self._audio.put_nowait(bytes(data))
@@ -207,7 +212,7 @@ class VoiceService:
 
     def _recognized(self, text: str):
         if (self._stop.is_set() or self._speaking.is_set()
-                or time.monotonic() - self._last_spoken < 0.6):
+                or time.monotonic() - self._last_spoken < SPEECH_ECHO_TAIL):
             return
         result = self.gate.feed(text, time.monotonic())
         if result.kind == "wake":
@@ -231,7 +236,7 @@ class VoiceService:
             recognizer = vosk.KaldiRecognizer(model, sample_rate)
             if self._stop.is_set():
                 return
-            with sound.RawInputStream(samplerate=sample_rate, blocksize=4000,
+            with sound.RawInputStream(samplerate=sample_rate, blocksize=max(400, int(sample_rate * 0.05)),
                                       dtype="int16", channels=1, callback=self._audio_callback):
                 self._emit(self.on_state, "Ожидаю слово «Джарвис»")
                 reset_after_speech = self._last_spoken
@@ -260,47 +265,140 @@ class VoiceService:
             self._clear_audio()
             self.gate.reset()
 
-    def say(self, text: str):
-        """Queue bounded plain text for an installed Windows voice, never SSML."""
-        text = re.sub(r"\s+", " ", str(text)).strip()[:700]
-        if not text or not self.speech_enabled:
-            return
-        if os.name != "nt":
+    def apply_preferences(self, preferences: dict):
+        """Apply bounded local settings; no model download or recording."""
+        engine = preferences.get("voice_engine", self.speech_engine)
+        rate = preferences.get("voice_rate", self.speech_rate)
+        if not isinstance(engine, str) or engine not in {"auto", "windows"}:
+            raise ValueError("Unsupported speech engine")
+        if type(rate) is not int or not 90 <= rate <= 240:
+            raise ValueError("Voice rate must be 90..240")
+        if engine != self.speech_engine or rate != self.speech_rate:
+            self.interrupt()
+        self.speech_engine, self.speech_rate = engine, rate
+        self.speech_enabled = bool(preferences.get("speech_enabled", self.speech_enabled))
+        if not self.speech_enabled:
+            self.interrupt()
+
+    def interrupt(self):
+        """Stop old speech without stopping the microphone or authorizing actions."""
+        with self._lock:
+            self._speech_generation += 1
+            self._halt_speech.set()
+            while True:
+                try:
+                    self._speech.get_nowait()
+                except queue.Empty:
+                    break
+
+    def _enqueue_speech(self, item):
+        if not self.speech_enabled or self._closed.is_set() or os.name != "nt":
             return
         with self._lock:
             if not self._speaker or not self._speaker.is_alive():
                 self._speaker = threading.Thread(target=self._speak_loop, name="JarvisSpeech", daemon=True)
                 self._speaker.start()
             try:
-                self._speech.put_nowait(text)
+                self._speech.put_nowait((self._speech_generation, item))
             except queue.Full:
                 pass
 
-    def _speak_loop(self):
-        initialized = False
+    def prepare(self):
+        """Warm CPU speech and cache the wake reply, asynchronously and silently."""
+        self._enqueue_speech(_PREPARE_SPEECH)
+
+    def say(self, text: str):
+        """Speak bounded plain text. UI labels/Markdown are not read as dialogue."""
+        text = re.sub(r"^Локальная модель:\s*", "", str(text).strip())
+        text = re.sub(r"(?m)^\s*(?:#{1,6}\s+|[-*]\s+)", "", text)
+        text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+        text = re.sub(r"\s+", " ", text).strip()[:700]
+        if text:
+            self._enqueue_speech(text)
+
+    def close(self):
+        self._closed.set()
+        self.stop()
         try:
-            pythoncom = importlib.import_module("pythoncom")
-            client = importlib.import_module("win32com.client")
-            pythoncom.CoInitialize()
-            initialized = True
-            speaker = client.Dispatch("SAPI.SpVoice")
-            speaker.Rate = 0
-            # Existing Windows voices only; no actor imitation or token copies.
-            select_windows_voice(speaker, client)
+            self._speech.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._speaker and self._speaker is not threading.current_thread():
+            self._speaker.join(timeout=3)
+
+    def _play_pcm(self, pcm: bytes, sample_rate: int):
+        """Use short output blocks for prompt stop/mute; never store audio."""
+        if (not isinstance(pcm, bytes) or not pcm or len(pcm) % 2
+                or type(sample_rate) is not int or not 8000 <= sample_rate <= 48000
+                or len(pcm) > sample_rate * 2 * 120):
+            raise ValueError("Invalid synthesized audio")
+        if self._halt_speech.is_set() or not self.speech_enabled or self._closed.is_set():
+            return
+        sound = importlib.import_module("sounddevice")
+        with sound.RawOutputStream(samplerate=sample_rate, dtype="int16", channels=1,
+                                   blocksize=0, latency="low") as stream:
+            for offset in range(0, len(pcm), 2048):
+                if self._halt_speech.is_set() or not self.speech_enabled or self._closed.is_set():
+                    stream.abort()
+                    break
+                stream.write(pcm[offset:offset + 2048])
+
+    def _speak_loop(self):
+        # Neural synthesis and COM remain on this one worker. Fallback COM is
+        # lazy: an unavailable Windows voice cannot prevent neural speech.
+        initialized, speaker, pythoncom, neural = False, None, None, None
+        try:
             while True:
-                text = self._speech.get()
-                if not self.speech_enabled:
+                item = self._speech.get()
+                if item is None:
+                    break
+                generation, text = item if isinstance(item, tuple) else (self._speech_generation, item)
+                if not self.speech_enabled or self._closed.is_set():
                     continue
-                self._halt_speech.clear()
-                self._speaking.set()
+                engine, speech_rate = self.speech_engine, self.speech_rate
+                use_neural = False
+                if engine == "auto":
+                    try:
+                        if neural is None:
+                            from desktop.neural_speech import NeuralSpeech
+                            neural = NeuralSpeech()
+                        use_neural = neural.prepare(rate=speech_rate)
+                    except Exception:
+                        use_neural = False
+                with self._lock:
+                    if generation != self._speech_generation or self._closed.is_set() or not self.speech_enabled:
+                        continue
+                    if text is _PREPARE_SPEECH:
+                        self.speech_backend = "neural" if use_neural else "windows"
+                        continue
+                    self._halt_speech.clear()
+                    self._speaking.set()
                 self._clear_audio()
                 self._emit(self.on_state, "Говорю…")
                 try:
+                    if use_neural:
+                        try:
+                            pcm, rate = neural.synthesize(text, rate=speech_rate)
+                            self.speech_backend = "neural"
+                            self._play_pcm(pcm, rate)
+                            continue
+                        except Exception:
+                            self._emit(self.on_state, "Нейроголос недоступен. Использую голос Windows.")
+                    if speaker is None:
+                        pythoncom = importlib.import_module("pythoncom")
+                        client = importlib.import_module("win32com.client")
+                        pythoncom.CoInitialize()
+                        initialized = True
+                        speaker = client.Dispatch("SAPI.SpVoice")
+                        select_windows_voice(speaker, client)
+                    if self._halt_speech.is_set() or self._closed.is_set() or not self.speech_enabled:
+                        continue
+                    self.speech_backend = "windows"
+                    speaker.Rate = max(-4, min(4, round((speech_rate - 165) / 18)))
                     # SVSFlagsAsync=1 + SVSFIsNotXML=16: plain text only.
                     speaker.Speak(text, 17)
                     while not speaker.WaitUntilDone(100):
-                        if self._halt_speech.is_set() or not self.speech_enabled:
-                            # Purge on the same COM thread; no cross-thread COM.
+                        if self._halt_speech.is_set() or not self.speech_enabled or self._closed.is_set():
                             speaker.Speak("", 18)
                             break
                 finally:
@@ -311,10 +409,10 @@ class VoiceService:
                     self._emit(self.on_state, "Ожидаю слово «Джарвис»" if self._thread and self._thread.is_alive()
                                and not self._stop.is_set() else "Микрофон выключен")
         except Exception:
+            self.speech_backend = "unavailable"
             self._speaking.clear()
-            self._emit(self.on_state, "Голос Windows недоступен. Ответ показан текстом.")
+            self._emit(self.on_state, "Голос недоступен. Ответ показан текстом.")
         finally:
             if initialized:
-                # Release COM interfaces before uninitializing their apartment.
                 speaker = None
                 pythoncom.CoUninitialize()

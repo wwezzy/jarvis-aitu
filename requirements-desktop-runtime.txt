@@ -1,0 +1,9 @@
+# Optional desktop-only runtime. No cloud credentials or training dependencies.
+PySide6-Essentials==6.12.0
+vosk==0.3.45
+sounddevice==0.5.6
+pywin32==312; sys_platform == 'win32'
+# CPU neural speech; Piper/espeak are GPLv3. See desktop/NOTICE.txt.
+piper-tts==1.8.0
+onnxruntime==1.31.1
+numpy==2.5.4
