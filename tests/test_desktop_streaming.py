@@ -63,4 +63,3 @@ def test_neural_voice_preferences_are_bounded_and_survive_restart(tmp_path):
         with pytest.raises(ValueError):
             again.store.set_preferences({"voice_engine": value})
     again.close()
-
