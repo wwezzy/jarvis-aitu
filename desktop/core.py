@@ -259,7 +259,7 @@ class DesktopCore:
             return Reply("Импортированный текст и ответы ИИ не могут запускать команды компьютера.")
         if not isinstance(text, str) or not text.strip() or len(text) > 20000 or "\x00" in text:
             return Reply("Нужна непустая команда длиной до 20 000 символов.")
-        self.store.record("user", text.strip())
+        request_id = self.store.record("user", text.strip())
         value = normalize(text)
         original = re.sub(r"^(?:джарвис|джарсис|джарвиз|jarvis)[,\s]+", "", text.strip(), flags=re.IGNORECASE)
         original = re.sub(r"^пожалуйста[,\s]+", "", original, flags=re.IGNORECASE)
@@ -371,9 +371,15 @@ class DesktopCore:
         if preferences["local_chat_enabled"]:
             from desktop.chat import LocalChat, LocalChatUnavailable
             try:
-                # A model's result is display-only. Never call handle()/execute
-                # on it, and never send stored notes or chat history implicitly.
-                answer = LocalChat(preferences["local_chat_model"]).answer(text)
+                # A model's result stays display-only. Optional context is
+                # exclusively earlier completed model-chat exchanges, never
+                # note/task/PC-command/personal-data records or the current row.
+                client = LocalChat(preferences["local_chat_model"])
+                if preferences["local_chat_history"]:
+                    history = self.store.model_chat_history(before_id=request_id)
+                    answer = client.answer(text, history=history)
+                else:
+                    answer = client.answer(text)
             except ValueError:
                 return self._answer(Reply("Для локальной модели сократи вопрос до 8000 символов и проверь имя модели в настройках."))
             except LocalChatUnavailable:

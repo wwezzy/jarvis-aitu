@@ -153,6 +153,25 @@ def test_explicit_microphone_toggle_and_voice_setting(app, window):
     assert window.core.snapshot()["preferences"]["speech_enabled"] is False
 
 
+def test_local_chat_history_requires_opt_in_and_persists_across_restart(app, tmp_path):
+    core = DesktopCore(tmp_path, executor=lambda _: pytest.fail("OS action"))
+    first = MainWindow(core, voice_factory=FakeVoice, enable_tray=False)
+    assert not first.local_chat_history_toggle.isChecked()
+    assert first.core.snapshot()["preferences"]["local_chat_history"] is False
+    first.local_chat_history_toggle.setChecked(True)
+    assert first.core.snapshot()["preferences"]["local_chat_history"] is True
+    first._quitting = True
+    first.close()
+    second = MainWindow(DesktopCore(tmp_path, executor=lambda _: pytest.fail("OS action")),
+                        voice_factory=FakeVoice, enable_tray=False)
+    assert second.local_chat_history_toggle.isChecked()
+    second.local_chat_history_toggle.setChecked(False)
+    assert second.core.snapshot()["preferences"]["local_chat_history"] is False
+    assert second.voice.starts == 0 and second.voice.spoken == []
+    second._quitting = True
+    second.close()
+
+
 def test_worker_failure_is_visible_and_does_not_claim_success(app, window, monkeypatch):
     def fail(*_args, **_kwargs):
         raise RuntimeError("sensitive adapter detail")

@@ -25,6 +25,7 @@ DEFAULT_PREFERENCES = {
     "language": "ru",
     "hide_advanced": True,
     "local_chat_enabled": False,
+    "local_chat_history": False,
     "local_chat_model": "qwen3:4b-instruct-2507-q4_K_M",
 }
 
@@ -182,13 +183,38 @@ class LocalStore:
                        (json.dumps(value, ensure_ascii=False),))
         return value
 
-    def record(self, role: str, text: str) -> None:
+    def record(self, role: str, text: str) -> int:
         if role not in {"user", "assistant"}:
             raise ValueError("Invalid history role")
         text = self._content(text, 24000)
         with self.connection() as db:
-            db.execute("INSERT INTO history(role,text,timestamp) VALUES(?,?,?)", (role, text, time.time()))
+            record_id = db.execute("INSERT INTO history(role,text,timestamp) VALUES(?,?,?)", (role, text, time.time())).lastrowid
             db.execute("DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY id DESC LIMIT 250)")
+        return record_id
+
+    def model_chat_history(self, *, before_id: int) -> list[dict]:
+        """Only completed local-model exchanges before the current input.
+
+        Deterministic command results, captured notes, reminders and personal
+        projections lack this fixed assistant prefix and are never included.
+        The prefix is provenance of the existing app response, not a tool grant.
+        """
+        from desktop.chat import bounded_history
+        with self.connection() as db:
+            rows = db.execute("SELECT role,text FROM history WHERE id<? ORDER BY id DESC LIMIT 250", (before_id,)).fetchall()
+        prefix = "Локальная модель: "
+        question = None
+        pairs = []
+        for row in reversed(rows):
+            if row["role"] == "user":
+                question = row["text"]
+            else:
+                answer = row["text"]
+                if question and answer.startswith(prefix) and answer[len(prefix):].strip():
+                    pairs.extend([{"role": "user", "content": question},
+                                  {"role": "assistant", "content": answer[len(prefix):]}])
+                question = None
+        return bounded_history(pairs[-6:])
 
     def create_confirmation(self, token: str, action: str, now: float, ttl: int = 60) -> None:
         with self.connection() as db:

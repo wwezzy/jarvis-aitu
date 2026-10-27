@@ -1,7 +1,8 @@
 """Optional local-only text adapter. It has no tools or execution callback.
 
 Ollama must already be running and a local model installed. This module never
-downloads a model, starts a shell, reads notes, or sends conversation history.
+downloads a model, starts a shell or reads notes. Explicitly enabled dialogue
+context contains only bounded completed local-model exchanges.
 """
 from __future__ import annotations
 
@@ -13,12 +14,16 @@ import urllib.request
 
 ENDPOINT = "http://127.0.0.1:11434/api/chat"
 MAX_RESPONSE_BYTES = 65536
+MAX_HISTORY_MESSAGES = 6
+MAX_HISTORY_CHARS = 4000
 SYSTEM = (
     "Ты Джарвис, спокойный личный помощник. Отвечай по-русски коротко и по делу, "
     "на английский запрос можно ответить по-английски. Помогай разобраться в мысли, "
     "выбрать один следующий шаг или составить реалистичный план. "
     "У тебя нет инструментов, доступа к компьютеру, файлам или календарю. "
-    "Ты не знаешь личных фактов, если пользователь не написал их в этом запросе. "
+    "Тебе передан текущий вопрос и, только если пользователь включил контекст, "
+    "несколько предыдущих реплик локального диалога. Используй факты только из этих сообщений. "
+    "Другие заметки, память, календарь и файлы тебе не переданы. "
     "Не утверждай, что выполнил действие, сохранил информацию или изменил настройки. "
     "Команды компьютера выполняет отдельный детерминированный обработчик приложения. "
     "Если просят такое действие, предложи ввести точную команду в приложении. "
@@ -34,6 +39,37 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, message, headers, new_url):
         # Even localhost redirects must not send personal text off this origin.
         return None
+
+
+def bounded_history(history=None) -> list[dict]:
+    """Validate completed user/assistant pairs and retain bounded recent ones.
+
+    No caller-supplied system/tool role or metadata is accepted. Cropping is
+    only context projection; the original local records are never modified.
+    """
+    if history is None:
+        return []
+    if not isinstance(history, (list, tuple)) or len(history) > 250 or len(history) % 2:
+        raise ValueError("History must contain completed local dialogue pairs")
+    for index, message in enumerate(history):
+        if not isinstance(message, dict) or set(message) != {"role", "content"}:
+            raise ValueError("History contains unsupported metadata")
+        if message["role"] != ("user" if index % 2 == 0 else "assistant"):
+            raise ValueError("History accepts only completed user/assistant pairs")
+        content = message["content"]
+        if not isinstance(content, str) or not content.strip() or "\x00" in content:
+            raise ValueError("History must contain plain nonempty text")
+    selected = []
+    remaining = MAX_HISTORY_CHARS
+    pairs = [history[index:index + 2] for index in range(0, len(history), 2)]
+    for user, assistant in reversed(pairs[-(MAX_HISTORY_MESSAGES // 2):]):
+        if remaining < 2:
+            break
+        question = user["content"].strip()[:min(2000, remaining // 2)]
+        answer = assistant["content"].strip()[:min(2000, remaining - len(question))]
+        selected.append([{"role": "user", "content": question}, {"role": "assistant", "content": answer}])
+        remaining -= len(question) + len(answer)
+    return [message for pair in reversed(selected) for message in pair]
 
 
 def _final_answer(content: str) -> str:
@@ -61,12 +97,12 @@ class LocalChat:
         self.timeout = min(90, max(1, timeout))
         self.opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
-    def answer(self, text: str) -> str:
+    def answer(self, text: str, history=None) -> str:
         if not isinstance(text, str) or not text.strip() or len(text) > 8000 or "\x00" in text:
             raise ValueError("Local question must contain 1..8000 characters")
         payload = {
             "model": self.model, "stream": False, "think": False, "keep_alive": "5m",
-            "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": text}],
+            "messages": [{"role": "system", "content": SYSTEM}, *bounded_history(history), {"role": "user", "content": text}],
             "options": {"num_predict": 512, "num_ctx": 4096, "temperature": 0.4},
         }
         request = urllib.request.Request(ENDPOINT,
