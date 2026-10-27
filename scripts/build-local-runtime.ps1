@@ -107,6 +107,10 @@ if os.name == "nt":
         if candidate.is_dir():
             _dll_handles.append(os.add_dll_directory(str(candidate)))
 sys.path.insert(0, str(APP))
+# Pin this installation's data outside packaged-terminal AppData virtualization.
+# The same directory is used from the Start Menu and development probes.
+if "--state-dir" not in sys.argv[1:]:
+    sys.argv.extend(["--state-dir", str(Path.home() / "JarvisData" / "Desktop")])
 runpy.run_path(str(APP / "desktop_app.py"), run_name="__main__")
 '@
 $launcherPath = Join-Path $installPath 'launcher.pyw'
