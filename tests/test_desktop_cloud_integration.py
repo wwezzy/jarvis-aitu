@@ -80,7 +80,13 @@ def test_cloud_flag_can_enable_conversation_without_local_model_and_records_actu
     assert reply.action is reply.confirmation_id is None and reply.speak is True
     assert len(constructors) == len(router.calls) == router.closed == 1
     assert constructors[0][0] == core.state_dir
-    assert constructors[0][1] == {"local_enabled": False, "local_model": core.store.preferences()["local_chat_model"]}
+    from desktop.openai_mode import OpenAIEnvironment
+    options = constructors[0][1]
+    assert set(options) == {"local_enabled", "local_model", "environ"}
+    assert options["local_enabled"] is False
+    assert options["local_model"] == core.store.preferences()["local_chat_model"]
+    assert isinstance(options["environ"], OpenAIEnvironment)
+    assert options["environ"].get("JARVIS_CLOUD_CHAT_ENABLED") == "1"
     assert chunks == [router.result] and not core.effects
     assert _usage_rows(core) == [{"model": "gpt-6-luna", "requests": 1, "successful": 1,
                                  "failed": 0, "input_tokens": 17, "output_tokens": 6}]

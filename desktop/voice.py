@@ -32,7 +32,22 @@ VOSK_ALIAS_CONFIDENCE = 0.90
 CLONE_READY_TIMEOUT = 120.0
 UTTERANCE_SILENCE_SECONDS = 0.8
 _CONFIDENT_READ_ONLY = frozenset({"как дела", "что ты умеешь", "помощь", "команды", "привет", "ты здесь",
+                                "ты меня слышишь", "доброе утро", "good morning", "can you hear me",
                                 "how are you", "what can you do", "help", "hello", "are you there"})
+# Fixed labels are projected from numeric session counters. Provider exception
+# messages, microphone names and recognized/private text never enter this map.
+_DIAGNOSTIC_REASONS = (
+    "not_prepared", "ready", "cloud_ready", "local_unavailable", "unavailable", "closed", "canceled", "busy",
+    "model_missing", "model_invalid", "dependencies_missing", "backend_unavailable", "audio_invalid", "silence",
+    "no_speech", "audio_clipped", "vad_invalid", "low_confidence", "language_unsupported", "transcript_invalid",
+    "transcript_limit", "repetition_rejected", "transcription_failed", "not_configured", "budget_exceeded",
+    "budget_unavailable", "authentication", "access_denied", "quota_or_rate_limit", "timeout", "network_unavailable",
+    "invalid_transcript", "invalid_response", "configuration_changed", "stale_request", "missing_audio",
+    "capture_unavailable", "unknown")
+_DIAGNOSTIC_STAGES = (None, "factory", "prepare", "decode", "english_wake", "local_prepare", "local_decode",
+                      "cloud_prepare", "cloud_decode", "vosk_shortcut", "wake", "capture")
+_DIAGNOSTIC_PROVIDERS = (None, "local", "openai", "vosk")
+_DIAGNOSTIC_FACTORIES = ("not_created", "local_default", "custom")
 
 
 def _pcm_rms(data):
@@ -172,6 +187,7 @@ class UtteranceBuffer:
         self._bytes = 0
         self._silence = 0
         self.started = self.overflow = False
+        self.peak_dbfs = -120
 
     def append(self, data, *, active):
         if self.overflow:
@@ -286,11 +302,14 @@ class VoiceService:
     """
 
     def __init__(self, on_text: Callable[[str], None], on_state: Callable[[str], None],
-                 model_dir: Path | None = None, *, transcriber_factory=None, on_command=None):
+                 model_dir: Path | None = None, *, transcriber_factory=None, on_command=None, speech_factory=None):
         if transcriber_factory is not None and not callable(transcriber_factory):
             raise ValueError("A transcriber factory is required")
         if on_command is not None and not callable(on_command):
             raise ValueError("A command receiver is required")
+        if speech_factory is not None and not callable(speech_factory):
+            raise ValueError("A speech factory is required")
+        self._speech_factory = speech_factory
         self._on_command = on_command
         self._transcriber_factory = transcriber_factory
         self.on_text, self.on_state = on_text, on_state
@@ -331,8 +350,11 @@ class VoiceService:
         with self._stats_lock:
             self._stats = {key: 0 for key in ("audio_callbacks", "suppressed_speech", "suppressed_decoder", "suppressed_echo",
                 "queue_overflows", "capture_overflows", "maximum_queue", "utterances", "commands", "wake_shortcuts",
-                "decoder_requests", "decoder_failures", "capture_sample_rate")}
-            self._stats.update(last_decoder_ms=None, last_level_dbfs=None)
+                "decoder_requests", "decoder_failures", "capture_sample_rate", "capture_default_sample_rate",
+                "capture_input_channels", "capture_16k_probe", "decoder_reason_code", "decoder_stage_code",
+                "decoder_provider_code", "decoder_factory_code")}
+            self._stats.update(last_decoder_ms=None, last_level_dbfs=None, decoder_prepare_ms=None,
+                               last_utterance_ms=None, last_utterance_level_dbfs=None)
 
     def _count(self, key):
         with self._stats_lock:
@@ -342,6 +364,43 @@ class VoiceService:
         """Session-only numeric counters: no audio, transcripts, files or IDs."""
         with self._stats_lock:
             return dict(self._stats)
+
+    def recognition_status(self):
+        """Fixed-label projection only; no SDK call, recordings or exception text."""
+        values = self.diagnostics()
+        return {name: labels[values[code]] for name, code, labels in (
+            ("reason", "decoder_reason_code", _DIAGNOSTIC_REASONS),
+            ("stage", "decoder_stage_code", _DIAGNOSTIC_STAGES),
+            ("provider", "decoder_provider_code", _DIAGNOSTIC_PROVIDERS),
+            ("factory", "decoder_factory_code", _DIAGNOSTIC_FACTORIES))}
+
+    def _recognition_status(self, reason, stage, provider=None, *, factory=None):
+        reason = reason if type(reason) is str and reason in _DIAGNOSTIC_REASONS else "unknown"
+        stage = stage if type(stage) is str and stage in _DIAGNOSTIC_STAGES else None
+        provider = provider if type(provider) is str and provider in _DIAGNOSTIC_PROVIDERS else None
+        with self._stats_lock:
+            self._stats.update(decoder_reason_code=_DIAGNOSTIC_REASONS.index(reason),
+                               decoder_stage_code=_DIAGNOSTIC_STAGES.index(stage),
+                               decoder_provider_code=_DIAGNOSTIC_PROVIDERS.index(provider))
+            if factory in _DIAGNOSTIC_FACTORIES:
+                self._stats["decoder_factory_code"] = _DIAGNOSTIC_FACTORIES.index(factory)
+
+    def _decoder_status(self, decoder, *, fallback, stage, success=False):
+        def metadata(name):
+            try:
+                return getattr(decoder, name, None)
+            except Exception:
+                return None
+        reason = metadata("reason")
+        if type(reason) is not str or reason not in _DIAGNOSTIC_REASONS:
+            reason = fallback
+        if not success and reason in {"ready", "cloud_ready", "not_prepared"}:
+            reason = fallback  # Never retain a stale ready label after failure.
+        provider = metadata("last_provider" if success else "last_error_provider")
+        precise_stage = metadata("last_error_stage") or metadata("error_stage")
+        if type(precise_stage) is not str or precise_stage not in _DIAGNOSTIC_STAGES:
+            precise_stage = stage
+        self._recognition_status(reason, stage if success else precise_stage, provider)
 
     def _emit(self, callback, value):
         try:
@@ -373,7 +432,7 @@ class VoiceService:
                 "dependencies": dependencies, "microphone": microphone, "reason": reason,
                 "running": bool(self._thread and self._thread.is_alive()),
                 "speaking": self._speaking.is_set(), "speech_backend": self.speech_backend,
-                "diagnostics": self.diagnostics()}
+                "diagnostics": self.diagnostics(), "recognition": self.recognition_status()}
 
     def start(self) -> bool:
         with self._lock:
@@ -473,10 +532,15 @@ class VoiceService:
         return True
 
     @staticmethod
-    def _capture_configuration(sound):
+    def _capture_configuration(sound, *, report=None):
         """Pin the same default input; use 16k only when its SDK probe accepts."""
         info = sound.query_devices(kind="input")
         rate, device = int(info["default_samplerate"]), None
+        if report is not None:
+            channels = info.get("max_input_channels")
+            report.update(capture_default_sample_rate=rate,
+                          capture_input_channels=channels if type(channels) is int and 0 <= channels <= 256 else 0,
+                          capture_16k_probe=0)
         try:
             candidate = sound.default.device[0]
             if type(candidate) is int and candidate >= 0:
@@ -488,14 +552,19 @@ class VoiceService:
             try:
                 if check(device=device, channels=1, dtype="int16", samplerate=16000) is None:
                     rate = 16000
+                    if report is not None:
+                        report["capture_16k_probe"] = 1
             except Exception:
+                if report is not None:
+                    report["capture_16k_probe"] = -1
                 pass  # Preserve the original rate and device; no OS setting changes.
         return rate, device
 
     @staticmethod
     def _confident_alias(full_text, command, words):
         from desktop.core import ALIASES, normalize
-        if normalize(command) not in {*ALIASES, *_CONFIDENT_READ_ONLY} or not isinstance(words, list) or not words:
+        if (normalize(command) not in {*ALIASES, *_CONFIDENT_READ_ONLY} or normalize(full_text) != normalize(command)
+                or not isinstance(words, list) or not words):
             return False
         recognized = []
         for word in words:
@@ -526,8 +595,10 @@ class VoiceService:
         # Text equality alone is not acoustic confidence. Only the caller's
         # validated final Vosk word scores permit the finite utility shortcut.
         if confident:
+            self._recognition_status("ready", "vosk_shortcut", "vosk")
             return text
         if pcm is None:
+            self._recognition_status("missing_audio", "decode")
             self._emit(self.on_state, "Недостаточно аудио для уверенного распознавания. Повтори команду.")
             return None
         self._transcribing.set()
@@ -539,10 +610,13 @@ class VoiceService:
             decoded = (bounded(pcm, sample_rate, cancel_event=canceled) if callable(bounded)
                        else decoder.transcribe(pcm, sample_rate))
             if not current():
+                self._recognition_status("stale_request", "decode")
                 return None
+            self._decoder_status(decoder, fallback="ready", stage="decode", success=True)
             return strip_wake_prefix(decoded, verified=True)
         except Exception:
             self._count("decoder_failures")
+            self._decoder_status(decoder, fallback="transcription_failed", stage="decode")
             if current():
                 self._emit(self.on_state, "Не удалось уверенно распознать команду. Повтори её или напиши текстом.")
             return None
@@ -587,9 +661,11 @@ class VoiceService:
                     or not isinstance(decoded, str) or not 1 <= len(decoded) <= 500):
                 return None
             first = re.search(r"\w+", decoded, flags=re.UNICODE)
+            self._decoder_status(decoder, fallback="ready", stage="english_wake", success=True)
             return decoded if first and first.group().casefold() in WakeGate.WAKE else None
         except Exception:
             self._count("decoder_failures")
+            self._decoder_status(decoder, fallback="transcription_failed", stage="english_wake")
             # A false/uncertain idle candidate must stay silent and unarmed.
             return None
         finally:
@@ -664,6 +740,7 @@ class VoiceService:
                 if not current():
                     return
                 self._count("wake_shortcuts")
+                self._recognition_status("ready", "wake", "vosk")
                 self._emit(self.on_state, "Слушаю команду…")
                 self.say("Да, сэр")
                 return
@@ -741,20 +818,33 @@ class VoiceService:
             vosk.SetLogLevel(-1)
             model = vosk.Model(str(self.model_dir))
             if self.multilingual_stt_enabled:
+                preparing = time.monotonic()
                 try:
                     from desktop.multilingual_stt import MultilingualSTT
                     self._emit(self.on_state, "Готовлю русское и английское распознавание…")
                     self._dispose_backend(self._stt)
+                    self._stt = None
+                    self._recognition_status("not_prepared", "factory",
+                                             factory="custom" if self._transcriber_factory is not None else "local_default")
                     self._stt = self._transcriber_factory() if self._transcriber_factory is not None else MultilingualSTT()
                     if not self._stt.prepare():
+                        self._decoder_status(self._stt, fallback="backend_unavailable", stage="prepare")
                         self._stt = None
                         self._emit(self.on_state, "Два языка пока недоступны. Русское распознавание продолжает работать.")
+                    else:
+                        self._decoder_status(self._stt, fallback="ready", stage="prepare", success=True)
                 except Exception:
+                    self._decoder_status(self._stt, fallback="backend_unavailable", stage="factory" if self._stt is None else "prepare")
                     self._stt = None
                     self._emit(self.on_state, "Два языка пока недоступны. Русское распознавание продолжает работать.")
-            sample_rate, device = self._capture_configuration(sound)
+                finally:
+                    with self._stats_lock:
+                        self._stats["decoder_prepare_ms"] = round(max(0, time.monotonic() - preparing) * 1000)
+            capture_report = {}
+            sample_rate, device = self._capture_configuration(sound, report=capture_report)
             with self._stats_lock:
                 self._stats["capture_sample_rate"] = sample_rate
+                self._stats.update(capture_report)
             recognizer = vosk.KaldiRecognizer(model, sample_rate)
             set_words = getattr(recognizer, "SetWords", None)
             if callable(set_words):
@@ -829,12 +919,14 @@ class VoiceService:
                     complete = recognizer.AcceptWaveform(data)
                     accepted_samples += len(data) // 2
                     result = json.loads(recognizer.Result()) if complete else None
+                    level = _pcm_rms(data)
+                    with self._stats_lock:
+                        self._stats["last_level_dbfs"] = round(20 * math.log10(max(level, 0.000001)))
                     if self.multilingual_stt_enabled:
                         was_started = utterance.started
-                        level = _pcm_rms(data)
-                        with self._stats_lock:
-                            self._stats["last_level_dbfs"] = round(20 * math.log10(max(level, 0.000001)))
                         utterance.append(data, active=level >= 0.002)
+                        if utterance.started:
+                            utterance.peak_dbfs = max(utterance.peak_dbfs, round(20 * math.log10(max(level, 0.000001))))
                         if english is not None and utterance.started and not utterance.overflow:
                             try:
                                 # First active frame is already in pcm(), together
@@ -855,6 +947,9 @@ class VoiceService:
                             complete = False
                     if complete or utterance.overflow:
                         self._count("utterances")
+                        with self._stats_lock:
+                            self._stats["last_utterance_ms"] = round(utterance._bytes / (2 * sample_rate) * 1000) if utterance.started else None
+                            self._stats["last_utterance_level_dbfs"] = utterance.peak_dbfs if utterance.started else None
                         result = result or {"text": ""}
                         if utterance.overflow:
                             first = re.search(r"\w+", result.get("text", ""), flags=re.UNICODE)
@@ -897,7 +992,7 @@ class VoiceService:
         multilingual = preferences.get("multilingual_stt_enabled", self.multilingual_stt_enabled)
         if type(multilingual) is not bool:
             raise ValueError("Boolean recognition preference required")
-        if not isinstance(engine, str) or engine not in {"auto", "windows", "expressive", "clone"}:
+        if not isinstance(engine, str) or engine not in {"auto", "windows", "expressive", "clone", "openai"}:
             raise ValueError("Unsupported speech engine")
         if not isinstance(character, str) or character not in {"aidar", "eugene"}:
             raise ValueError("Unsupported speech character")
@@ -913,7 +1008,7 @@ class VoiceService:
             self.gate.reset()
             self._audio_epoch += 1
             self._clear_audio()
-        self.multilingual_stt_enabled = multilingual
+        self.multilingual_stt_enabled = multilingual or engine == "openai"
         self.speech_enabled = bool(preferences.get("speech_enabled", self.speech_enabled))
         if not self.speech_enabled:
             self.interrupt()
@@ -966,7 +1061,7 @@ class VoiceService:
 
     @staticmethod
     def _speech_text(text: str) -> str:
-        text = re.sub(r"^Локальная модель:\s*", "", str(text).strip())
+        text = re.sub(r"^(?:Локальная модель|OpenAI):\s*", "", str(text).strip())
         text = re.sub(r"(?m)^\s*(?:#{1,6}\s+|[-*]\s+)", "", text)
         text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
         text = re.sub(r"\s+", " ", text).strip()
@@ -1225,12 +1320,18 @@ class VoiceService:
                 engine, speech_rate, character = self.speech_engine, self.speech_rate, self.speech_character
                 use_neural = False
                 renderer, fixed_audio = None, None
-                if engine in {"auto", "expressive", "clone"}:
+                if engine in {"auto", "expressive", "clone", "openai"}:
                     try:
                         key = (engine, character if engine == "expressive" else None)
                         if neural is None or neural_key != key or self._active_backend is not neural:
                             self._close_backend()
-                            if engine == "clone":
+                            if engine == "openai":
+                                if self._speech_factory is None:
+                                    from desktop.cloud_speech import OpenAIRealtimeSpeech
+                                    candidate = OpenAIRealtimeSpeech()
+                                else:
+                                    candidate = self._speech_factory()
+                            elif engine == "clone":
                                 from desktop.clone_speech import CloneSpeech
                                 candidate = CloneSpeech(personal_use=True)
                             elif engine == "expressive":
@@ -1275,6 +1376,11 @@ class VoiceService:
                         use_neural = False
                 if not _event_current(validator):
                     continue
+                if engine == "openai" and not use_neural:
+                    if self._backend_current(generation, engine, character):
+                        self.speech_backend = "openai_unavailable"
+                        self._emit(self.on_state, "Голос OpenAI недоступен. Проверь подключение и лимит; ответ остаётся на экране.")
+                    continue
                 if engine == "clone" and text is not _PREPARE_SPEECH and not use_neural:
                     if self._backend_current(generation, engine, character):
                         warming = bool(neural is not None and getattr(neural, "is_warming", False))
@@ -1290,7 +1396,7 @@ class VoiceService:
                             self.speech_backend = ("clone" if use_neural else "clone_warming"
                                                    if neural is not None and getattr(neural, "is_warming", False) else "clone_unavailable")
                         else:
-                            self.speech_backend = ("expressive" if engine == "expressive" else "neural") if use_neural else "windows"
+                            self.speech_backend = ("openai" if engine == "openai" else "expressive" if engine == "expressive" else "neural") if use_neural else "windows"
                         continue
                 if not self._begin_audio(generation):
                     continue
@@ -1301,8 +1407,8 @@ class VoiceService:
                                 self.speech_backend = "clone"
                                 pcm, rate = fixed_audio
                                 self._play_pcm(pcm, rate, is_current=validator)
-                            elif engine == "clone" and renderer is neural:
-                                self.speech_backend = "clone"
+                            elif engine in {"clone", "openai"} and renderer is neural:
+                                self.speech_backend = engine
                                 chunks = neural.stream(text, rate=speech_rate,
                                     cancel=lambda: self._closed.is_set() or self._halt_speech.is_set()
                                     or not self.speech_enabled or not _event_current(validator))
@@ -1322,8 +1428,8 @@ class VoiceService:
                             if self._utterance_audio_started:
                                 self._emit(self.on_state, "Озвучивание прервалось. Полный ответ остаётся на экране.")
                                 continue
-                            if engine == "clone":
-                                self.speech_backend = "clone_unavailable"
+                            if engine in {"clone", "openai"}:
+                                self.speech_backend = engine + "_unavailable"
                                 self._emit(self.on_state, "Выбранный голос недоступен. Ответ показан текстом.")
                                 continue
                             self._emit(self.on_state, "Нейроголос недоступен. Использую голос Windows.")

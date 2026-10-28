@@ -6,7 +6,6 @@ actions additionally require a one-use local button or typed confirmation.
 """
 from __future__ import annotations
 
-import os
 import re
 import secrets
 import threading
@@ -933,7 +932,9 @@ class DesktopCore:
         if self.request_kind(text, source) != "chat":
             return self._answer(Reply("Уточни команду: что открыть, сохранить или изменить. Свободный вопрос можно задать отдельно."))
         preferences = self.store.preferences()
-        cloud_chat = os.environ.get("JARVIS_CLOUD_CHAT_ENABLED") == "1"
+        from desktop.openai_mode import OpenAIEnvironment
+        cloud_environment = OpenAIEnvironment(self.state_dir, self.store.preferences)
+        cloud_chat = cloud_environment.get("JARVIS_CLOUD_CHAT_ENABLED") == "1"
         if preferences["local_chat_enabled"] or cloud_chat:
             from desktop.chat import LocalChat, LocalChatCancelled, LocalChatTruncated, LocalChatUnavailable
             from desktop.cloud_ai import CloudCancelled, CloudUnavailable
@@ -946,7 +947,7 @@ class DesktopCore:
                 if cloud_chat:
                     from desktop.ai_routing import ChatRouter
                     client = ChatRouter(self.state_dir, local_enabled=preferences["local_chat_enabled"],
-                                        local_model=preferences["local_chat_model"])
+                                        local_model=preferences["local_chat_model"], environ=cloud_environment)
                 else:
                     client = LocalChat(preferences["local_chat_model"])
                 options = {"on_chunk": on_chunk} if on_chunk is not None else {}

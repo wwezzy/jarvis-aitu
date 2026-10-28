@@ -46,6 +46,12 @@ QMenu { background: #101c2c; color: #dbe6f3; }
 QMenu::item:selected { background: #255253; }
 QScrollArea { border: none; background: transparent; }
 QScrollArea > QWidget > QWidget { background: transparent; }
+QTabWidget::pane { background: #0b1421; border: 1px solid #203349; border-radius: 12px; top: -1px; }
+QTabBar::tab { background: transparent; color: #8fa8be; border: 1px solid transparent; padding: 10px 16px; margin-right: 5px; }
+QTabBar::tab:selected { color: #ddfff8; background: #15343c; border-bottom: 2px solid #79e2d2; }
+QTabBar::tab:hover:!selected { color: #e7f4ff; background: #142637; }
+QListWidget { background: #101d2d; color: #dbe6f3; border: 1px solid #203349; border-radius: 9px; outline: 0; }
+QListWidget::item:selected { background: #193d43; color: #e5fff9; }
 QScrollBar:vertical { background: transparent; width: 7px; margin: 4px 0; }
 QScrollBar::handle:vertical { background: #294157; border-radius: 3px; min-height: 28px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
@@ -725,9 +731,13 @@ class MainWindow(QMainWindow):
         if factory is None:
             from desktop.voice import VoiceService
             from desktop.ai_routing import FallbackTranscription
+            from desktop.cloud_speech import OpenAIRealtimeSpeech
+            from desktop.openai_mode import OpenAIEnvironment
             factory = VoiceService
             state_dir = self.core.state_dir
-            options["transcriber_factory"] = lambda: FallbackTranscription(state_dir)
+            cloud_environment = OpenAIEnvironment(state_dir, self.core.store.preferences)
+            options["transcriber_factory"] = lambda: FallbackTranscription(state_dir, environ=cloud_environment)
+            options["speech_factory"] = lambda: OpenAIRealtimeSpeech(state_dir=state_dir, environ=cloud_environment)
             options["on_command"] = self._command_callback(self._capture_session)
         voice = factory(on_text=self._recognition_callback(self._capture_session), on_state=self.events.voice_state.emit,
                         model_dir=self.model_dir, **options)
@@ -793,7 +803,7 @@ class MainWindow(QMainWindow):
         side.addWidget(label("НА ЭТОМ КОМПЬЮТЕРЕ", "eyebrow"))
         side.addWidget(label("Задачи и заметки доступны\nбез интернета.", "muted", True))
         side.addSpacing(15)
-        side.addWidget(label("DESKTOP 4.4.1", "eyebrow"))
+        side.addWidget(label("DESKTOP 4.5.0", "eyebrow"))
         shell.addWidget(sidebar)
         content = QWidget()
         main = QVBoxLayout(content)
@@ -1015,6 +1025,7 @@ class MainWindow(QMainWindow):
         self.voice_engine.addItem("Голос Windows", "windows")
         self.voice_engine.addItem("Выразительный голос (личное использование)", "expressive")
         self.voice_engine.addItem("Голос по вашему образцу (RU/EN)", "clone")
+        self.voice_engine.addItem("OpenAI · естественный голос и умный диалог", "openai")
         engine_index = self.voice_engine.findData(self.preferences.get("voice_engine", "auto"))
         self.voice_engine.setCurrentIndex(max(0, engine_index))
         self.voice_engine.currentIndexChanged.connect(self._voice_engine_changed)
@@ -1037,6 +1048,12 @@ class MainWindow(QMainWindow):
         self.voice_backend_status = label("Источник голоса определяется при подготовке.", "muted", True)
         self.voice_backend_status.setObjectName("voiceBackendStatus")
         content.addWidget(self.voice_backend_status)
+        self.recognition_backend_status = label("", "muted", True)
+        self.recognition_backend_status.setObjectName("recognitionBackendStatus")
+        content.addWidget(self.recognition_backend_status)
+        content.addWidget(label("В режиме OpenAI речь после слова «Джарвис», вопросы и озвучиваемые ответы передаются OpenAI. "
+                               "Постоянное ожидание имени работает локально. Запросы платные; дневной лимит по умолчанию $0.25. "
+                               "Этот голос создан ИИ. Без подключения остаются локальные команды и заметки.", "muted", True))
         self.voice_rate_label = label("Темп речи", "muted")
         content.addWidget(self.voice_rate_label)
         speed_row = QHBoxLayout()
@@ -1066,7 +1083,8 @@ class MainWindow(QMainWindow):
         self.auto_listen_toggle.toggled.connect(self._auto_listen_changed)
         content.addWidget(self.auto_listen_toggle)
         self.multilingual_toggle = QCheckBox("Понимать русскую и английскую речь")
-        self.multilingual_toggle.setChecked(bool(self.preferences.get("multilingual_stt_enabled", False)))
+        self.multilingual_toggle.setChecked(bool(self.preferences.get("multilingual_stt_enabled", False)) or self.preferences.get("voice_engine") == "openai")
+        self.multilingual_toggle.setEnabled(self.preferences.get("voice_engine") != "openai")
         self.multilingual_toggle.toggled.connect(self._multilingual_changed)
         content.addWidget(self.multilingual_toggle)
         content.addWidget(label("Двуязычный режим использует отдельно установленную локальную модель. Если её нет, продолжает работать русский режим; аудио не отправляется в облако.", "muted", True))
@@ -1643,6 +1661,10 @@ class MainWindow(QMainWindow):
             widget.setVisible(personal)
         self.voice_personal_license.setVisible(self.voice_engine.currentData() in {"expressive", "clone"})
         self.save_preference("voice_engine", self.voice_engine.currentData())
+        if hasattr(self, "multilingual_toggle"):
+            cloud = self.voice_engine.currentData() == "openai"
+            self.multilingual_toggle.setEnabled(not cloud)
+            self._set_checked_silently(self.multilingual_toggle, cloud or self.preferences.get("multilingual_stt_enabled", False))
 
     def _activity_monitor_changed(self, enabled):
         previous = bool(self.preferences.get("activity_monitor_enabled", False))
@@ -1749,9 +1771,28 @@ class MainWindow(QMainWindow):
             "clone_warming": "Голос по образцу готовится. Ответ ожидает озвучки.",
             "clone_unavailable": "Голос по образцу недоступен. Ответы доступны текстом; другой тембр не подставляется.",
             "personal_cue": "Личное приветствие из записи.",
+            "openai": "Естественный голос OpenAI (потоковая озвучка).",
+            "openai_unavailable": "Голос OpenAI пока недоступен: подключение, ключ или дневной лимит. Ответы доступны текстом.",
             "unavailable": "Озвучивание недоступно; ответ доступен текстом.",
         }
         self.voice_backend_status.setText(labels.get(state.get("speech_backend"), "Источник голоса определяется при подготовке."))
+        recognition = state.get("recognition", {})
+        reasons = {
+            "silence": "Микрофон передал почти тишину. Проверь выбранный микрофон и его уровень в Windows.",
+            "no_speech": "В записи не удалось выделить речь. Попробуй говорить ближе к микрофону.",
+            "audio_clipped": "Сигнал микрофона перегружен. Уменьши его усиление в Windows.",
+            "low_confidence": "Распознавание не уверено в словах. Команда не выполнена; можно написать её.",
+            "language_unsupported": "Не удалось уверенно определить русский или английский язык короткой фразы.",
+            "model_missing": "Локальная модель распознавания не найдена.",
+            "dependencies_missing": "Компоненты распознавания пока не установлены.",
+            "authentication": "OpenAI отклонил ключ подключения.",
+            "quota_or_rate_limit": "OpenAI сообщил об ограничении запросов или средств.",
+            "budget_exceeded": "Достигнут дневной лимит Jarvis для OpenAI.",
+            "not_configured": "Подключение OpenAI ещё не настроено. Локальные команды доступны.",
+            "network_unavailable": "Не удалось связаться с OpenAI; используется локальное распознавание.",
+        }
+        if hasattr(self, "recognition_backend_status"):
+            self.recognition_backend_status.setText(reasons.get(recognition.get("reason"), ""))
 
     def _commit_voice_rate(self):
         self._voice_rate_timer.stop()

@@ -250,7 +250,7 @@ class LocalStore:
         if "voice_rate" in updates and (type(updates["voice_rate"]) is not int or not 90 <= updates["voice_rate"] <= 240):
             raise ValueError("Voice rate must be 90..240")
         if "voice_engine" in updates and (not isinstance(updates["voice_engine"], str)
-                                          or updates["voice_engine"] not in {"auto", "windows", "expressive", "clone"}):
+                                          or updates["voice_engine"] not in {"auto", "windows", "expressive", "clone", "openai"}):
             raise ValueError("Unsupported speech engine")
         if "voice_character" in updates and (not isinstance(updates["voice_character"], str)
                                              or updates["voice_character"] not in {"aidar", "eugene"}):

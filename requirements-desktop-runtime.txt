@@ -12,3 +12,5 @@ ctranslate2==4.8.4
 tokenizers==0.23.3
 huggingface-hub==0.36.2
 PyYAML==6.0.3
+# Bounded optional OpenAI Realtime speech transport (BSD-3-Clause).
+websockets==16.1.1

@@ -367,7 +367,10 @@ class _Client:
             try:
                 run.check()
                 opener = self.opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect(), _PinnedHTTPS(run))
-                with opener.open(request, timeout=max(0.001, deadline - time.monotonic())) as response:
+                # Addition/subtraction of a large monotonic timestamp can add
+                # an ULP. Keep the configured per-provider ceiling exact too.
+                ceiling = CHAT_TIMEOUT if endpoint == CHAT_URL else STT_TIMEOUT
+                with opener.open(request, timeout=min(ceiling, max(0.001, deadline - time.monotonic()))) as response:
                     run.check()
                     if response.geturl() != endpoint:
                         raise CloudUnavailable("origin_refused")
