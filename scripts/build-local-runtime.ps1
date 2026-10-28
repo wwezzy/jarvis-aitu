@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 $repoPath = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 if (-not $PythonPath) { $PythonPath = Join-Path $repoPath '.venv\Scripts\python.exe' }
 $PythonPath = (Resolve-Path -LiteralPath $PythonPath).Path
-if (-not $InstallRoot) { $InstallRoot = Join-Path $env:USERPROFILE 'Applications\JarvisDesktopLocal' }
+if (-not $InstallRoot) { $InstallRoot = Join-Path $env:USERPROFILE 'Applications\JarvisDesktopLocal-4.4.1' }
 $installPath = [IO.Path]::GetFullPath($InstallRoot)
 if ((Test-Path -LiteralPath $installPath) -and (Get-ChildItem -LiteralPath $installPath -Force | Select-Object -First 1)) {
     throw 'The destination is not empty. Choose a new versioned installation directory; existing files are never deleted.'
@@ -154,7 +154,7 @@ runpy.run_path(str(APP / "desktop_app.py"), run_name="__main__")
 $launcherPath = Join-Path $installPath 'launcher.pyw'
 [IO.File]::WriteAllText($launcherPath, $launcher, [Text.UTF8Encoding]::new($false))
 $manifest = @{
-    version = '4.4.0'; kind = 'isolated-source-runtime'; sourceCommit = (& git -C $repoPath rev-parse HEAD).Trim()
+    version = '4.4.1'; kind = 'isolated-source-runtime'; sourceCommit = (& git -C $repoPath rev-parse HEAD).Trim()
     runtimeSigner = $signature.SignerCertificate.Subject
     pythonwSha256 = (Get-FileHash -LiteralPath (Join-Path $runtimePath 'pythonw.exe') -Algorithm SHA256).Hash
     personalDataBundled = $false; cloudCredentialsBundled = $false
@@ -220,7 +220,7 @@ if (-not $NoShortcut) {
     $shortcut.Description = 'JARVIS — локальный голосовой ассистент'
     $shortcut.Save()
     Write-Output ('Start Menu shortcut: ' + $shortcutPath)
-    $downloadPath = Join-Path $env:USERPROFILE 'Downloads\Jarvis-Desktop-4.4.0'
+    $downloadPath = Join-Path $env:USERPROFILE 'Downloads\Jarvis-Desktop-4.4.1'
     New-Item -ItemType Directory -Path $downloadPath -Force | Out-Null
     Copy-Item -LiteralPath $shortcutPath -Destination (Join-Path $downloadPath 'JARVIS.lnk') -Force
     Write-Output ('Ready launch shortcut: ' + (Join-Path $downloadPath 'JARVIS.lnk'))
