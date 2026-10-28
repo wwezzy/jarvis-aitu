@@ -43,7 +43,9 @@ _DIAGNOSTIC_REASONS = (
     "transcript_limit", "repetition_rejected", "transcription_failed", "not_configured", "budget_exceeded",
     "budget_unavailable", "authentication", "access_denied", "quota_or_rate_limit", "timeout", "network_unavailable",
     "invalid_transcript", "invalid_response", "configuration_changed", "stale_request", "missing_audio",
-    "capture_unavailable", "unknown")
+    "capture_unavailable", "unknown", "credit_balance_exhausted", "insufficient_quota",
+    "organization_spend_limit_exceeded", "project_spend_limit_exceeded", "organization_usage_limit_exceeded",
+    "rate_limit_exceeded", "slow_down")
 _DIAGNOSTIC_STAGES = (None, "factory", "prepare", "decode", "english_wake", "local_prepare", "local_decode",
                       "cloud_prepare", "cloud_decode", "vosk_shortcut", "wake", "capture")
 _DIAGNOSTIC_PROVIDERS = (None, "local", "openai", "vosk")
@@ -428,11 +430,20 @@ class VoiceService:
                     self.speech_backend = "clone"
             except Exception:
                 pass
+        speech_error = None
+        if self.speech_engine == "openai" and self.speech_backend == "openai_unavailable":
+            raw_reason = getattr(self._active_backend, "reason", None)
+            speech_error = raw_reason if type(raw_reason) is str and raw_reason in _DIAGNOSTIC_REASONS else "unavailable"
         return {"ready": dependencies and model and microphone, "model": model,
                 "dependencies": dependencies, "microphone": microphone, "reason": reason,
                 "running": bool(self._thread and self._thread.is_alive()),
                 "speaking": self._speaking.is_set(), "speech_backend": self.speech_backend,
-                "diagnostics": self.diagnostics(), "recognition": self.recognition_status()}
+                "diagnostics": self.diagnostics(), "recognition": self.recognition_status(), "speech_error": speech_error}
+
+    @property
+    def capture_stopped(self) -> bool:
+        """Thread lifecycle only; checking this never opens or probes a device."""
+        return not (self._thread and self._thread.is_alive())
 
     def start(self) -> bool:
         with self._lock:
@@ -590,13 +601,19 @@ class VoiceService:
 
         if canceled.is_set() or generation != self._speech_generation:
             return None
-        if not self.multilingual_stt_enabled or self._stt is None:
+        if not self.multilingual_stt_enabled:
             return text
         # Text equality alone is not acoustic confidence. Only the caller's
         # validated final Vosk word scores permit the finite utility shortcut.
         if confident:
             self._recognition_status("ready", "vosk_shortcut", "vosk")
             return text
+        if decoder is None:
+            if self.speech_engine == "openai":
+                self._recognition_status("backend_unavailable", "prepare")
+                self._emit(self.on_state, "Распознавание ещё не готово. Перезапусти микрофон или напиши команду.")
+                return None
+            return text  # Preserve the explicitly selected local Russian fallback.
         if pcm is None:
             self._recognition_status("missing_audio", "decode")
             self._emit(self.on_state, "Недостаточно аудио для уверенного распознавания. Повтори команду.")
@@ -1004,11 +1021,12 @@ class VoiceService:
             self._close_backend()
         self.speech_engine, self.speech_rate = engine, rate
         self.speech_character = character
-        if multilingual != self.multilingual_stt_enabled:
+        effective_multilingual = multilingual or engine == "openai"
+        if effective_multilingual != self.multilingual_stt_enabled:
             self.gate.reset()
             self._audio_epoch += 1
             self._clear_audio()
-        self.multilingual_stt_enabled = multilingual or engine == "openai"
+        self.multilingual_stt_enabled = effective_multilingual
         self.speech_enabled = bool(preferences.get("speech_enabled", self.speech_enabled))
         if not self.speech_enabled:
             self.interrupt()

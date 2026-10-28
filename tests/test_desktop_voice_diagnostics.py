@@ -29,6 +29,20 @@ def _words(text, confidence=1.0):
     return [{"word": word.casefold(), "conf": confidence} for word in text.split()]
 
 
+@pytest.mark.parametrize("reason, expected", [("credit_balance_exhausted", "credit_balance_exhausted"),
+    ("project_spend_limit_exceeded", "project_spend_limit_exceeded"), ("PRIVATE_PROVIDER_MESSAGE", "unavailable"),
+    ({"private": "message"}, "unavailable"), (None, "unavailable")])
+def test_speech_availability_projects_only_fixed_account_error_labels(service, monkeypatch, reason, expected):
+    instance = service.instance
+    monkeypatch.setattr(voice.importlib.util, "find_spec", lambda *_: None)
+    instance.speech_engine, instance.speech_backend = "openai", "openai_unavailable"
+    instance._active_backend = SimpleNamespace(reason=reason)
+    state = instance.available()
+    assert state["speech_error"] == expected and "PRIVATE_PROVIDER_MESSAGE" not in repr(state)
+    instance.speech_backend = "openai"
+    assert instance.available()["speech_error"] is None
+
+
 @pytest.mark.parametrize("phrase", ["доброе утро", "good morning", "ты меня слышишь", "can you hear me", "что ты умеешь"])
 @pytest.mark.parametrize("confidence", [.90, 1.0])
 def test_clear_literal_utility_after_wake_avoids_redundant_decoder_without_weakening_confidence(service, phrase, confidence):

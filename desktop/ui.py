@@ -1656,15 +1656,58 @@ class MainWindow(QMainWindow):
         return True
 
     def _voice_engine_changed(self, _index):
-        personal = self.voice_engine.currentData() == "expressive"
+        engine = self.voice_engine.currentData()
+        previous = self.preferences.get("voice_engine", "auto")
+        multilingual = self.preferences.get("multilingual_stt_enabled", False)
+        recognition_changed = (multilingual or previous == "openai") != (multilingual or engine == "openai")
+        pending = getattr(self, "_voice_mode_restart", None)
+        pending_capture = (pending is not None and pending[0] == self._capture_session
+                           and pending[1] is self.voice)
+        was_listening = self.listening or self._capture_requested or pending_capture
+        if recognition_changed and was_listening:
+            self.stop_listening()  # Old session callbacks and queued audio lose authority.
+        if not self.save_preference("voice_engine", engine):
+            blocked = self.voice_engine.blockSignals(True)
+            self.voice_engine.setCurrentIndex(self.voice_engine.findData(previous))
+            self.voice_engine.blockSignals(blocked)
+            engine = previous
+        personal = engine == "expressive"
         for widget in (self.voice_character_label, self.voice_character):
             widget.setVisible(personal)
-        self.voice_personal_license.setVisible(self.voice_engine.currentData() in {"expressive", "clone"})
-        self.save_preference("voice_engine", self.voice_engine.currentData())
+        self.voice_personal_license.setVisible(engine in {"expressive", "clone"})
         if hasattr(self, "multilingual_toggle"):
-            cloud = self.voice_engine.currentData() == "openai"
+            cloud = engine == "openai"
             self.multilingual_toggle.setEnabled(not cloud)
             self._set_checked_silently(self.multilingual_toggle, cloud or self.preferences.get("multilingual_stt_enabled", False))
+        if recognition_changed and was_listening:
+            self._resume_voice_after_mode_change()
+
+    def _resume_voice_after_mode_change(self):
+        """Resume prior capture consent only after the old listener really exits."""
+        import time
+        pending = (self._capture_session, self.voice, time.monotonic() + 10)
+        self._voice_mode_restart = pending
+
+        def resume():
+            if getattr(self, "_voice_mode_restart", None) is not pending:
+                return
+            if (self._quitting or pending[0] != self._capture_session or pending[1] is not self.voice
+                    or self.listening or self._capture_requested):
+                self._voice_mode_restart = None
+                return
+            # start() refuses overlapping listeners. Wait without blocking Qt
+            # when a stopped listener is still finishing a bounded decoder call.
+            if getattr(self.voice, "capture_stopped", True) is True:
+                self._voice_mode_restart = None
+                self.start_listening()
+            elif time.monotonic() >= pending[2]:
+                self._voice_mode_restart = None
+                self.status.setText("Прежний сеанс микрофона ещё завершается. Повторите включение немного позже.")
+            else:
+                self.status.setText("Завершаю прежний сеанс распознавания…")
+                QTimer.singleShot(50, resume)
+
+        resume()
 
     def _activity_monitor_changed(self, enabled):
         previous = bool(self.preferences.get("activity_monitor_enabled", False))
@@ -1787,12 +1830,22 @@ class MainWindow(QMainWindow):
             "dependencies_missing": "Компоненты распознавания пока не установлены.",
             "authentication": "OpenAI отклонил ключ подключения.",
             "quota_or_rate_limit": "OpenAI сообщил об ограничении запросов или средств.",
+            "credit_balance_exhausted": "Средства API OpenAI закончились. Голос OpenAI пока недоступен.",
+            "insufficient_quota": "OpenAI ограничил квоту API. Проверь средства и лимиты аккаунта.",
+            "organization_spend_limit_exceeded": "Достигнут лимит расходов организации OpenAI.",
+            "project_spend_limit_exceeded": "Достигнут лимит расходов проекта OpenAI.",
+            "organization_usage_limit_exceeded": "Достигнут разрешённый OpenAI лимит использования API.",
+            "rate_limit_exceeded": "OpenAI временно ограничил скорость запросов. Повтори позже.",
+            "slow_down": "OpenAI просит снизить скорость запросов. Повтори позже.",
             "budget_exceeded": "Достигнут дневной лимит Jarvis для OpenAI.",
             "not_configured": "Подключение OpenAI ещё не настроено. Локальные команды доступны.",
             "network_unavailable": "Не удалось связаться с OpenAI; используется локальное распознавание.",
         }
         if hasattr(self, "recognition_backend_status"):
             self.recognition_backend_status.setText(reasons.get(recognition.get("reason"), ""))
+        speech_error = state.get("speech_error")
+        if type(speech_error) is str and speech_error in reasons:
+            self.voice_backend_status.setText(reasons[speech_error])
 
     def _commit_voice_rate(self):
         self._voice_rate_timer.stop()

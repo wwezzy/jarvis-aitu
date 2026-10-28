@@ -228,6 +228,12 @@ def test_default_main_window_factories_share_live_explicit_environment_without_e
             "reason": "PRIVATE_RECOGNIZED_WORDS", "error": "private-key.env", "transcript": "private words"}})
         assert widget.recognition_backend_status.text() == ""
         assert "PRIVATE" not in widget.voice_backend_status.text()
+        widget._update_voice_backend_status({"speech_backend": "openai_unavailable",
+                                            "speech_error": "credit_balance_exhausted"})
+        assert "Средства API OpenAI закончились" in widget.voice_backend_status.text()
+        widget._update_voice_backend_status({"speech_backend": "openai_unavailable",
+                                            "speech_error": "PRIVATE_PROVIDER_MESSAGE"})
+        assert "PRIVATE" not in widget.voice_backend_status.text()
     finally:
         widget._quitting = True
         widget.close()
