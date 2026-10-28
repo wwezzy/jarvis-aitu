@@ -84,17 +84,60 @@ class PhoneDelivery:
         if self._telegram or self._twilio:
             try:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
-                with self._db() as db:
+                with self._processor_lease() as exclusive, self._db() as db:
                     db.execute("""CREATE TABLE IF NOT EXISTS outbox(
                         provider TEXT, event_id TEXT, text TEXT NOT NULL, fingerprint TEXT NOT NULL,
                         state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL,
                         next_at REAL NOT NULL, provider_id TEXT, error_class TEXT,
                         PRIMARY KEY(provider,event_id))""")
                     db.execute("CREATE TABLE IF NOT EXISTS call_days(day TEXT PRIMARY KEY)")
-                    db.execute("UPDATE outbox SET state='uncertain' WHERE state='claimed'")
+                    if exclusive:
+                        db.execute("UPDATE outbox SET state='uncertain' WHERE state='claimed'")
                 self._ready = True
             except Exception:
                 pass  # Optional delivery cannot prevent the local assistant.
+
+    @contextmanager
+    def _processor_lease(self):
+        """One bounded sender/recovery owner per database, across processes.
+
+        The OS releases the byte/file lock after a crash. A second live
+        instance must not reinterpret an in-flight HTTP claim as an orphan.
+        Acquisition never waits for another sender or holds a SQL transaction
+        across network I/O. The file contains one nonsecret sentinel byte.
+        """
+        stream, locked = None, False
+        try:
+            stream = self._path.with_suffix(".lock").open("a+b", buffering=0)
+            stream.seek(0)
+            if not stream.read(1):
+                stream.write(b"\0")
+            stream.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+        except (OSError, ImportError):
+            pass
+        try:
+            yield locked
+        finally:
+            if stream is not None:
+                if locked:
+                    try:
+                        stream.seek(0)
+                        if os.name == "nt":
+                            import msvcrt
+                            msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                        else:
+                            import fcntl
+                            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                stream.close()
 
     @contextmanager
     def _db(self):
@@ -201,57 +244,83 @@ class PhoneDelivery:
         if not self._ready:
             return self.status()
         try:
-            with self._lock:
-                with self._db() as db:
-                    rows = db.execute("SELECT * FROM outbox WHERE state='pending' AND next_at<=? ORDER BY created LIMIT 4",
-                                      (self._clock(),)).fetchall()
-                for row in rows:
-                    now, key = self._clock(), (row["provider"], row["event_id"])
-                    state, detail, error_class = "discarded", None, None
-                    if now - row["created"] >= 86400 or not self._current(row):
-                        self._update(key, state)
-                        continue
-                    local = datetime.fromtimestamp(now, _ZONE)
-                    if row["provider"] == "twilio" and not 480 <= local.hour * 60 + local.minute < 1350:
-                        next_day = local.date() + timedelta(days=local.hour * 60 + local.minute >= 1350)
-                        opening = datetime.combine(next_day, datetime.min.time(), _ZONE) + timedelta(hours=8)
-                        self._update(key, "pending", next_at=opening.timestamp())
-                        continue
-                    try:
-                        request = self._request(row)  # Validate before a durable attempt claim.
-                        with self._db() as db:
-                            db.execute("BEGIN IMMEDIATE")
-                            if row["provider"] == "twilio" and not db.execute(
-                                    "INSERT OR IGNORE INTO call_days(day) VALUES(?)", (local.date().isoformat(),)).rowcount:
-                                db.execute("UPDATE outbox SET state='daily_limit' WHERE provider=? AND event_id=? AND state='pending'", key)
-                                continue
-                            claimed = db.execute("""UPDATE outbox SET state='claimed',attempts=attempts+1
-                                WHERE provider=? AND event_id=? AND state='pending' AND attempts=? AND next_at<=?""",
-                                                 (*key, row["attempts"], now)).rowcount
-                        if not claimed:
-                            continue
-                        if not self._current(row):
-                            self._update(key, "discarded")
-                            continue
-                        state, detail = self._post(row, request)
-                    except Exception as error:
-                        state, error_class = "uncertain", type(error).__name__
-                    if state == "retry":
-                        if row["attempts"] + 1 < 3 and now + detail < row["created"] + 86400:
-                            self._update(key, "pending", next_at=now + max(detail, 60 * 2 ** row["attempts"]))
-                        else:
-                            self._update(key, "failed")
-                    else:
-                        self._update(key, state, provider_id=detail, error_class=error_class)
-                    if state not in ("retry", "pending"):
-                        self._guards.pop(key, None)
+            with self._lock, self._processor_lease() as exclusive:
+                if exclusive:
+                    self._process_exclusive()
         except Exception:
             pass  # A local outbox/storage outage must not break deterministic UI.
         return self.status()
 
-    def _update(self, key, state, *, next_at=0, provider_id=None, error_class=None):
+    def _process_exclusive(self):
         with self._db() as db:
-            db.execute("UPDATE outbox SET state=?,next_at=?,provider_id=?,error_class=? WHERE provider=? AND event_id=?",
-                       (state, next_at, provider_id, error_class, *key))
-        if state not in ("pending", "claimed"):
+            # A previous process/call can have died after its durable claim.
+            # Exclusive OS ownership proves no live sender can still own it.
+            db.execute("UPDATE outbox SET state='uncertain' WHERE state='claimed'")
+            rows = db.execute("SELECT * FROM outbox WHERE state='pending' AND next_at<=? ORDER BY created LIMIT 4",
+                              (self._clock(),)).fetchall()
+        for row in rows:
+            now, key = self._clock(), (row["provider"], row["event_id"])
+            attempt, claimed = row["attempts"] + 1, False
+            if now - row["created"] >= 86400 or not self._current(row):
+                self._update(key, "discarded", expected_state="pending", attempt=row["attempts"])
+                continue
+            local = datetime.fromtimestamp(now, _ZONE)
+            if row["provider"] == "twilio" and not 480 <= local.hour * 60 + local.minute < 1350:
+                next_day = local.date() + timedelta(days=local.hour * 60 + local.minute >= 1350)
+                opening = datetime.combine(next_day, datetime.min.time(), _ZONE) + timedelta(hours=8)
+                self._update(key, "pending", expected_state="pending", attempt=row["attempts"], next_at=opening.timestamp())
+                continue
+            try:
+                request = self._request(row)  # No irreversible attempt yet.
+                with self._db() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    day = local.date().isoformat()
+                    daily_limit = row["provider"] == "twilio" and db.execute("SELECT 1 FROM call_days WHERE day=?", (day,)).fetchone()
+                    if daily_limit:
+                        db.execute("""UPDATE outbox SET state='daily_limit'
+                            WHERE provider=? AND event_id=? AND state='pending' AND attempts=?""", (*key, row["attempts"]))
+                        changed = False
+                    else:
+                        changed = db.execute("""UPDATE outbox SET state='claimed',attempts=attempts+1,provider_id=NULL,error_class=NULL
+                            WHERE provider=? AND event_id=? AND state='pending' AND attempts=? AND next_at<=?""",
+                                             (*key, row["attempts"], now)).rowcount > 0
+                        if changed and row["provider"] == "twilio":
+                            db.execute("INSERT INTO call_days(day) VALUES(?)", (day,))
+                if daily_limit:
+                    self._guards.pop(key, None)
+                    continue
+                if not changed:
+                    continue
+                claimed = True  # The durable transaction committed successfully.
+                if not self._current(row):
+                    self._update(key, "discarded", attempt=attempt)
+                    continue
+                state, detail = self._post(row, request)
+                error_class = None
+            except Exception as error:
+                if not claimed:
+                    # Request validation/claim failure sent nothing. Preserve
+                    # the pending event for a later valid configuration/claim;
+                    # never overwrite a completed or another claimed attempt.
+                    # Defer its next preflight so invalid early rows cannot
+                    # starve later pending events. This is not a POST retry.
+                    self._update(key, "pending", expected_state="pending", attempt=row["attempts"],
+                                 next_at=now + 60, error_class=type(error).__name__)
+                    continue
+                state, detail, error_class = "uncertain", None, type(error).__name__
+            if state == "retry":
+                if attempt < 3 and now + detail < row["created"] + 86400:
+                    self._update(key, "pending", attempt=attempt, next_at=now + max(detail, 60 * 2 ** row["attempts"]))
+                else:
+                    self._update(key, "failed", attempt=attempt)
+            else:
+                self._update(key, state, attempt=attempt, provider_id=detail, error_class=error_class)
+
+    def _update(self, key, state, *, attempt, expected_state="claimed", next_at=0, provider_id=None, error_class=None):
+        with self._db() as db:
+            changed = db.execute("""UPDATE outbox SET state=?,next_at=?,provider_id=?,error_class=?
+                WHERE provider=? AND event_id=? AND state=? AND attempts=?""",
+                                 (state, next_at, provider_id, error_class, *key, expected_state, attempt)).rowcount > 0
+        if changed and state not in ("pending", "claimed"):
             self._guards.pop(key, None)
+        return changed

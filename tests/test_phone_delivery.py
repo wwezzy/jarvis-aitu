@@ -1,9 +1,14 @@
 """Fake provider responses only: no messages, phone calls or paid requests."""
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import io
 import json
+from pathlib import Path
 import sqlite3
+import subprocess
+import sys
+import threading
 from urllib.parse import parse_qs
 from xml.etree import ElementTree
 
@@ -61,7 +66,7 @@ def factory(tmp_path):
 
 
 def rows(delivery):
-    with sqlite3.connect(delivery._path) as db:
+    with closing(sqlite3.connect(delivery._path)) as db:
         db.row_factory = sqlite3.Row
         return [dict(row) for row in db.execute("SELECT * FROM outbox ORDER BY provider,event_id")]
 
@@ -206,6 +211,144 @@ def test_concurrent_processors_cannot_post_the_same_event_twice(factory):
         list(pool.map(lambda delivery: delivery.process_pending(), (first, second)))
     assert len(opener_a.calls) + len(opener_b.calls) == 1
     assert rows(first)[0]["state"] == "provider_accepted"
+
+
+def test_stale_processor_validation_failure_cannot_overwrite_accepted_result(factory):
+    env = {**ENV, "DESKTOP_TELEGRAM_ENABLED": "0"}
+    first, opener_a, now = factory(env={**env, "TWILIO_PERSONAL_AUDIO_URL": "https://audio.example/owned.wav"})
+    # Legal queue text, but too large after escaping for dynamic TwiML. The
+    # fixed-audio instance has a valid request for the same queued event.
+    assert first.enqueue("concurrent-validation", "<" * 1000, call=True, is_current=lambda: True)
+    selected, release = threading.Event(), threading.Event()
+    def current(*_args):
+        selected.set()
+        assert release.wait(3)
+        return True
+    second, opener_b, _ = factory(env=env, folder=first._path.parent, lookup=current)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(second.process_pending)
+        try:
+            assert selected.wait(1)
+            first.process_pending()
+        finally:
+            release.set()
+        future.result(timeout=3)
+    now[0] += 60  # Retry only the failed preflight, which never sent a POST.
+    first.process_pending()
+    assert len(opener_a.calls) == 1 and not opener_b.calls
+    assert rows(first)[0]["state"] == "provider_accepted"
+
+
+def test_new_instance_cannot_recover_another_live_processors_claim_as_orphan(factory):
+    entered, release = threading.Event(), threading.Event()
+    def response(request):
+        entered.set()
+        assert release.wait(3)
+        return Response(request, {"ok": True, "result": {"message_id": 1, "chat": {"id": 123456789}}})
+    first, opener_a, _ = factory(behavior=response)
+    first.enqueue("live-claim", "Reminder", is_current=lambda: True)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(first.process_pending)
+        try:
+            assert entered.wait(1)
+            second, opener_b, _ = factory(folder=first._path.parent, lookup=lambda *_args: True)
+            assert rows(first)[0]["state"] == "claimed"
+            second.process_pending()
+            assert not opener_b.calls
+        finally:
+            release.set()
+        future.result(timeout=3)
+    assert len(opener_a.calls) == 1 and rows(first)[0]["state"] == "provider_accepted"
+
+
+def test_failure_before_durable_attempt_claim_is_not_an_ambiguous_post(factory, monkeypatch):
+    delivery, opener, now = factory()
+    delivery.enqueue("before-claim", "Reminder", is_current=lambda: True)
+    def failed_request(_row):
+        raise OSError("synthetic temporary preflight failure")
+    with monkeypatch.context() as patch:
+        patch.setattr(delivery, "_request", failed_request)
+        delivery.process_pending()
+    assert not opener.calls and rows(delivery)[0]["state"] == "pending"
+    assert rows(delivery)[0]["attempts"] == 0
+    delivery.process_pending()
+    assert not opener.calls
+    now[0] += 60
+    assert delivery.process_pending()["counts"] == {"provider_accepted": 1}
+    assert len(opener.calls) == 1
+
+
+def test_failed_preflight_rows_do_not_starve_later_valid_events(factory, monkeypatch):
+    delivery, opener, _ = factory()
+    for index in range(5):
+        delivery.enqueue(f"queued-{index}", "Reminder", is_current=lambda: True)
+    request = delivery._request
+    def preflight(row):
+        if row["event_id"] != "queued-4":
+            raise ValueError("synthetic invalid request")
+        return request(row)
+    monkeypatch.setattr(delivery, "_request", preflight)
+    assert delivery.process_pending()["counts"] == {"pending": 5}
+    assert delivery.process_pending()["counts"] == {"pending": 4, "provider_accepted": 1}
+    assert len(opener.calls) == 1
+
+
+def test_stale_state_or_attempt_update_cannot_overwrite_a_provider_result(factory):
+    delivery, _opener, _ = factory()
+    delivery.enqueue("fenced", "Reminder", is_current=lambda: True)
+    delivery.process_pending()
+    original = rows(delivery)[0]
+    key = ("telegram", "fenced")
+    assert not delivery._update(key, "uncertain", attempt=original["attempts"])
+    assert not delivery._update(key, "discarded", expected_state="pending", attempt=0)
+    assert rows(delivery)[0] == original
+    with sqlite3.connect(delivery._path) as db:
+        db.execute("UPDATE outbox SET state='claimed',attempts=2 WHERE event_id='fenced'")
+    assert not delivery._update(key, "uncertain", attempt=1)
+    assert rows(delivery)[0]["state"] == "claimed"
+
+
+def test_processor_lease_is_cross_process_and_crash_recovery_cannot_repost(factory):
+    delivery, opener, _ = factory()
+    delivery.enqueue("cross-process", "Reminder", is_current=lambda: True)
+    with sqlite3.connect(delivery._path) as db:
+        db.execute("UPDATE outbox SET state='claimed',attempts=1")
+    code = """import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from desktop.phone_delivery import PhoneDelivery
+delivery = PhoneDelivery(Path(sys.argv[2]), environ={})
+with delivery._processor_lease() as acquired:
+    print('locked' if acquired else 'busy', flush=True)
+    sys.stdin.buffer.read(1)
+"""
+    # Windows venv python.exe is a launcher with a separate interpreter child;
+    # terminate the actual lock owner, not that launcher's wrapper process.
+    python = getattr(sys, "_base_executable", sys.executable)
+    process = subprocess.Popen([python, "-I", "-c", code,
+        str(Path(__file__).resolve().parents[1]), str(delivery._path.parent)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        assert pool.submit(process.stdout.readline).result(timeout=5).strip() == b"locked"
+        observer, observer_opener, _ = factory(folder=delivery._path.parent, lookup=lambda *_args: True)
+        assert rows(delivery)[0]["state"] == "claimed"
+        observer.process_pending()
+        assert not observer_opener.calls and rows(delivery)[0]["state"] == "claimed"
+    finally:
+        if process.poll() is None:
+            process.terminate()  # Only the test-owned, credential-free helper.
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1)
+        pool.shutdown(wait=True)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            stream.close()
+    assert delivery.process_pending()["counts"] == {"uncertain": 1}
+    assert not opener.calls
 
 
 def test_ambiguous_timeout_never_retries_or_claims_delivered_and_stores_no_error_details(factory):
