@@ -151,13 +151,15 @@ def test_stream_uses_owned_runtime_keeps_warm_and_never_passes_secret_env(manife
     assert process.terminated == 1
 
 
-def test_original_ru_ack_and_warmed_en_ack_cached_without_repeated_synthesis(manifest):
+def test_original_ru_ack_and_explicit_en_ack_cached_without_repeated_synthesis(manifest):
     voice, process, _ = adapter(manifest)
     assert voice.synthesize("Да, сэр")[0] == b"\x01\x00" * 2400
     assert process.requests == []
     assert voice.prepare()
-    assert len(process.requests) == 1 and process.requests[0]["text"] == "Yes, sir."
+    assert process.requests == [] and voice.fixed_ack("en") is None
     assert voice.synthesize("Yes, sir!")[0] == b"\x01\x00" * 100
+    assert len(process.requests) == 1 and process.requests[0]["text"] == "Yes, sir!"
+    assert voice.synthesize("Yes, sir.")[0] == b"\x01\x00" * 100
     assert len(process.requests) == 1
     voice.close()
 
@@ -185,6 +187,8 @@ def test_background_preparation_does_not_block_exact_cue_or_duplicate_warmers(ma
         release.set()
     voice._background_thread.join(1)
     assert voice.is_ready and not voice.prepare_background()
+    assert voice.fixed_ack("en") is None
+    assert voice.synthesize("Yes, sir.") == (b"\x01\x00" * 100, 24000)
     assert voice.fixed_ack("en") == (b"\x01\x00" * 100, 24000)
     voice.close()
     assert not voice.is_ready and not voice.prepare_background()

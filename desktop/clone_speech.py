@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 from collections import OrderedDict
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -26,6 +27,7 @@ SAMPLE_RATE = 24000
 MAX_PCM_BYTES = SAMPLE_RATE * 2 * 60
 MAX_FRAME_BYTES = 800000
 MAX_CHUNK_BYTES = SAMPLE_RATE * 2 * 12
+PREPARATION_RETRY_DELAY = 60.0
 STARTUP_REASONS = {"model_invalid", "manifest_invalid", "asset_invalid", "worker_invalid",
                    "runtime_invalid", "cuda_unavailable", "reference_invalid", "manifest_missing"}
 MODEL_REVISION = "6c2b0d75eae4b7047358e3b6bd9325f857d43f77"
@@ -233,6 +235,7 @@ class CloneSpeech:
         self._ack_cache = OrderedDict()
         self._cue_lock, self._fixed_acks = threading.RLock(), {}
         self._ready, self._warming, self._background_thread = False, False, None
+        self._prepare_retry_after = 0.0
 
     @property
     def is_ready(self):
@@ -276,16 +279,20 @@ class CloneSpeech:
         if not self.personal_use or self._closed.is_set():
             return False
         with self._state_lock:
-            if self._warming or (self._ready and self._process is not None and self._process.poll() is None):
+            if (self._warming or time.monotonic() < self._prepare_retry_after
+                    or self._ready and self._process is not None and self._process.poll() is None):
                 return False
             self._warming = True
 
         def warm():
+            prepared = False
             try:
-                self.prepare(rate)
+                prepared = self.prepare(rate)
             finally:
                 with self._state_lock:
                     self._warming = False
+                    self._prepare_retry_after = (0.0 if prepared else
+                                                 time.monotonic() + PREPARATION_RETRY_DELAY)
         thread = threading.Thread(target=warm, name="jarvis-clone-prepare", daemon=True)
         self._background_thread = thread
         try:
@@ -293,8 +300,44 @@ class CloneSpeech:
         except RuntimeError:
             with self._state_lock:
                 self._warming = False
+                self._prepare_retry_after = time.monotonic() + PREPARATION_RETRY_DELAY
             return False
         return True
+
+    @contextmanager
+    def _request_slot(self, cancel=None):
+        """Bound admission to the owned helper, including cancellation while busy."""
+        deadline = time.monotonic() + self._request_timeout
+        acquired = False
+        try:
+            while True:
+                if self._closed.is_set():
+                    raise CloneSpeechUnavailable("closed")
+                try:
+                    cancelled = cancel is not None and cancel()
+                except Exception:
+                    cancelled = True
+                if cancelled:
+                    raise CloneSpeechUnavailable("cancelled")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise CloneSpeechUnavailable("helper_timeout")
+                if acquired:
+                    break
+                acquired = self._request_lock.acquire(timeout=min(0.05, remaining))
+            yield
+        finally:
+            if acquired:
+                self._request_lock.release()
+
+    def _publish_ready(self, process):
+        """Publish preparation only after releasing the request admission lock."""
+        with self._state_lock:
+            if (self._process is process and process is not None
+                    and process.poll() is None and not self._closed.is_set()):
+                self._ready = True
+                return True
+        return False
 
     def available(self):
         if not self.personal_use:
@@ -420,7 +463,7 @@ class CloneSpeech:
     def _ensure_child(self):
         with self._state_lock:
             if self._process is not None and self._process.poll() is None:
-                return
+                return self._process
         self._stop_child()
         if not self.available():
             raise CloneSpeechUnavailable(self.reason)
@@ -444,29 +487,27 @@ class CloneSpeech:
                 self.error_class = backend_error
             reason = frame.get("reason")
             raise CloneSpeechUnavailable(reason if isinstance(reason, str) and reason in STARTUP_REASONS else "helper_unavailable")
-        with self._state_lock:
-            if self._process is process and not self._closed.is_set():
-                self._ready = True
+        return process
 
     def prepare(self, rate=185):
         self.error_class = None
         try:
             validate_request("Да, сэр", rate)
-            with self._request_lock:
-                self._ensure_child()
-                # Only this fixed acknowledgment is precomputed. No personal
-                # text is synthesized, cached or written during warm-up.
-                english, _ = self.synthesize("Yes, sir.", rate, language="en")
-                with self._cue_lock:
-                    self._fixed_acks["en"] = english
-            if self._closed.is_set():
-                raise CloneSpeechUnavailable("closed")
+            with self._request_slot():
+                try:
+                    process = self._ensure_child()
+                    # Fixed cues are read lazily. No unrelated English synthesis
+                    # can delay the first ordinary response in the selected voice.
+                except Exception:
+                    self._stop_child()
+                    raise
+            if not self._publish_ready(process):
+                raise CloneSpeechUnavailable("closed" if self._closed.is_set() else "helper_closed")
             self.reason, self.error_class = "ready", None
             return True
         except Exception as error:
             self.reason = str(error) if isinstance(error, CloneSpeechUnavailable) else "helper_unavailable"
             self.error_class = self.error_class or type(error).__name__
-            self._stop_child()
             return False
 
     def _ack(self, text, language):
@@ -484,7 +525,8 @@ class CloneSpeech:
                     raise CloneSpeechUnavailable("cancelled")
                 yield fixed
                 return
-        with self._request_lock:
+        process = None
+        with self._request_slot(cancel):
             if cancel is not None and cancel():
                 raise CloneSpeechUnavailable("cancelled")
             key = (language, rate)
@@ -505,7 +547,7 @@ class CloneSpeech:
                 return
             request_id, total, count, collected = None, 0, 0, []
             try:
-                self._ensure_child()
+                process = self._ensure_child()
                 self._sequence += 1
                 request_id = self._sequence
                 self._send({"type": "synthesize", "id": request_id, "text": text, "rate": rate, "language": language})
@@ -541,6 +583,9 @@ class CloneSpeech:
                     self._ack_cache[key] = b"".join(collected)
                     while len(self._ack_cache) > 8:
                         self._ack_cache.popitem(last=False)
+                    if len(self._ack_cache[key]) <= SAMPLE_RATE * 2 * 5:
+                        with self._cue_lock:
+                            self._fixed_acks[language] = self._ack_cache[key]
                 self.reason, self.error_class = "ready", None
             except GeneratorExit:
                 self._cancel_request(request_id)
@@ -553,6 +598,8 @@ class CloneSpeech:
                 else:
                     self._stop_child()
                 raise CloneSpeechUnavailable(self.reason) from None
+        if process is not None:
+            self._publish_ready(process)
 
     def _cancel_request(self, request_id):
         if request_id is None:
