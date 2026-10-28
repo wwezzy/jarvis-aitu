@@ -54,6 +54,25 @@ class Router:
         self.closed += 1
 
 
+@pytest.mark.parametrize("reason, phrase", [
+    ("credit_balance_exhausted", "закончились средства API"),
+    ("insufficient_quota", "квоту API"),
+    ("organization_spend_limit_exceeded", "лимит расходов организации"),
+    ("project_spend_limit_exceeded", "лимит расходов проекта"),
+    ("organization_usage_limit_exceeded", "лимит использования API"),
+    ("rate_limit_exceeded", "скорость запросов"),
+    ("slow_down", "снизить скорость"),
+    ("budget_exceeded", "дневной лимит Jarvis"),
+])
+def test_core_distinguishes_api_account_limits_from_local_allowance(core, monkeypatch, reason, phrase):
+    router = Router(error=cloud_ai.CloudUnavailable(reason))
+    _install_router(monkeypatch, router)
+    result = core.handle("Объясни формирование привычки")
+    assert phrase in result.text and "Команды, задачи и заметки продолжают работать" in result.text
+    assert result.action is result.confirmation_id is None and not core.effects
+    assert len(router.calls) == router.closed == 1
+
+
 def _install_router(monkeypatch, router):
     constructors = []
 

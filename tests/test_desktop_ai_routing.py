@@ -74,6 +74,35 @@ def test_cloud_requires_exact_opt_in_and_valid_key_before_factory(tmp_path, flag
     assert value.router.last_provider == "local"
 
 
+@pytest.mark.parametrize("reason", ["credit_balance_exhausted", "project_spend_limit_exceeded", "rate_limit_exceeded",
+                                   "insufficient_quota", "organization_spend_limit_exceeded", "organization_usage_limit_exceeded", "slow_down"])
+def test_circuit_refusal_preserves_safe_provider_cause_without_answer_attempt(tmp_path, reason):
+    value = setup(tmp_path, local_enabled=False)
+    value.cloud.ready = False
+    value.cloud.reason = reason
+    try:
+        with pytest.raises(CloudUnavailable) as error:
+            value.router.answer("Hello")
+        assert error.value.reason == reason
+        assert value.cloud.calls == value.local.calls == []
+        assert value.cloud.closed == 1 and value.router.last_provider is None
+    finally:
+        value.router.close()
+
+
+def test_provider_prepare_reason_cannot_expose_arbitrary_private_text(tmp_path):
+    value = setup(tmp_path, local_enabled=False)
+    value.cloud.ready = False
+    value.cloud.reason = "PRIVATE_PROVIDER_EXCEPTION_TEXT"
+    try:
+        with pytest.raises(CloudUnavailable) as error:
+            value.router.answer("Hello")
+        assert error.value.reason == "cloud_unavailable"
+        assert "PRIVATE" not in str(error.value)
+    finally:
+        value.router.close()
+
+
 def test_cloud_final_has_provenance_safe_usage_and_no_unvalidated_preview(tmp_path):
     value, chunks = setup(tmp_path), []
     assert value.router.answer("Hello", on_chunk=chunks.append) == "cloud final"

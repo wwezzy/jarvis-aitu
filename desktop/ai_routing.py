@@ -201,6 +201,10 @@ class ChatRouter(_Lifecycle):
                             self.last_provider = "openai"
                             self.last_model = getattr(cloud, "model", None)
                             self.last_usage = _usage(cloud)
+                    else:
+                        reason = getattr(cloud, "reason", None)
+                        cloud_failure = CloudUnavailable(reason if type(reason) is str and reason in _CLOUD_STT_REASONS
+                                                         else "cloud_unavailable")
                 finally:
                     self._release(cloud)
                     _close(cloud)
@@ -257,6 +261,8 @@ _CLOUD_STT_REASONS = frozenset({
     "budget_exceeded", "budget_unavailable", "budget_invalid", "timeout", "busy",
     "origin_refused", "provider_error", "response_limit", "invalid_response",
     "invalid_transcript", "transcript_limit", "network_unavailable", "cloud_unavailable",
+    "credit_balance_exhausted", "insufficient_quota", "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded", "organization_usage_limit_exceeded", "rate_limit_exceeded", "slow_down",
 })
 
 

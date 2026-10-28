@@ -23,6 +23,7 @@ import time
 
 from desktop.cloud_ai import (
     CloudBudgetExceeded, CloudCancelled, CloudUnavailable, _CIRCUITS, _CIRCUIT_LOCK, _Client, _INFLIGHT, _Run,
+    _QUOTA_REASONS, _RATE_REASONS, _error_cooldown, _quota_body_reason, _quota_details_reason,
 )
 
 
@@ -44,7 +45,7 @@ _INSTRUCTIONS = ("Read the supplied user text aloud verbatim in its original lan
 _REASONS = {"not_configured", "configuration_changed", "canceled", "timeout", "busy",
             "budget_configuration", "budget_unavailable", "budget_exceeded", "dependencies_missing",
             "authentication", "access_denied", "quota_or_rate_limit", "provider_error", "network_unavailable",
-            "origin_refused", "invalid_response", "response_limit", "no_audio", "incomplete_response"}
+            "origin_refused", "invalid_response", "response_limit", "no_audio", "incomplete_response"} | _QUOTA_REASONS | _RATE_REASONS
 _LOGGER = logging.Logger("jarvis.realtime.silent")
 _LOGGER.disabled = True
 _LOGGER.propagate = False
@@ -52,9 +53,12 @@ _LOGGER.propagate = False
 
 def _reason(error):
     if isinstance(error, CloudUnavailable):
-        return error.reason if error.reason in _REASONS else "provider_error"
-    code = getattr(getattr(error, "response", None), "status_code", None)
+        return error.reason if type(error.reason) is str and error.reason in _REASONS else "provider_error"
+    response = getattr(error, "response", None)
+    code = getattr(response, "status_code", None)
     if type(code) is int:
+        if code == 429:
+            return _quota_body_reason(getattr(response, "body", None))
         return {401: "authentication", 403: "access_denied", 429: "quota_or_rate_limit"}.get(code, "provider_error")
     if isinstance(error, (TimeoutError, socket.timeout)):
         return "timeout"
@@ -468,7 +472,7 @@ class OpenAIRealtimeSpeech(_Client):
             if isinstance(error, CloudCancelled):
                 self._clear_cache()
             if not isinstance(error, CloudCancelled):
-                delay = 120 if self.reason in {"authentication", "access_denied", "quota_or_rate_limit"} else 10
+                delay = _error_cooldown(self.reason)
                 with _CIRCUIT_LOCK:
                     _CIRCUITS[hashlib.sha256(key.encode("ascii")).hexdigest()] = (time.monotonic() + delay, self.reason)
             raise
@@ -499,9 +503,10 @@ class OpenAIRealtimeSpeech(_Client):
                 raise CloudUnavailable("invalid_response")
             kind = event["type"]
             if kind == "error":
-                code = event.get("error", {}).get("code") if isinstance(event.get("error"), dict) else None
-                reason = {"invalid_api_key": "authentication", "insufficient_quota": "quota_or_rate_limit",
-                          "rate_limit_exceeded": "quota_or_rate_limit", "permission_denied": "access_denied"}.get(code, "provider_error")
+                details = event.get("error")
+                code = details.get("code") if isinstance(details, dict) else None
+                auth = {"invalid_api_key": "authentication", "permission_denied": "access_denied"}
+                reason = auth[code] if type(code) is str and code in auth else _quota_details_reason(details, "provider_error")
                 raise CloudUnavailable(reason)
             if kind == "session.created":
                 if protocol.created:

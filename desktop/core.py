@@ -974,10 +974,21 @@ class DesktopCore:
                 if client is not None:
                     self._record_chat_usage(usage_model, client, success=False)
                 return self._answer(Reply("Локальная модель сейчас недоступна. Проверь, что Ollama запущена и выбранная локальная модель установлена. Команды, задачи и заметки продолжают работать."))
-            except CloudUnavailable:
+            except CloudUnavailable as error:
                 if client is not None:
                     self._record_chat_usage(usage_model, client, success=False)
-                return self._answer(Reply("Облачный помощник сейчас недоступен или достигнут локальный лимит запросов. Проверь подключение и настройки. Команды, задачи и заметки продолжают работать."))
+                reasons = {
+                    "credit_balance_exhausted": "В OpenAI закончились средства API. Облачный голос и диалог пока недоступны.",
+                    "insufficient_quota": "OpenAI ограничил квоту API. Проверь средства и лимиты аккаунта.",
+                    "organization_spend_limit_exceeded": "Достигнут лимит расходов организации OpenAI.",
+                    "project_spend_limit_exceeded": "Достигнут лимит расходов проекта OpenAI.",
+                    "organization_usage_limit_exceeded": "Достигнут разрешённый OpenAI лимит использования API.",
+                    "rate_limit_exceeded": "OpenAI временно ограничил скорость запросов. Повтори позже.",
+                    "slow_down": "OpenAI просит снизить скорость запросов. Повтори позже.",
+                    "budget_exceeded": "Достигнут дневной лимит Jarvis для OpenAI.",
+                }
+                message = reasons.get(error.reason, "Облачный помощник сейчас недоступен или достигнут локальный лимит запросов. Проверь подключение и настройки.")
+                return self._answer(Reply(message + " Команды, задачи и заметки продолжают работать."))
             finally:
                 if cloud_chat and client is not None:
                     client.close()

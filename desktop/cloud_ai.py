@@ -36,6 +36,7 @@ import wave
 CHAT_URL = "https://api.openai.com/v1/responses"
 TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions"
 MAX_BODY = 131072
+MAX_ERROR_BODY = 8192
 MAX_INPUT_BYTES = 65536
 MAX_OUTPUT = 512
 STT_TIMEOUT = 5
@@ -299,6 +300,84 @@ def _error_reason(error):
     return "network_unavailable"
 
 
+_QUOTA_REASONS = frozenset({
+    "credit_balance_exhausted", "insufficient_quota", "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded", "organization_usage_limit_exceeded",
+})
+_RATE_REASONS = frozenset({"rate_limit_exceeded", "slow_down"})
+
+
+def _quota_details_reason(details, fallback="quota_or_rate_limit"):
+    """Shared HTTP/WebSocket projection: exact code first, never message text."""
+    if not isinstance(details, dict):
+        return fallback
+    code, kind = details.get("code"), details.get("type")
+    if type(code) is str and code in _QUOTA_REASONS | _RATE_REASONS:
+        return code
+    if type(kind) is str and kind == "insufficient_quota":
+        return "insufficient_quota"
+    return fallback
+
+
+def _quota_body_reason(body, fallback="quota_or_rate_limit"):
+    """Inspect only an already available bounded body; perform no reads or I/O."""
+    try:
+        if isinstance(body, str) and len(body) <= MAX_ERROR_BODY:
+            body = body.encode("utf-8")
+        if not isinstance(body, bytes) or not 0 < len(body) <= MAX_ERROR_BODY:
+            return fallback
+        payload = json.loads(body)
+        return _quota_details_reason(payload.get("error") if isinstance(payload, dict) else None, fallback)
+    except (ValueError, UnicodeError, RecursionError):
+        return fallback
+
+
+def _error_cooldown(reason):
+    return 120 if reason in {"authentication", "access_denied", "quota_or_rate_limit"} | _QUOTA_REASONS else 10
+
+
+def _http_error_reason(error, run):
+    """Project only fixed 429 codes from at most 8KiB; never retain messages.
+
+    HTTPError's body is the same pinned HTTPS response whose TCP/TLS sockets
+    are already attached to run. The consumer deadline remains independent of
+    a stalled read, and cancel closes those sockets before a late result can
+    be published. A synthetic blocked reader still occupies one bounded slot.
+    """
+    fallback = _error_reason(error)
+    run.check()
+    if error.code != 429:
+        return fallback
+    try:
+        reader = getattr(error, "read1", None)
+        if not callable(reader):
+            reader = error.read
+        blocks, total = [], 0
+        while True:
+            run.check()
+            block = reader(min(2048, MAX_ERROR_BODY - total + 1))
+            run.check()
+            if not isinstance(block, bytes):
+                return fallback
+            if not block:
+                break
+            total += len(block)
+            if total > MAX_ERROR_BODY:
+                return fallback
+            blocks.append(block)
+        reason = _quota_body_reason(b"".join(blocks), fallback)
+        run.check()
+        return reason
+    except CloudUnavailable as error:
+        if isinstance(error, CloudCancelled) or error.reason == "timeout":
+            raise
+        run.check()
+        return fallback
+    except Exception:
+        run.check()
+        return fallback
+
+
 class _Client:
     flag = ""
 
@@ -402,8 +481,18 @@ class _Client:
                     result.put((True, data))
             except Exception as error:
                 if isinstance(error, urllib.error.HTTPError):
-                    error.close()
-                result.put((False, _error_reason(error)))
+                    try:
+                        reason = _http_error_reason(error, run)
+                    except Exception as diagnostic_error:
+                        reason = _error_reason(diagnostic_error)
+                    finally:
+                        try:
+                            error.close()
+                        except Exception:
+                            pass
+                else:
+                    reason = _error_reason(error)
+                result.put((False, reason))
             finally:
                 run.close_transports()
                 with self._lock:
@@ -434,7 +523,7 @@ class _Client:
         except CloudUnavailable as error:
             self.reason = error.reason
             if not isinstance(error, CloudCancelled):
-                delay = 120 if error.reason in {"authentication", "access_denied", "quota_or_rate_limit"} else 10
+                delay = _error_cooldown(error.reason)
                 fingerprint = hashlib.sha256(key.encode("ascii")).hexdigest()
                 with _CIRCUIT_LOCK:
                     _CIRCUITS[fingerprint] = (time.monotonic() + delay, error.reason)
