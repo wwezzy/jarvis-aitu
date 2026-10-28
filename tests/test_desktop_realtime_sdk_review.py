@@ -15,6 +15,8 @@ def transport(monkeypatch):
     calls, canceled = [], threading.Event()
     run = cloud_ai._Run(time.monotonic() + 2, canceled, lambda: True)
     class Raw:
+        family, type, proto = socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP
+
         def settimeout(self, value):
             calls.append(("timeout", value))
 
