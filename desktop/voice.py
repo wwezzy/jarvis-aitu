@@ -242,6 +242,7 @@ class VoiceService:
         self._audio_epoch = 0
         self.multilingual_stt_enabled = False
         self._stt = None
+        self._english_wake = None
         self._active_backend = None
         self._utterance_audio_started = False
         self._audio: queue.Queue[bytes] = queue.Queue(maxsize=24)
@@ -384,16 +385,60 @@ class VoiceService:
             self._clear_audio()
             self._transcribing.clear()
 
-    def _recognized(self, text: str, pcm=None, sample_rate=None, *, words=None):
-        if (self._stop.is_set() or self._speaking.is_set()
+    def _decode_english_wake(self, pcm, sample_rate, started):
+        """A keyword candidate needs a fresh exact leading wake in full audio.
+
+        The optional English keyword model cannot itself open a command window.
+        Keep the original candidate deadline and invalidate work on any capture,
+        output or preference change while the second decoder is running.
+        """
+        if (not self.multilingual_stt_enabled or self._stt is None
+                or not isinstance(pcm, bytes) or not pcm or len(pcm) % 2
+                or type(sample_rate) is not int or not 8000 <= sample_rate <= 48000
+                or len(pcm) > sample_rate * 2 * 12):
+            return None
+        decoder = self._stt
+        epoch, generation = self._audio_epoch, self._speech_generation
+        serial, deadline = self._wake_serial, self.gate.deadline
+        last_spoken = self._last_spoken
+        self._transcribing.set()
+        self._clear_audio()
+        try:
+            decoded = decoder.transcribe(pcm, sample_rate)
+            if (self._stop.is_set() or self._closed.is_set() or self._speaking.is_set()
+                    or not self.multilingual_stt_enabled or self._stt is not decoder
+                    or self._audio_epoch != epoch or self._speech_generation != generation
+                    or self._wake_serial != serial or self.gate.deadline != deadline
+                    or self._last_spoken != last_spoken
+                    or time.monotonic() > started + self.gate.timeout
+                    or time.monotonic() - self._last_spoken < SPEECH_ECHO_TAIL
+                    or not isinstance(decoded, str) or not 1 <= len(decoded) <= 500):
+                return None
+            first = re.search(r"\w+", decoded, flags=re.UNICODE)
+            return decoded if first and first.group().casefold() in WakeGate.WAKE else None
+        except Exception:
+            # A false/uncertain idle candidate must stay silent and unarmed.
+            return None
+        finally:
+            self._clear_audio()
+            self._transcribing.clear()
+
+    def _recognized(self, text: str, pcm=None, sample_rate=None, *, words=None, english_candidate=False):
+        if (self._stop.is_set() or self._closed.is_set() or self._speaking.is_set()
                 or time.monotonic() - self._last_spoken < SPEECH_ECHO_TAIL):
             return
         now = time.monotonic()
         previous_deadline = self.gate.deadline
         armed = bool(previous_deadline and now <= previous_deadline)
-        result = self.gate.feed(text, now)
         first = re.search(r"\w+", text, flags=re.UNICODE)
         verified_wake = bool(first and first.group().casefold() in WakeGate.WAKE)
+        english_decoded = None
+        if english_candidate is True and not verified_wake and not armed:
+            english_decoded = self._decode_english_wake(pcm, sample_rate, now)
+            if english_decoded is None:
+                return
+            text, verified_wake = english_decoded, True
+        result = self.gate.feed(text, now)
         if verified_wake:
             self._wake_serial += 1
         retry_deadline = now + self.gate.timeout if verified_wake else previous_deadline if armed else 0
@@ -417,8 +462,9 @@ class VoiceService:
         if result.kind in {"wake", "command"}:
             self._emit(self.on_state, "Обрабатываю команду…")
             confident = result.kind == "command" and self._confident_alias(text, result.text, words)
-            decoded = self._decode_command(result.text if result.kind == "command" else text,
-                                           pcm, sample_rate, confident=confident)
+            decoded = (strip_wake_prefix(english_decoded) if english_decoded is not None else
+                       self._decode_command(result.text if result.kind == "command" else text,
+                                            pcm, sample_rate, confident=confident))
             if self._stop.is_set() or self._closed.is_set():
                 return
             if decoded is None or not decoded.strip():
@@ -456,6 +502,24 @@ class VoiceService:
                                          current, preserve_wake_deadline=True))
 
     def _listen(self):
+        english = None
+
+        def close_english():
+            nonlocal english
+            if english is not None:
+                try:
+                    english.close()
+                except Exception:
+                    pass
+            english = self._english_wake = None
+
+        def reset_english():
+            if english is not None:
+                try:
+                    english.reset()
+                except Exception:
+                    close_english()
+
         try:
             vosk = importlib.import_module("vosk")
             sound = importlib.import_module("sounddevice")
@@ -479,6 +543,16 @@ class VoiceService:
             set_words = getattr(recognizer, "SetWords", None)
             if callable(set_words):
                 set_words(True)
+            if self.multilingual_stt_enabled and self._stt is not None and not self._stop.is_set():
+                try:
+                    from desktop.english_wake import EnglishWakeDetector
+                    english = EnglishWakeDetector()
+                    if not english.prepare(sample_rate, vosk_module=vosk):
+                        close_english()
+                    else:
+                        self._english_wake = english
+                except Exception:
+                    close_english()
             if self._stop.is_set():
                 return
             with sound.RawInputStream(samplerate=sample_rate, blocksize=max(400, int(sample_rate * 0.05)),
@@ -486,22 +560,34 @@ class VoiceService:
                 self._emit(self.on_state, "Ожидаю слово «Джарвис»")
                 reset_after_speech = self._last_spoken
                 audio_epoch, utterance = self._audio_epoch, UtteranceBuffer(sample_rate)
+                generation, bilingual = self._speech_generation, self.multilingual_stt_enabled
                 while not self._stop.is_set():
+                    if english is not None and not self.multilingual_stt_enabled:
+                        close_english()
+                        recognizer.Reset()
+                        utterance.reset()
                     if self._speaking.is_set():
+                        reset_english()
+                        utterance.reset()
                         self._clear_audio()
                         self._stop.wait(0.05)
                         continue
                     echo_remaining = SPEECH_ECHO_TAIL - (time.monotonic() - self._last_spoken)
                     if echo_remaining > 0:
+                        reset_english()
+                        utterance.reset()
                         self._clear_audio()
                         self._stop.wait(min(0.05, echo_remaining))
                         continue
-                    if reset_after_speech != self._last_spoken or audio_epoch != self._audio_epoch:
+                    if (reset_after_speech != self._last_spoken or audio_epoch != self._audio_epoch
+                            or generation != self._speech_generation or bilingual != self.multilingual_stt_enabled):
                         recognizer.Reset()
                         self._clear_audio()
                         reset_after_speech = self._last_spoken
                         audio_epoch = self._audio_epoch
+                        generation, bilingual = self._speech_generation, self.multilingual_stt_enabled
                         utterance.reset()
+                        reset_english()
                         self._emit(self.on_state, "Слушаю команду…" if self._followup_armed() else "Ожидаю слово «Джарвис»")
                     try:
                         data = self._audio.get(timeout=0.2)
@@ -510,10 +596,28 @@ class VoiceService:
                             self.gate.reset()
                             self._emit(self.on_state, "Ожидаю слово «Джарвис»")
                         continue
+                    if self._stop.is_set() or self._closed.is_set():
+                        break
+                    if (audio_epoch != self._audio_epoch or generation != self._speech_generation
+                            or bilingual != self.multilingual_stt_enabled or self._speaking.is_set()
+                            or reset_after_speech != self._last_spoken
+                            or time.monotonic() - self._last_spoken < SPEECH_ECHO_TAIL):
+                        # A callback may revoke the capture while get() waits.
+                        # This frame cannot finish an utterance from that epoch.
+                        continue
                     complete = recognizer.AcceptWaveform(data)
                     result = json.loads(recognizer.Result()) if complete else None
                     if self.multilingual_stt_enabled:
+                        was_started = utterance.started
                         utterance.append(data, active=pcm_active(data))
+                        if english is not None and utterance.started and not utterance.overflow:
+                            try:
+                                # First active frame is already in pcm(), together
+                                # with the complete bounded preroll. Never feed
+                                # idle time or duplicate this onset frame.
+                                english.accept(data if was_started else utterance.pcm())
+                            except Exception:
+                                close_english()
                         if not complete and utterance.finished:
                             result = json.loads(recognizer.FinalResult())
                             complete = True
@@ -527,13 +631,24 @@ class VoiceService:
                             if invoked or was_armed:
                                 self._emit(self.on_state, "Фраза слишком длинная. Повтори короткую команду после «Джарвис».")
                         else:
-                            self._recognized(result.get("text", ""), utterance.pcm(), sample_rate,
-                                             words=result.get("result"))
+                            candidate = False
+                            if english is not None and self.multilingual_stt_enabled:
+                                try:
+                                    candidate = english.finish() is True
+                                except Exception:
+                                    close_english()
+                            if (audio_epoch == self._audio_epoch and generation == self._speech_generation
+                                    and bilingual == self.multilingual_stt_enabled
+                                    and reset_after_speech == self._last_spoken):
+                                self._recognized(result.get("text", ""), utterance.pcm(), sample_rate,
+                                                 words=result.get("result"), english_candidate=candidate)
                         recognizer.Reset()
                         utterance.reset()
+                        reset_english()
         except Exception as error:
             self._emit(self.on_state, f"Голос недоступен ({type(error).__name__}). Текстовый ввод работает.")
         finally:
+            close_english()
             self._clear_audio()
             self.gate.reset()
 
@@ -557,6 +672,10 @@ class VoiceService:
             self._close_backend()
         self.speech_engine, self.speech_rate = engine, rate
         self.speech_character = character
+        if multilingual != self.multilingual_stt_enabled:
+            self.gate.reset()
+            self._audio_epoch += 1
+            self._clear_audio()
         self.multilingual_stt_enabled = multilingual
         self.speech_enabled = bool(preferences.get("speech_enabled", self.speech_enabled))
         if not self.speech_enabled:
