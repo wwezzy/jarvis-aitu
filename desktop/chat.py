@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import http.client
 import io
+import math
 import re
 import select
 import socket
@@ -26,6 +27,8 @@ MAX_STREAM_LINE_BYTES = 65536
 MAX_STREAM_EVENTS = 2048
 MAX_ANSWER_CHARS = 12000
 KEEP_ALIVE = "30m"
+MAX_PREWARM_TIMEOUT = 90
+LOCAL_CONNECT_TIMEOUT = 3
 MAX_HISTORY_MESSAGES = 6
 MAX_HISTORY_CHARS = 4000
 MAX_PLAN_CONTEXT_CHARS = 2800
@@ -131,7 +134,14 @@ class _ControlledHTTPHandler(urllib.request.HTTPHandler):
 
             def connect(self):
                 owner.client._check_cancel()
-                super().connect()
+                # A cold model may need a longer header/body budget, but a
+                # missing loopback service must not borrow that whole budget.
+                original_timeout = self.timeout
+                self.timeout = min(LOCAL_CONNECT_TIMEOUT, original_timeout)
+                try:
+                    super().connect()
+                finally:
+                    self.timeout = original_timeout
                 with owner.lock:
                     owner.sockets.append(self.sock)
                 if owner.client._canceled():
@@ -334,14 +344,21 @@ class LocalChat:
         self.opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect(), self._transport)
         self.last_usage = None
         self.last_budget = None
+        self.last_warmup = None
 
     @staticmethod
     def _usage(data, started):
         def counter(name):
             value = data.get(name)
             return value if type(value) is int and 0 <= value <= (1 << 63) - 1 else None
-        return {"input_tokens": counter("prompt_eval_count"), "output_tokens": counter("eval_count"),
-                "elapsed_ms": max(0, round((time.monotonic() - started) * 1000))}
+        result = {"input_tokens": counter("prompt_eval_count"), "output_tokens": counter("eval_count"),
+                  "elapsed_ms": max(0, round((time.monotonic() - started) * 1000))}
+        for name, source in (("load_ms", "load_duration"), ("prompt_eval_ms", "prompt_eval_duration"),
+                             ("generation_ms", "eval_duration")):
+            duration = data.get(source)
+            if type(duration) is int and 0 <= duration <= 3600 * 1000000000:
+                result[name] = round(duration / 1000000, 3)
+        return result
 
     def _canceled(self):
         return self._cancel_event is not None and self._cancel_event.is_set()
@@ -526,28 +543,46 @@ class LocalChat:
         self._remaining(response, deadline)
         return final, final_event
 
-    def prewarm(self) -> bool:
+    def prewarm(self, *, timeout=None, cancel_event=None) -> bool:
         """Explicit model-only preload, with no prompt/history or service start.
 
         Ollama documents empty /api/chat requests for preload and keep_alive
         retention: https://docs.ollama.com/faq#how-can-i-preload-a-model-into-ollama-to-get-faster-response-times
         """
-        self._cancel_event = None
+        if cancel_event is not None and not isinstance(cancel_event, threading.Event):
+            raise ValueError("A cancellation event is required")
+        if timeout is not None and (type(timeout) not in {int, float} or not math.isfinite(timeout)):
+            raise ValueError("A finite model-load timeout is required")
+        load_timeout = self.timeout if timeout is None else min(MAX_PREWARM_TIMEOUT, max(1, timeout))
+        self._cancel_event = cancel_event
         self.last_usage = self.last_budget = None
+        self.last_warmup = None
         payload = {"model": self.model, "messages": [], "stream": False, "think": False,
                    "keep_alive": KEEP_ALIVE, "options": {"num_ctx": 4096}}
-        deadline = time.monotonic() + self.timeout
+        started = time.monotonic()
+        deadline = started + load_timeout
         try:
-            with self.opener.open(self._request(payload), timeout=self.timeout) as response:
+            self._check_cancel()
+            with self.opener.open(self._request(payload), timeout=load_timeout) as response:
+                self._check_cancel()
                 self._response_origin(response)
                 data = self._complete_json(response, deadline)
             message = data.get("message", {})
-            return (data.get("done") is True and data.get("done_reason") in {None, "load", "stop"}
-                    and isinstance(message, dict) and message.get("role", "assistant") == "assistant"
-                    and not message.get("tool_calls")
-                    and not message.get("content") and not message.get("thinking"))
+            ready = (data.get("done") is True and data.get("done_reason") in {None, "load", "stop"}
+                     and isinstance(message, dict) and message.get("role", "assistant") == "assistant"
+                     and not message.get("tool_calls")
+                     and not message.get("content") and not message.get("thinking"))
+            self.last_warmup = {"completed": ready, **{key: value for key, value in self._usage(data, started).items()
+                                                     if key not in {"input_tokens", "output_tokens"}}}
+            self._check_cancel()
+            return ready
         except (LocalChatUnavailable, urllib.error.URLError, OSError, ValueError, TypeError, RecursionError):
+            self.last_warmup = {"completed": False, "canceled": self._canceled(),
+                                "elapsed_ms": max(0, round((time.monotonic() - started) * 1000))}
             return False
+        finally:
+            if self._transport is not None:
+                self._transport.reset()
 
     def answer(self, text: str, history=None, on_chunk=None, *, plan_context=None, cancel_event=None) -> str:
         self.last_usage = self.last_budget = None

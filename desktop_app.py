@@ -36,7 +36,9 @@ def _warm_local_chat(model):
                 time.sleep(0.2)
         else:
             return
-        LocalChat(model, timeout=20).prewarm()
+        # Cold weight loading has its own bounded budget; it does not extend
+        # the deadline for a later interactive question.
+        LocalChat(model, timeout=20).prewarm(timeout=90)
     except Exception:
         pass  # Warm-up failure never prevents commands or application startup.
 

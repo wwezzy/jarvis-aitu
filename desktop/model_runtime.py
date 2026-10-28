@@ -21,8 +21,9 @@ def should_start_local_model(preferences, environ=None) -> bool:
     """Warm only an explicitly enabled local primary; no key/profile lookup."""
     environment = os.environ if environ is None else environ
     return (isinstance(preferences, Mapping) and preferences.get("local_chat_enabled") is True
-            and preferences.get("voice_engine") != "openai"
-            and environment.get("JARVIS_CLOUD_CHAT_ENABLED") != "1")
+            and (preferences.get("free_mode") is True
+                 or preferences.get("voice_engine") != "openai"
+                 and environment.get("JARVIS_CLOUD_CHAT_ENABLED") != "1"))
 
 
 def ensure_model_runtime(state_dir: Path, manifest: dict,

@@ -14,6 +14,7 @@ import hashlib
 import importlib.util
 import math
 from pathlib import Path
+import re
 import sys
 import threading
 import zlib
@@ -58,6 +59,8 @@ class _Decoded:
     avg_logprob: float
     no_speech_probability: float
     speech_seconds: float
+    supported_language_probability: float | None = None
+    language_selection: str = "auto"
 
 
 @dataclass
@@ -196,17 +199,52 @@ def _features(waveform, filters):
     return np.ascontiguousarray(((log_mel + 4) / 4)[None], dtype="float32")
 
 
-def _decode(backend, values, sample_rate):
+def _language_choice(candidates, preferred_language=None):
+    """Apply an explicit RU/EN prior without renormalizing foreign speech away.
+
+    Whisper's language posterior and its acoustic transcript score describe
+    different uncertainties. In the opt-in mode, a brief RU utterance may have
+    modest absolute RU probability while RU+EN together remain likely. Keep
+    the original 0.55 supported-mass gate as well as a 0.55 conditional gate.
+    A confident opposite supported language always wins over the preference.
+    """
+    if not isinstance(candidates, (list, tuple)) or not 1 <= len(candidates) <= 128:
+        raise MultilingualSTTUnavailable("low_confidence")
+    probabilities = {}
+    for candidate in candidates:
+        if not isinstance(candidate, (list, tuple)) or len(candidate) != 2:
+            raise MultilingualSTTUnavailable("low_confidence")
+        token, probability = candidate
+        if (not isinstance(token, str) or re.fullmatch(r"<\|[a-z]{2,3}\|>", token) is None or token in probabilities
+                or not isinstance(probability, (int, float)) or isinstance(probability, bool)
+                or not math.isfinite(probability) or not 0 <= probability <= 1):
+            raise MultilingualSTTUnavailable("low_confidence")
+        probabilities[token] = probability
+    if sum(probabilities.values()) > 1.01:
+        raise MultilingualSTTUnavailable("low_confidence")
+    language_token, probability = max(probabilities.items(), key=lambda item: item[1])
+    supported = ("<|ru|>", "<|en|>")
+    if language_token in supported and probability >= 0.55:
+        return language_token, probability, None, "auto"
+    if preferred_language is not None:
+        preferred = f"<|{preferred_language}|>"
+        supported_mass = sum(probabilities.get(token, 0) for token in supported)
+        preferred_probability = probabilities.get(preferred, 0)
+        if (supported_mass >= 0.55 and preferred_probability / supported_mass >= 0.55):
+            return preferred, preferred_probability, supported_mass, "ru_en_preference"
+    if language_token not in supported:
+        raise MultilingualSTTUnavailable("language_unsupported")
+    raise MultilingualSTTUnavailable("low_confidence")
+
+
+def _decode(backend, values, sample_rate, *, preferred_language=None):
     import ctranslate2
 
     waveform, speech_seconds = _speech_window(backend.vad, _audio_16k(values, sample_rate))
     features = ctranslate2.StorageView.from_array(_features(waveform, backend.filters))
     encoded = backend.model.encode(features)
-    language_token, probability = backend.model.detect_language(encoded)[0][0]
-    if language_token not in ("<|ru|>", "<|en|>"):
-        raise MultilingualSTTUnavailable("language_unsupported")
-    if not math.isfinite(probability) or probability < 0.55:
-        raise MultilingualSTTUnavailable("low_confidence")
+    language_token, probability, supported_mass, selection = _language_choice(
+        backend.model.detect_language(encoded)[0], preferred_language)
     # Only structural transcription tokens; no command list, prefix, hotwords,
     # arbitrary prompt text, conversation history or translation instruction.
     prompt = [backend.tokenizer.token_to_id(token) for token in
@@ -219,14 +257,19 @@ def _decode(backend, values, sample_rate):
         raise MultilingualSTTUnavailable("transcript_limit")
     text = backend.tokenizer.decode(tokens, skip_special_tokens=True).strip()
     avg_logprob = result.scores[0] * len(tokens) / (len(tokens) + 1)
-    return _Decoded(text, language_token[2:-2], probability, avg_logprob, result.no_speech_prob, speech_seconds)
+    return _Decoded(text, language_token[2:-2], probability, avg_logprob, result.no_speech_prob,
+                    speech_seconds, supported_mass, selection)
 
 
 class MultilingualSTT:
-    def __init__(self, model_dir=None):
+    def __init__(self, model_dir=None, *, preferred_language=None):
+        if preferred_language is not None and (type(preferred_language) is not str or preferred_language not in {"ru", "en"}):
+            raise ValueError("Preferred language must be ru, en or None")
         self.model_dir = Path(model_dir) if model_dir is not None else default_model_dir()
+        self.preferred_language = preferred_language
         self.reason, self.error_class = "not_prepared", None
         self.last_language = self.last_confidence = None
+        self.last_supported_confidence = self.last_conditional_confidence = self.last_language_selection = None
         self._backend = None
         self._lock = threading.RLock()
 
@@ -260,16 +303,27 @@ class MultilingualSTT:
 
     def transcribe(self, pcm: bytes, sample_rate: int) -> str:
         self.last_language = self.last_confidence = None
+        self.last_supported_confidence = self.last_conditional_confidence = self.last_language_selection = None
         try:
             values = _pcm_samples(pcm, sample_rate)
             with self._lock:
                 if not self.prepare():
                     raise MultilingualSTTUnavailable(self.reason)
-                result = _decode(self._backend, values, sample_rate)
+                result = (_decode(self._backend, values, sample_rate) if self.preferred_language is None else
+                          _decode(self._backend, values, sample_rate, preferred_language=self.preferred_language))
                 metrics = (result.language_probability, result.avg_logprob, result.no_speech_probability, result.speech_seconds)
                 if (any(not isinstance(value, (float, int)) or isinstance(value, bool) or not math.isfinite(value) for value in metrics)
-                        or not 0.55 <= result.language_probability <= 1 or result.avg_logprob < -0.8
+                        or not 0 <= result.language_probability <= 1 or result.avg_logprob < -0.8
                         or not 0 <= result.no_speech_probability <= 0.4 or not 0.18 <= result.speech_seconds <= 12.1):
+                    raise MultilingualSTTUnavailable("low_confidence")
+                if result.language_selection == "ru_en_preference":
+                    mass = result.supported_language_probability
+                    if (result.language != self.preferred_language or self.preferred_language is None
+                            or not isinstance(mass, (float, int)) or isinstance(mass, bool) or not math.isfinite(mass)
+                            or not 0.55 <= mass <= 1 or result.language_probability > mass
+                            or result.language_probability / mass < 0.55):
+                        raise MultilingualSTTUnavailable("low_confidence")
+                elif result.language_selection != "auto" or result.language_probability < 0.55:
                     raise MultilingualSTTUnavailable("low_confidence")
                 if result.language not in ("ru", "en"):
                     raise MultilingualSTTUnavailable("language_unsupported")
@@ -283,6 +337,10 @@ class MultilingualSTT:
                 if len(raw) / len(zlib.compress(raw)) > 2.2:
                     raise MultilingualSTTUnavailable("repetition_rejected")
                 self.last_language, self.last_confidence = result.language, result.language_probability
+                self.last_supported_confidence = result.supported_language_probability
+                self.last_conditional_confidence = (result.language_probability / result.supported_language_probability
+                                                    if result.language_selection == "ru_en_preference" else None)
+                self.last_language_selection = result.language_selection
                 self.reason, self.error_class = "ready", None
                 return text
         except MultilingualSTTUnavailable as error:
