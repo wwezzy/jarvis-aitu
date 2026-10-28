@@ -10,7 +10,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6", reason="Optional desktop UI dependency")
 from PySide6.QtCore import QCoreApplication, QEvent, Qt  # noqa: E402
-from PySide6.QtWidgets import QApplication, QLabel, QScrollArea  # noqa: E402
+from PySide6.QtWidgets import QApplication, QLabel, QScrollArea, QTabWidget, QVBoxLayout, QWidget  # noqa: E402
 
 from desktop import obsidian_ui as module  # noqa: E402
 from desktop.obsidian import ObsidianVault  # noqa: E402
@@ -417,3 +417,142 @@ def test_long_literal_paths_and_preview_fit_a_small_notes_viewport(panel, app):
         panel.setParent(None)
         scroll.close()
         scroll.deleteLater()
+
+
+def test_storage_path_and_security_details_are_collapsed_until_requested(panel, app, tmp_path, monkeypatch):
+    root = connect(panel, app, tmp_path, monkeypatch)
+    assert panel.details_box.isHidden()
+    assert not panel.vault_status.isVisible() and not panel.preview_path.isVisible()
+    assert str(root) in panel.vault_status.text()
+    before = list(panel.changed)
+    panel.details_button.click()
+    app.processEvents()
+    assert panel.details_box.isVisible() and panel.vault_status.isVisible()
+    assert panel.vault_status.textFormat() == Qt.TextFormat.PlainText
+    panel.details_button.click()
+    assert panel.details_box.isHidden() and panel.changed == before
+
+
+def test_empty_workspace_offers_explicit_folder_setup_then_a_first_note(panel, app, tmp_path, monkeypatch):
+    panel.refresh()
+    settled(app, panel)
+    assert not panel.library_box.isVisible() and panel.detail_stack.currentIndex() == 2
+    assert panel.empty_button.text() == "Выбрать папку"
+    assert not panel.new_note_button.isEnabled()
+    root = tmp_path / "vault"
+    root.mkdir()
+    calls = []
+    def picker(*_args, **_kwargs):
+        calls.append(True)
+        return str(root)
+    monkeypatch.setattr(module.QFileDialog, "getExistingDirectory", picker)
+    panel.empty_button.click()
+    settled(app, panel)
+    assert calls == [True] and panel._configured
+    assert panel.library_box.isVisible() and panel.library_stack.currentWidget() is panel.list_empty
+    assert not panel.notes_list.isVisible() and panel.new_note_button.isEnabled()
+    panel.empty_button.click()
+    assert panel.detail_stack.currentWidget() is panel.editor
+    assert not list(root.rglob("*.md")) and panel.core.opened == []
+
+
+def test_draft_view_survives_back_navigation_and_async_listing_refresh(panel, app, tmp_path, monkeypatch):
+    root = connect(panel, app, tmp_path, monkeypatch)
+    (root / "Existing.md").write_text("EXISTING", encoding="utf-8")
+    panel.refresh()
+    settled(app, panel)
+    panel.new_note_button.click()
+    panel.title_input.setText("Мой черновик")
+    panel.body_input.setPlainText("Мысль, которую нельзя потерять")
+    panel.back_button.click()
+    assert panel.detail_stack.currentWidget() is panel.reader
+    panel.new_note_button.click()
+    panel.refresh()
+    settled(app, panel)
+    assert panel.detail_stack.currentWidget() is panel.editor and panel._editing
+    assert panel.title_input.text() == "Мой черновик"
+    assert panel.body_input.toPlainText() == "Мысль, которую нельзя потерять"
+    assert (root / "Existing.md").read_text(encoding="utf-8") == "EXISTING"
+
+
+def test_saving_editor_opens_only_the_created_note_without_rewriting_existing(panel, app, tmp_path, monkeypatch):
+    root = connect(panel, app, tmp_path, monkeypatch)
+    existing = root / "Existing.md"
+    existing.write_text("EXISTING", encoding="utf-8")
+    panel.new_note_button.click()
+    panel.title_input.setText("Моя новая мысль")
+    panel.body_input.setPlainText("Сохранённый буквальный текст <tag>")
+    panel.create_button.click()
+    settled(app, panel)
+    assert panel.detail_stack.currentWidget() is panel.reader and not panel._editing
+    assert panel.preview_title.text() == "Моя новая мысль"
+    assert panel.preview.toPlainText() == "Сохранённый буквальный текст <tag>"
+    assert panel.preview.isReadOnly() and panel.title_input.text() == panel.body_input.toPlainText() == ""
+    assert existing.read_text(encoding="utf-8") == "EXISTING" and not panel.core.opened
+
+
+@pytest.mark.parametrize("width,editor", [(575, False), (960, False), (575, True), (960, True)])
+def test_compact_notes_workspace_renders_without_horizontal_overflow(panel, app, tmp_path, monkeypatch, width, editor):
+    from desktop.ui import STYLE, load_application_font
+    load_application_font()
+    root = connect(panel, app, tmp_path, monkeypatch)
+    (root / "Идея проекта.md").write_text("Один ясный следующий шаг\n\nСначала собрать простой прототип.\nПотом проверить его на практике.", encoding="utf-8")
+    (root / "Книги и находки.md").write_text("Полезные мысли после чтения.", encoding="utf-8")
+    (root / "План недели.md").write_text("Оставить время на отдых и важные дела.", encoding="utf-8")
+    panel.refresh()
+    settled(app, panel)
+    if editor:
+        panel.new_note_button.click()
+        panel.title_input.setText("Мысль на завтра")
+        panel.body_input.setPlainText("Начать с одного небольшого дела.\n\nЗатем — короткая пауза и следующий шаг.")
+    shell = QWidget()
+    shell.setObjectName("root")
+    shell.setStyleSheet(STYLE)
+    layout = QVBoxLayout(shell)
+    layout.addWidget(QLabel("Заметки"))
+    tabs = QTabWidget()
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setWidget(panel)
+    tabs.addTab(scroll, "Obsidian")
+    tabs.addTab(QWidget(), "Прежние заметки")
+    layout.addWidget(tabs, 1)
+    shell.resize(width, 620)
+    try:
+        shell.show()
+        app.processEvents()
+        assert scroll.horizontalScrollBar().maximum() == 0
+        assert panel.library_box.isVisible() and panel.notes_list.isVisible()
+        assert not panel.details_box.isVisible()
+        assert panel.detail_stack.currentWidget() is (panel.editor if editor else panel.reader)
+        assert panel.new_note_button.geometry().right() < panel.width()
+        assert tabs.tabText(1) == "Прежние заметки"
+        image_path = tmp_path / f"notes-{'editor' if editor else 'reader'}-{width}.png"
+        assert shell.grab().save(str(image_path))
+        print(f"Notes visual QA: {image_path}")
+    finally:
+        scroll.takeWidget()
+        panel.setParent(None)
+        shell.close()
+        shell.deleteLater()
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_friendly_empty_workspace_renders_without_a_blank_list(panel, app, tmp_path, monkeypatch, configured):
+    from desktop.ui import load_application_font
+    load_application_font()
+    if configured:
+        connect(panel, app, tmp_path, monkeypatch)
+    else:
+        panel.refresh()
+        settled(app, panel)
+    panel.resize(575, 500)
+    panel.show()
+    app.processEvents()
+    assert not panel.notes_list.isVisible() and panel.detail_stack.currentIndex() == 2
+    assert not panel.details_box.isVisible()
+    assert panel.empty_button.isVisible() and panel.empty_button.isEnabled()
+    assert not panel.preview.isVisible() and not panel.body_input.isVisible()
+    path = tmp_path / f"notes-empty-{'connected' if configured else 'setup'}-575.png"
+    assert panel.grab().save(str(path))
+    print(f"Notes empty visual QA: {path}")

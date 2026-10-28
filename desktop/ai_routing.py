@@ -246,6 +246,20 @@ def _cloud_stt_factory(**options):
     return OpenAITranscription(**options)
 
 
+_LOCAL_STT_REASONS = frozenset({
+    "dependencies_missing", "model_missing", "model_invalid", "backend_unavailable",
+    "audio_invalid", "silence", "no_speech", "audio_clipped", "vad_invalid",
+    "language_unsupported", "low_confidence", "transcript_limit", "transcript_invalid",
+    "repetition_rejected", "transcription_failed", "local_unavailable",
+})
+_CLOUD_STT_REASONS = frozenset({
+    "not_configured", "authentication", "access_denied", "quota_or_rate_limit",
+    "budget_exceeded", "budget_unavailable", "budget_invalid", "timeout", "busy",
+    "origin_refused", "provider_error", "response_limit", "invalid_response",
+    "invalid_transcript", "transcript_limit", "network_unavailable", "cloud_unavailable",
+})
+
+
 class FallbackTranscription(_Lifecycle):
     """Optional full-utterance decoder; the primary local wake gate is separate.
 
@@ -258,9 +272,36 @@ class FallbackTranscription(_Lifecycle):
         self.local_factory, self.cloud_factory = local_factory or _local_stt_factory, cloud_factory or _cloud_stt_factory
         self._local = self._cloud = None
         self.reason, self.last_provider = "not_prepared", None
+        self.last_error_stage = self.last_error_provider = None
         self.last_language = self.last_confidence = self.last_usage = None
         self._decode_lock = threading.Lock()
         self._initialize_lifecycle()
+
+    @property
+    def error_stage(self):
+        """Compatibility alias; diagnostics never include exception text/audio."""
+        return self.last_error_stage
+
+    def _clear_error(self):
+        self.last_error_stage = self.last_error_provider = None
+
+    def _record_error(self, reason, stage, provider):
+        allowed = _LOCAL_STT_REASONS if provider == "local" else _CLOUD_STT_REASONS
+        fallback = "local_unavailable" if provider == "local" else "cloud_unavailable"
+        self.reason = reason if type(reason) is str and reason in allowed else fallback
+        self.last_error_stage, self.last_error_provider = stage, provider
+
+    def _cloud_prepared(self, cloud):
+        try:
+            if cloud.prepare() is True:
+                return True
+            reason = getattr(cloud, "reason", None)
+        except CloudCancelled:
+            raise
+        except CloudUnavailable as error:
+            reason = error.reason
+        self._record_error(reason, "cloud_prepare", "openai")
+        return False
 
     def _cloud_decoder(self, cancellation):
         cancellation.check()
@@ -297,24 +338,34 @@ class FallbackTranscription(_Lifecycle):
         try:
             cancellation = self._begin()
         except CloudCancelled:
+            self._clear_error()
             self.reason = "closed"
             return False
+        self._clear_error()
+        local, stage, provider = None, "cloud_prepare", "openai"
         try:
             cloud = self._cloud_decoder(cancellation)
-            if cloud is not None and _cloud_ready(cloud):
+            if cloud is not None and self._cloud_prepared(cloud):
                 cancellation.check()
+                self._clear_error()
                 self.reason = "cloud_ready"
                 return True
+            stage, provider = "local_prepare", "local"
             local = self._local_decoder(cancellation)
             ready = local.prepare() is True
             cancellation.check()
-            self.reason = "ready" if ready else "local_unavailable"
+            if ready:
+                self._clear_error()
+                self.reason = "ready"
+            else:
+                self._record_error(getattr(local, "reason", None), stage, provider)
             return ready
         except CloudCancelled:
+            self._clear_error()
             self.reason = "canceled"
             return False
         except (CloudUnavailable, OSError, ValueError, RuntimeError):
-            self.reason = "unavailable"
+            self._record_error(getattr(local, "reason", None), stage, provider)
             return False
         finally:
             self._end(cancellation)
@@ -337,12 +388,13 @@ class FallbackTranscription(_Lifecycle):
             self._end(cancellation)
             raise CloudUnavailable("busy")
         self.last_provider = self.last_language = self.last_confidence = self.last_usage = None
+        self._clear_error()
         try:
             cancellation.check()
             cloud = self._cloud_decoder(cancellation)
             cancellation.check()
             configuration = _cloud_configuration(self.environ, "JARVIS_CLOUD_STT_ENABLED")
-            if cloud is not None and _cloud_ready(cloud):
+            if cloud is not None and self._cloud_prepared(cloud):
                 cancellation.check()
                 if _cloud_configuration(self.environ, "JARVIS_CLOUD_STT_ENABLED") != configuration:
                     raise CloudCancelled("configuration_changed")
@@ -352,37 +404,50 @@ class FallbackTranscription(_Lifecycle):
                     cancellation.check()
                     if len(text) > 500:
                         raise CloudUnavailable("transcript_limit")
+                    self._clear_error()
                     self.last_provider, self.reason, self.last_usage = "openai", "ready", _usage(cloud)
                     return text
                 except CloudCancelled:
                     raise
-                except CloudUnavailable:
+                except CloudUnavailable as error:
                     cancellation.check()
+                    self._record_error(error.reason, "cloud_decode", "openai")
             return self._local_result(pcm, sample_rate, cancellation)
         finally:
             self._decode_lock.release()
             self._end(cancellation)
 
     def _local_result(self, pcm, sample_rate, cancellation):
+        local, stage = None, "local_prepare"
         try:
             local = self._local_decoder(cancellation)
             if local.prepare() is not True:
-                raise CloudUnavailable("local_unavailable")
+                self._record_error(getattr(local, "reason", None), stage, "local")
+                raise CloudUnavailable(self.reason)
             cancellation.check()
-            text = ChatRouter._final(local.transcribe(pcm, sample_rate))
+            stage = "local_decode"
+            text = local.transcribe(pcm, sample_rate)
             cancellation.check()
+            if not isinstance(text, str) or not text.strip() or "\x00" in text:
+                raise CloudUnavailable("transcript_invalid")
+            text = text.strip()
             if len(text) > 500 or "<|" in text or any(ord(char) < 32 and char not in "\n\t" for char in text):
                 raise CloudUnavailable("transcript_limit")
+            self._clear_error()
             self.last_provider, self.reason = "local", "ready"
             self.last_language = getattr(local, "last_language", None)
             self.last_confidence = getattr(local, "last_confidence", None)
             return text
         except CloudCancelled:
+            self._clear_error()
+            self.reason = "canceled"
             raise
-        except CloudUnavailable:
-            raise
+        except CloudUnavailable as error:
+            self._record_error(error.reason, stage, "local")
+            raise CloudUnavailable(self.reason) from None
         except Exception:
-            raise CloudUnavailable("local_unavailable") from None
+            self._record_error(getattr(local, "reason", None), stage, "local")
+            raise CloudUnavailable(self.reason) from None
 
     def transcribe_local(self, pcm, sample_rate):
         """Before verified wake: no cloud construction, flags, key or HTTP.
@@ -398,6 +463,7 @@ class FallbackTranscription(_Lifecycle):
             self._end(cancellation)
             raise CloudUnavailable("busy")
         self.last_provider = self.last_language = self.last_confidence = self.last_usage = None
+        self._clear_error()
         try:
             return self._local_result(pcm, sample_rate, cancellation)
         finally:

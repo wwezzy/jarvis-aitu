@@ -10,10 +10,10 @@ import re
 import threading
 import weakref
 
-from PySide6.QtCore import QObject, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QSize, Qt, Signal, Slot
 from PySide6.QtWidgets import (
-    QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QPlainTextEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
+    QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QPlainTextEdit, QPushButton, QSizePolicy, QSplitter, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 
@@ -21,7 +21,7 @@ _LIMIT = 30
 _MAX_BODY = 20000
 _PREVIEW = 2000
 _MESSAGES = {
-    "configured": "Хранилище подключено. Заметки Jarvis остаются в своём разделе.",
+    "configured": "Хранилище подключено.",
     "not_configured": "Выбери существующую локальную папку хранилища Obsidian.",
     "unavailable": "Хранилище или заметка недоступны. Проверь папку и обнови список.",
     "refused": "Действие не подтверждено. Проверь владельца, выбранную папку, заголовок и текст; существующие заметки не заменяются.",
@@ -32,6 +32,37 @@ _MESSAGES = {
 }
 _OWNER = "Сначала подтверди владельца в разделе «Управление», если защита включена."
 _FAILURE = "Не удалось подтвердить действие. Сохранённые заметки не сбрасываются; повтори проверку."
+
+_STYLE = """
+QWidget#obsidianWorkspace { background: #0b1421; color: #dbe6f3; font-family: 'Inter'; font-size: 13px; }
+QLabel { background: transparent; border: none; }
+QLabel#notesHeading { color: #edf7ff; font-size: 17px; font-weight: 600; }
+QLabel#notesMuted, QLabel#notesFeedback { color: #91a6bd; font-size: 12px; }
+QLabel#notesEmptyTitle { color: #dcecf5; font-size: 21px; font-weight: 600; }
+QFrame#notesLibrary, QFrame#notesDetail, QFrame#notesDetails { background: #101d2d; border: 1px solid #203349; border-radius: 12px; }
+QPushButton { background: #182b3e; color: #dbe6f3; border: 1px solid #2b4057; padding: 8px 11px; border-radius: 8px; }
+QPushButton:hover { background: #213b50; border-color: #4b6e82; }
+QPushButton:disabled { color: #5c7287; background: #111e2d; border-color: #203146; }
+QPushButton#primary { color: #072829; background: #79e2d2; border-color: #79e2d2; font-weight: 600; }
+QPushButton#primary:hover { background: #a4f5e8; }
+QPushButton#primary:disabled { background: #142b34; color: #587d85; border-color: #264452; }
+QPushButton#quiet { background: transparent; color: #9cb4c9; border-color: #2a3e51; }
+QPushButton#quiet:disabled { background: transparent; color: #52697d; border-color: #203146; }
+QLineEdit { background: #0b1624; color: #edf7ff; border: 1px solid #2b4057; border-radius: 8px; padding: 9px 11px; selection-background-color: #286f72; }
+QLineEdit:focus, QPlainTextEdit:focus { border-color: #72d9cc; }
+QPlainTextEdit { background: #0d1928; color: #dbe6f3; border: 1px solid #263c50; border-radius: 8px; padding: 10px; selection-background-color: #286f72; }
+QPlainTextEdit#notePreview { background: transparent; border: none; padding: 0; }
+QListWidget#notesList { background: transparent; color: #c2d4e2; border: none; outline: 0; padding: 2px; }
+QListWidget#notesList::item { padding: 10px 8px; border: 1px solid transparent; border-radius: 7px; }
+QListWidget#notesList::item:selected { background: #193d43; color: #e5fff9; border-color: #2d6266; }
+QListWidget#notesList::item:hover:!selected { background: #182d40; }
+QStackedWidget { background: transparent; border: none; }
+QSplitter::handle { background: transparent; width: 10px; }
+QSplitter::handle:hover { background: #203a4a; border-radius: 3px; }
+QScrollBar:vertical { background: transparent; width: 6px; margin: 2px 0; }
+QScrollBar::handle:vertical { background: #304d61; min-height: 28px; border-radius: 3px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+"""
 
 
 def _label(text):
@@ -66,6 +97,7 @@ class ObsidianPanel(QWidget):
         self._thread_lock, self._threads, self._thread_number = threading.Lock(), {}, 0
         self._configured, self._preview_id = False, None
         self._refresh_pending = self._preview_pending = False
+        self._editing, self._select_after_refresh = False, None
         self._build()
         self._sync()
 
@@ -88,72 +120,204 @@ class ObsidianPanel(QWidget):
     @staticmethod
     def _button(text, handler):
         widget = QPushButton(text)
+        widget.setCursor(Qt.CursorShape.PointingHandCursor)
         widget.clicked.connect(handler)
         return widget
 
     def _build(self):
+        self.setObjectName("obsidianWorkspace")
+        self.setStyleSheet(_STYLE)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(_label("Obsidian · локальные заметки"))
-        layout.addWidget(_label("Поиск по именам и кратким фрагментам Markdown. Содержимое отображается как текст; команды и ссылки из заметок не выполняются и не отправляются ИИ."))
+        layout.setContentsMargins(14, 14, 14, 10)
+        layout.setSpacing(12)
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
+        heading = _label("Библиотека")
+        heading.setObjectName("notesHeading")
+        toolbar.addWidget(heading, 1)
+        self.new_note_button = self._button("Новая", self.new_note)
+        self.new_note_button.setObjectName("primary")
+        self.new_note_button.setToolTip("Создать новую заметку")
+        toolbar.addWidget(self.new_note_button)
+        self.open_vault_button = self._button("Obsidian ↗", self.open_vault)
+        self.open_vault_button.setObjectName("quiet")
+        self.open_vault_button.setToolTip("Открыть хранилище в Obsidian")
+        toolbar.addWidget(self.open_vault_button)
+        self.details_button = self._button("Папка", lambda: None)
+        self.details_button.setObjectName("quiet")
+        self.details_button.setCheckable(True)
+        toolbar.addWidget(self.details_button)
+        layout.addLayout(toolbar)
+
+        self.details_box = QFrame()
+        self.details_box.setObjectName("notesDetails")
+        details = QVBoxLayout(self.details_box)
+        details.setContentsMargins(14, 12, 14, 12)
         self.vault_status = _label("Хранилище ещё не проверено. Выбери папку или нажми «Обновить».")
-        layout.addWidget(self.vault_status)
-        row = QHBoxLayout()
+        self.vault_status.setObjectName("notesMuted")
+        details.addWidget(self.vault_status)
         self.choose_button = self._button("Выбрать хранилище…", self.choose_vault)
-        self.refresh_button = self._button("Обновить", self.refresh)
-        row.addWidget(self.choose_button)
-        row.addWidget(self.refresh_button)
-        layout.addLayout(row)
-        self.open_vault_button = self._button("Открыть Obsidian", self.open_vault)
-        layout.addWidget(self.open_vault_button)
+        details.addWidget(self.choose_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.preview_path = _label("")
+        self.preview_path.setObjectName("notesMuted")
+        details.addWidget(self.preview_path)
+        privacy = _label("Просмотр ограничен кратким текстом. Записи не выполняются и автоматически не передаются ИИ. Новые заметки создаются без перезаписи существующих файлов.")
+        privacy.setObjectName("notesMuted")
+        details.addWidget(privacy)
+        self.details_box.hide()
+        self.details_button.toggled.connect(self.details_box.setVisible)
+        layout.addWidget(self.details_box)
+
         row = QHBoxLayout()
+        row.setSpacing(8)
+        self.refresh_button = self._button("Обновить", self.refresh)
+        self.refresh_button.setObjectName("quiet")
         self.search_input = QLineEdit()
         self.search_input.setMaxLength(500)
-        self.search_input.setPlaceholderText("Название или текст в начале заметки")
+        self.search_input.setPlaceholderText("Найти заметку…")
         self.search_input.setClearButtonEnabled(True)
         self.search_input.returnPressed.connect(self.refresh)
         self.search_button = self._button("Найти", self.refresh)
+        self.search_button.setObjectName("quiet")
         row.addWidget(self.search_input, 1)
         row.addWidget(self.search_button)
+        row.addWidget(self.refresh_button)
         layout.addLayout(row)
-        self.results_status = _label("Показываются до 30 заметок; поиск не сканирует весь компьютер.")
-        layout.addWidget(self.results_status)
+
+        self.workspace = QSplitter(Qt.Orientation.Horizontal)
+        self.workspace.setChildrenCollapsible(False)
+        self.workspace.setHandleWidth(10)
+        self.workspace.setMinimumHeight(320)
+        self.library_box = QFrame()
+        self.library_box.setObjectName("notesLibrary")
+        self.library_box.setMinimumWidth(155)
+        library = QVBoxLayout(self.library_box)
+        library.setContentsMargins(10, 12, 10, 10)
+        library.setSpacing(8)
+        self.results_status = _label("Твои заметки")
+        self.results_status.setObjectName("notesMuted")
+        library.addWidget(self.results_status)
+        self.library_stack = QStackedWidget()
         self.notes_list = QListWidget()
-        self.notes_list.setMinimumHeight(140)
-        self.notes_list.setMaximumHeight(240)
+        self.notes_list.setObjectName("notesList")
+        self.notes_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.notes_list.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.notes_list.setUniformItemSizes(True)
         self.notes_list.currentItemChanged.connect(self._selection_changed)
-        layout.addWidget(self.notes_list)
-        self.preview_title = _label("Выбери заметку для просмотра.")
-        self.preview_path = _label("")
-        layout.addWidget(self.preview_title)
-        layout.addWidget(self.preview_path)
+        self.library_stack.addWidget(self.notes_list)
+        self.list_empty = _label("Пока пусто.\nСохрани первую мысль.")
+        self.list_empty.setObjectName("notesMuted")
+        self.list_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.library_stack.addWidget(self.list_empty)
+        library.addWidget(self.library_stack, 1)
+        self.workspace.addWidget(self.library_box)
+
+        detail_box = QFrame()
+        detail_box.setObjectName("notesDetail")
+        detail_box.setMinimumWidth(270)
+        detail = QVBoxLayout(detail_box)
+        detail.setContentsMargins(18, 16, 18, 14)
+        self.detail_stack = QStackedWidget()
+        detail.addWidget(self.detail_stack, 1)
+        self.reader = QWidget()
+        reader = QVBoxLayout(self.reader)
+        reader.setContentsMargins(0, 0, 0, 0)
+        reader.setSpacing(12)
+        self.preview_title = _label("Выбери заметку")
+        self.preview_title.setObjectName("notesHeading")
+        reader.addWidget(self.preview_title)
         self.preview = QPlainTextEdit()
+        self.preview.setObjectName("notePreview")
         self.preview.setReadOnly(True)
-        self.preview.setMinimumHeight(90)
-        self.preview.setMaximumHeight(200)
-        layout.addWidget(self.preview)
-        self.preview_hint = _label("Показан только текст. Полную заметку можно открыть отдельной кнопкой.")
-        layout.addWidget(self.preview_hint)
-        self.open_note_button = self._button("Открыть выбранную заметку", self.open_note)
-        layout.addWidget(self.open_note_button)
-        layout.addWidget(_label("Новая заметка · существующие файлы не перезаписываются"))
+        reader.addWidget(self.preview, 1)
+        self.preview_hint = _label("Полную заметку можно открыть в Obsidian.")
+        self.preview_hint.setObjectName("notesMuted")
+        reader.addWidget(self.preview_hint)
+        self.open_note_button = self._button("Открыть заметку", self.open_note)
+        self.open_note_button.setObjectName("quiet")
+        reader.addWidget(self.open_note_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.detail_stack.addWidget(self.reader)
+
+        self.editor = QWidget()
+        editor = QVBoxLayout(self.editor)
+        editor.setContentsMargins(0, 0, 0, 0)
+        editor.setSpacing(10)
+        editor_header = QHBoxLayout()
+        editor_heading = _label("Новая заметка")
+        editor_heading.setObjectName("notesHeading")
+        editor_header.addWidget(editor_heading, 1)
+        self.back_button = self._button("Назад", self.show_reader)
+        self.back_button.setObjectName("quiet")
+        self.back_button.setToolTip("Вернуться к просмотру. Черновик останется до закрытия Jarvis.")
+        editor_header.addWidget(self.back_button)
+        editor.addLayout(editor_header)
         self.title_input = QLineEdit()
         self.title_input.setMaxLength(100)
-        self.title_input.setPlaceholderText("Заголовок заметки")
+        self.title_input.setPlaceholderText("Заголовок")
         self.title_input.textChanged.connect(self._sync)
-        layout.addWidget(self.title_input)
+        editor.addWidget(self.title_input)
         self.body_input = QPlainTextEdit()
-        self.body_input.setPlaceholderText("Текст новой заметки")
-        self.body_input.setMinimumHeight(120)
+        self.body_input.setPlaceholderText("Мысль, план или полезная находка…")
+        self.body_input.setMinimumHeight(150)
         self.body_input.textChanged.connect(self._sync)
-        layout.addWidget(self.body_input)
+        editor.addWidget(self.body_input, 1)
+        editor_footer = QHBoxLayout()
         self.body_count = _label("0 / 20 000 символов")
-        layout.addWidget(self.body_count)
-        self.create_button = self._button("Создать новую заметку", self.create_note)
-        layout.addWidget(self.create_button)
-        layout.addWidget(_label("Черновик этой формы не сохраняется автоматически. Выбор папки, создание и открытие требуют действующего разрешения владельца, если защита включена."))
+        self.body_count.setObjectName("notesMuted")
+        editor_footer.addWidget(self.body_count, 1)
+        self.create_button = self._button("Сохранить", self.create_note)
+        self.create_button.setObjectName("primary")
+        editor_footer.addWidget(self.create_button)
+        editor.addLayout(editor_footer)
+        draft_hint = _label("Создастся новая заметка. Черновик хранится до закрытия Jarvis.")
+        draft_hint.setObjectName("notesMuted")
+        editor.addWidget(draft_hint)
+        self.detail_stack.addWidget(self.editor)
+
+        empty = QWidget()
+        empty_layout = QVBoxLayout(empty)
+        empty_layout.setContentsMargins(10, 16, 10, 16)
+        empty_layout.addStretch()
+        self.empty_title = _label("Здесь будут твои идеи")
+        self.empty_title.setObjectName("notesEmptyTitle")
+        empty_layout.addWidget(self.empty_title)
+        self.empty_hint = _label("Подключи папку заметок, чтобы собрать важное в одном месте.")
+        self.empty_hint.setObjectName("notesMuted")
+        empty_layout.addWidget(self.empty_hint)
+        self.empty_button = self._button("Выбрать папку", self._empty_action)
+        self.empty_button.setObjectName("primary")
+        empty_layout.addSpacing(6)
+        empty_layout.addWidget(self.empty_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        empty_layout.addStretch()
+        self.detail_stack.addWidget(empty)
+        self.detail_stack.setCurrentIndex(2)
+        self.workspace.addWidget(detail_box)
+        self.workspace.setStretchFactor(0, 1)
+        self.workspace.setStretchFactor(1, 2)
+        self.workspace.setSizes([220, 460])
+        layout.addWidget(self.workspace, 1)
         self.feedback = _label("")
+        self.feedback.setObjectName("notesFeedback")
         layout.addWidget(self.feedback)
+
+    def new_note(self):
+        if self._closing.is_set() or not self._configured:
+            return
+        self._editing = True
+        self.detail_stack.setCurrentIndex(1)
+        self.title_input.setFocus()
+
+    def show_reader(self):
+        if self._closing.is_set():
+            return
+        self._editing = False
+        self.detail_stack.setCurrentIndex(0 if self._preview_id else 2)
+
+    def _empty_action(self):
+        if self._configured:
+            self.new_note()
+        else:
+            self.choose_vault()
 
     def _selected_id(self):
         item = self.notes_list.currentItem()
@@ -164,6 +328,9 @@ class ObsidianPanel(QWidget):
         for widget in (self.choose_button, self.refresh_button, self.search_button):
             widget.setEnabled(active)
         self.notes_list.setEnabled(active and self._configured)
+        self.new_note_button.setEnabled(self._configured and not self._closing.is_set())
+        self.empty_button.setEnabled(active)
+        self.library_box.setVisible(self._configured)
         self.open_vault_button.setEnabled(active and self._configured)
         self.open_note_button.setEnabled(active and self._configured and self._preview_id is not None and self._preview_id == self._selected_id())
         count = len(self.body_input.toPlainText())
@@ -250,10 +417,12 @@ class ObsidianPanel(QWidget):
 
     def _clear_preview(self):
         self._preview_id = None
-        self.preview_title.setText("Выбери заметку для просмотра.")
+        self.preview_title.setText("Выбери заметку")
         self.preview_path.setText("")
         self.preview.clear()
-        self.preview_hint.setText("Показан только текст. Полную заметку можно открыть отдельной кнопкой.")
+        self.preview_hint.setText("Полную заметку можно открыть в Obsidian.")
+        if not self._editing:
+            self.detail_stack.setCurrentIndex(2)
 
     def _apply_listing(self, result):
         state, rows, query = result
@@ -262,7 +431,8 @@ class ObsidianPanel(QWidget):
         if self._configured and isinstance(state.get("vault"), str):
             text += "\nПапка: " + state["vault"][:2048]
         self.vault_status.setText(text)
-        old_id = self._selected_id()
+        old_id = self._select_after_refresh or self._selected_id()
+        self._select_after_refresh = None
         blocked = self.notes_list.blockSignals(True)
         self.notes_list.clear()
         seen = set()
@@ -271,8 +441,8 @@ class ObsidianPanel(QWidget):
                 continue
             seen.add(row["id"])
             title = row.get("title") if isinstance(row.get("title"), str) else "Заметка"
-            path = row.get("relative_path") if isinstance(row.get("relative_path"), str) else ""
-            item = QListWidgetItem(title[:200] + ("\n" + path[:2048] if path else ""))
+            item = QListWidgetItem(title[:200])
+            item.setSizeHint(QSize(0, 43))
             item.setData(Qt.ItemDataRole.UserRole, row["id"])
             self.notes_list.addItem(item)
             if row["id"] == old_id:
@@ -283,18 +453,30 @@ class ObsidianPanel(QWidget):
         self._clear_preview()
         count = self.notes_list.count()
         if count:
-            prefix = f"Поиск «{query[:80]}»: {count}. " if query else f"В списке: {count}. "
-            message = prefix + "Показаны до 30 заметок; поиск учитывает только краткие фрагменты."
+            message = f"Найдено: {count}" if query else f"Заметки · {count}"
+            if count == _LIMIT:
+                message += " · уточни поиск"
         elif not self._configured:
-            message = "Список недоступен, пока хранилище не подключено."
+            message = "Заметки"
         else:
-            message = "По этому запросу заметок нет." if query else "В доступной части хранилища заметок пока нет."
+            message = "Ничего не найдено" if query else "Заметки · 0"
         self.results_status.setText(message)
+        self.library_stack.setCurrentIndex(0 if count else 1)
+        self.list_empty.setText("Ничего не найдено.\nПопробуй другое слово." if query else "Пока пусто.\nСохрани первую мысль.")
+        if self._configured:
+            self.empty_title.setText("Сохрани то, что важно")
+            self.empty_hint.setText("Идею, план или полезную находку. Здесь они останутся под рукой.")
+            self.empty_button.setText("Новая заметка")
+        else:
+            self.empty_title.setText("Подключи свои заметки")
+            self.empty_hint.setText("Выбери папку Obsidian. Прежние заметки Jarvis доступны в соседней вкладке.")
+            self.empty_button.setText("Выбрать папку")
         self._preview_pending = self._selected_id() is not None
 
     def _selection_changed(self, *_args):
         if self._closing.is_set():
             return
+        self._editing = False
         self._clear_preview()
         if self.busy:
             self._preview_pending = True
@@ -317,7 +499,9 @@ class ObsidianPanel(QWidget):
                 self.preview_title.setText(result["title"][:200] if isinstance(result.get("title"), str) else "Заметка")
                 self.preview_path.setText(result["relative_path"][:2048] if isinstance(result.get("relative_path"), str) else "")
                 self.preview.setPlainText(result["preview"][:_PREVIEW])
-                self.preview_hint.setText("Показан краткий фрагмент. Полный текст можно открыть в Obsidian." if result.get("truncated") is True else "Текстовый просмотр. Ссылки и инструкции здесь не выполняются.")
+                self.preview_hint.setText("Показан краткий фрагмент. Полный текст можно открыть в Obsidian." if result.get("truncated") is True else "Полную заметку можно открыть в Obsidian.")
+                if not self._editing:
+                    self.detail_stack.setCurrentIndex(0)
             else:
                 self._clear_preview()
                 self._result_message(result)
@@ -375,6 +559,9 @@ class ObsidianPanel(QWidget):
                 if self.title_input.text() == title and self.body_input.toPlainText() == body:
                     self.title_input.clear()
                     self.body_input.clear()
+                    self._editing = False
+                    if isinstance(result.get("id"), str) and re.fullmatch(r"[a-f0-9]{24}", result["id"]):
+                        self._select_after_refresh = result["id"]
                 self._changed()
                 self._refresh_pending = True
         self._run(create, complete)
