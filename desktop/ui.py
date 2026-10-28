@@ -719,10 +719,15 @@ class MainWindow(QMainWindow):
 
     def _new_voice(self):
         factory = self.voice_factory
+        options = {}
         if factory is None:
             from desktop.voice import VoiceService
+            from desktop.ai_routing import FallbackTranscription
             factory = VoiceService
-        voice = factory(on_text=self._recognition_callback(self._capture_session), on_state=self.events.voice_state.emit, model_dir=self.model_dir)
+            state_dir = self.core.state_dir
+            options["transcriber_factory"] = lambda: FallbackTranscription(state_dir)
+        voice = factory(on_text=self._recognition_callback(self._capture_session), on_state=self.events.voice_state.emit,
+                        model_dir=self.model_dir, **options)
         voice.speech_enabled = bool(self.preferences.get("speech_enabled", True))
         apply_preferences = getattr(voice, "apply_preferences", None)
         if callable(apply_preferences):
@@ -769,7 +774,7 @@ class MainWindow(QMainWindow):
         side.addWidget(label("НА ЭТОМ КОМПЬЮТЕРЕ", "eyebrow"))
         side.addWidget(label("Задачи и заметки доступны\nбез интернета.", "muted", True))
         side.addSpacing(15)
-        side.addWidget(label("DESKTOP 4.4", "eyebrow"))
+        side.addWidget(label("DESKTOP 4.4.1", "eyebrow"))
         shell.addWidget(sidebar)
         content = QWidget()
         main = QVBoxLayout(content)
@@ -1264,8 +1269,11 @@ class MainWindow(QMainWindow):
         content.setSpacing(7)
         content.addWidget(label("ВЫ" if role == "user" else "JARVIS", "eyebrow"))
         displayed = str(text)
-        if role == "assistant" and displayed.startswith("Локальная модель: "):
-            displayed = displayed[len("Локальная модель: "):]
+        if role == "assistant":
+            for prefix in ("Локальная модель: ", "OpenAI: "):
+                if displayed.startswith(prefix):
+                    displayed = displayed[len(prefix):]
+                    break
         body = label(displayed, wrap=True)
         body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         content.addWidget(body)
@@ -1359,11 +1367,11 @@ class MainWindow(QMainWindow):
             timing = (f"{latency / 1000:.2f} с" if type(latency) in {int, float} and math.isfinite(latency)
                       and latency >= 0 else "нет данных")
             self.usage_status.setText(
-                f"Локальный ИИ · сегодня · UTC+5\nЗапросы: {data['requests']} · Успешно: {data['successful']} · Ошибки: {data['failed']}\n"
+                f"ИИ · сегодня · UTC+5\nЗапросы: {data['requests']} · Успешно: {data['successful']} · Ошибки: {data['failed']}\n"
                 f"Известные токены: вход {inputs} / выход {outputs} · Неполные данные: {data['unknown_usage_requests']}\n"
                 f"Среднее время ответа: {timing}")
         except Exception:
-            self.usage_status.setText("Статистика локального ИИ недоступна. Основные команды продолжают работать.")
+            self.usage_status.setText("Статистика ИИ недоступна. Основные команды продолжают работать.")
 
     def _run_integration(self, function, done):
         """Keep optional provider I/O off both Qt and the command worker."""

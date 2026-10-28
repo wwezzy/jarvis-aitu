@@ -6,6 +6,7 @@ actions additionally require a one-use local button or typed confirmation.
 """
 from __future__ import annotations
 
+import os
 import re
 import secrets
 import threading
@@ -306,6 +307,7 @@ def _duration(count: str, unit: str) -> int:
 
 class DesktopCore:
     def __init__(self, state_dir: Path, executor=None, *, personal_path: Path | None = None, computer_controls=None):
+        self.state_dir = Path(state_dir).absolute()
         self._closed = threading.Event()
         self._request_context = threading.local()
         self._morning_lock, self._morning_pending = threading.RLock(), {}
@@ -932,14 +934,22 @@ class DesktopCore:
         if self.request_kind(text, source) != "chat":
             return self._answer(Reply("Уточни команду: что открыть, сохранить или изменить. Свободный вопрос можно задать отдельно."))
         preferences = self.store.preferences()
-        if preferences["local_chat_enabled"]:
+        cloud_chat = os.environ.get("JARVIS_CLOUD_CHAT_ENABLED") == "1"
+        if preferences["local_chat_enabled"] or cloud_chat:
             from desktop.chat import LocalChat, LocalChatCancelled, LocalChatTruncated, LocalChatUnavailable
+            from desktop.cloud_ai import CloudCancelled, CloudUnavailable
             client = None
+            usage_model = preferences["local_chat_model"] if not cloud_chat else "cloud-router"
             try:
                 # A model's result stays display-only. Optional context is
                 # exclusively earlier completed model-chat exchanges, never
                 # note/task/PC-command/personal-data records or the current row.
-                client = LocalChat(preferences["local_chat_model"])
+                if cloud_chat:
+                    from desktop.ai_routing import ChatRouter
+                    client = ChatRouter(self.state_dir, local_enabled=preferences["local_chat_enabled"],
+                                        local_model=preferences["local_chat_model"])
+                else:
+                    client = LocalChat(preferences["local_chat_model"])
                 options = {"on_chunk": on_chunk} if on_chunk is not None else {}
                 cancel_event = getattr(self._request_context, "cancel_event", None)
                 if cancel_event is not None:
@@ -951,21 +961,30 @@ class DesktopCore:
                     answer = client.answer(text, history=history, **options)
                 else:
                     answer = client.answer(text, **options)
-            except LocalChatCancelled:
+            except (LocalChatCancelled, CloudCancelled):
                 if client is not None:
-                    self._record_chat_usage(preferences["local_chat_model"], client, success=False)
+                    self._record_chat_usage(usage_model, client, success=False)
                 return Reply("Запрос отменён.", speak=False)
             except ValueError:
-                return self._answer(Reply("Для локальной модели сократи вопрос до 8000 символов и проверь имя модели в настройках."))
+                return self._answer(Reply("Сократи вопрос до 8000 символов и проверь выбранную модель в настройках."))
             except LocalChatTruncated:
-                self._record_chat_usage(preferences["local_chat_model"], client, success=False)
+                self._record_chat_usage(usage_model, client, success=False)
                 return self._answer(Reply("Ответ достиг лимита длины и не был озвучен. Разбей вопрос на части; готовые команды и план продолжают работать."))
             except LocalChatUnavailable:
                 if client is not None:
-                    self._record_chat_usage(preferences["local_chat_model"], client, success=False)
+                    self._record_chat_usage(usage_model, client, success=False)
                 return self._answer(Reply("Локальная модель сейчас недоступна. Проверь, что Ollama запущена и выбранная локальная модель установлена. Команды, задачи и заметки продолжают работать."))
-            self._record_chat_usage(preferences["local_chat_model"], client, success=True)
-            return self._answer(Reply("Локальная модель: " + answer))
+            except CloudUnavailable:
+                if client is not None:
+                    self._record_chat_usage(usage_model, client, success=False)
+                return self._answer(Reply("Облачный помощник сейчас недоступен или достигнут локальный лимит запросов. Проверь подключение и настройки. Команды, задачи и заметки продолжают работать."))
+            finally:
+                if cloud_chat and client is not None:
+                    client.close()
+            model = getattr(client, "last_model", None) or usage_model
+            self._record_chat_usage(model, client, success=True)
+            prefix = "OpenAI: " if getattr(client, "last_provider", None) == "openai" else "Локальная модель: "
+            return self._answer(Reply(prefix + answer))
         return self._answer(Reply("Не распознал точную команду. " + HELP))
 
     def confirm(self, token: str, source: str = "button") -> Reply:

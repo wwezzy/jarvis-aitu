@@ -14,7 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6", reason="Optional desktop reply UI tests run in the desktop job")
 from PySide6.QtWidgets import QApplication, QLabel  # noqa: E402
 
-from desktop.core import DesktopCore, Reply  # noqa: E402
+from desktop.core import DesktopCore, HELP, HELP_SPOKEN, Reply  # noqa: E402
 from desktop.ui import MainWindow  # noqa: E402
 
 
@@ -96,7 +96,7 @@ def settled(app, window):
 
 @pytest.mark.parametrize("phrase,fragment", [
     ("как дела", "На связи"), ("Jarvis, how are you?", "На связи"),
-    ("что ты умеешь?", "Могу"), ("what are your capabilities", "Могу"),
+    ("что ты умеешь?", "Открываю"), ("what are your capabilities", "Открываю"),
     ("открой что-нибудь", "Укажи одно действие"),
     ("выключи непонятно что", "Уточни действие"),
     ("добавь задачу Разобрать одну тему", "Добавил задачу"),
@@ -116,8 +116,9 @@ def test_recognized_original_voice_command_gets_same_selected_reply_dispatch(app
     assert window.listening and window.voice.starts == 1
     window.voice.on_text("что ты умеешь")
     settled(app, window)
-    assert len(window.voice.spoken) == 1 and "Могу" in window.voice.spoken[0][0]
+    assert len(window.voice.spoken) == 1 and window.voice.spoken[0][0] == HELP_SPOKEN
     assert window.voice.spoken[0][1] == "clone"
+    assert any(label.text() == HELP for label in window.findChildren(QLabel))
     assert window.effects == window.model_calls == []
 
 

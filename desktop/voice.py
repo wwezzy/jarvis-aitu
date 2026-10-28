@@ -286,7 +286,10 @@ class VoiceService:
     """
 
     def __init__(self, on_text: Callable[[str], None], on_state: Callable[[str], None],
-                 model_dir: Path | None = None):
+                 model_dir: Path | None = None, *, transcriber_factory=None):
+        if transcriber_factory is not None and not callable(transcriber_factory):
+            raise ValueError("A transcriber factory is required")
+        self._transcriber_factory = transcriber_factory
         self.on_text, self.on_state = on_text, on_state
         self.model_dir = Path(model_dir) if model_dir else default_model_dir()
         self.gate = WakeGate()
@@ -552,7 +555,10 @@ class VoiceService:
         decoding_started = time.monotonic()
         self._count("decoder_requests")
         try:
-            decoded = decoder.transcribe(pcm, sample_rate)
+            # An idle English candidate is not permission to upload audio.
+            # Optional cloud decoders expose a strictly local verification path.
+            local_decode = getattr(decoder, "transcribe_local", None)
+            decoded = local_decode(pcm, sample_rate) if callable(local_decode) else decoder.transcribe(pcm, sample_rate)
             if (self._stop.is_set() or self._closed.is_set() or self._speaking.is_set()
                     or not self.multilingual_stt_enabled or self._stt is not decoder
                     or self._audio_epoch != epoch or self._speech_generation != generation
@@ -685,7 +691,8 @@ class VoiceService:
                 try:
                     from desktop.multilingual_stt import MultilingualSTT
                     self._emit(self.on_state, "Готовлю русское и английское распознавание…")
-                    self._stt = MultilingualSTT()
+                    self._dispose_backend(self._stt)
+                    self._stt = self._transcriber_factory() if self._transcriber_factory is not None else MultilingualSTT()
                     if not self._stt.prepare():
                         self._stt = None
                         self._emit(self.on_state, "Два языка пока недоступны. Русское распознавание продолжает работать.")
@@ -860,6 +867,12 @@ class VoiceService:
 
     def interrupt(self):
         """Stop old speech without stopping the microphone or authorizing actions."""
+        cancel_decoder = getattr(self._stt, "cancel", None)
+        if callable(cancel_decoder):
+            try:
+                cancel_decoder()
+            except Exception:
+                pass
         canceled = []
         with self._lock:
             self._speech_generation += 1
@@ -964,6 +977,8 @@ class VoiceService:
     def close(self):
         self._closed.set()
         self.stop()
+        self._dispose_backend(self._stt)
+        self._stt = None
         self._close_backend()
         try:
             self._speech.put_nowait(None)

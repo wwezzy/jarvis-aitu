@@ -291,7 +291,7 @@ class LocalStore:
         from desktop.chat import bounded_history
         with self.connection() as db:
             rows = db.execute("SELECT role,text FROM history WHERE id<? ORDER BY id DESC LIMIT 250", (before_id,)).fetchall()
-        prefix = "Локальная модель: "
+        prefixes = ("Локальная модель: ", "OpenAI: ")
         question = None
         pairs = []
         for row in reversed(rows):
@@ -299,7 +299,8 @@ class LocalStore:
                 question = row["text"]
             else:
                 answer = row["text"]
-                if question and answer.startswith(prefix) and answer[len(prefix):].strip():
+                prefix = next((value for value in prefixes if answer.startswith(value)), None)
+                if question and prefix and answer[len(prefix):].strip():
                     pairs.extend([{"role": "user", "content": question},
                                   {"role": "assistant", "content": answer[len(prefix):]}])
                 question = None
