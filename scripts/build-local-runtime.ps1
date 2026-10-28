@@ -4,7 +4,6 @@ param(
     [string]$ModelDir,
     [string]$OllamaPath,
     [switch]$PersonalVoice,
-    [switch]$Gestures,
     [switch]$NoShortcut
 )
 $ErrorActionPreference = 'Stop'
@@ -59,10 +58,6 @@ if ($PersonalVoice) {
     & $PythonPath -m pip install --disable-pip-version-check --no-compile --target $sitePath --upgrade -r (Join-Path $repoPath 'requirements-personal-voice.txt')
     if ($LASTEXITCODE -ne 0) { throw 'Optional personal voice runtime installation failed.' }
 }
-if ($Gestures) {
-    & $PythonPath -m pip install --disable-pip-version-check --no-compile --target $sitePath --upgrade -r (Join-Path $repoPath 'requirements-gestures.txt')
-    if ($LASTEXITCODE -ne 0) { throw 'Optional gesture runtime installation failed.' }
-}
 # This is a CPU-only CTranslate2 installation. Its Windows wheel contains an
 # unused cuDNN dispatcher although v4.8.4 is built WITH_CUDNN=OFF. Do not ship
 # that optional NVIDIA binary in the CPU app; retain all source/vendor notices.
@@ -77,6 +72,7 @@ Copy-Item -LiteralPath (Join-Path $repoPath 'desktop_app.py') -Destination $appP
 $desktopPath = Join-Path $appPath 'desktop'
 New-Item -ItemType Directory -Path $desktopPath -Force | Out-Null
 Get-ChildItem -LiteralPath (Join-Path $repoPath 'desktop') -File -Filter '*.py' |
+    Where-Object { $_.Name -notin @('gestures.py', 'gesture_worker.py') } |
     ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $desktopPath }
 Copy-Item -LiteralPath (Join-Path $repoPath 'desktop\assets') -Destination $desktopPath -Recurse
 Copy-Item -LiteralPath (Join-Path $repoPath 'desktop\NOTICE.txt') -Destination $desktopPath

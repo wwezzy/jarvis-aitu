@@ -444,16 +444,14 @@ class DesktopCore:
         self.store.set_preferences({"remote_control_approved": enabled})
         return True
 
-    def request_control(self, action, *, source="gesture", token=None, cancel=False):
-        """Trusted gesture/paired-phone adapters; no text or model action extraction."""
+    def request_control(self, action, *, source="remote", token=None, cancel=False):
+        """Trusted paired-phone adapter; no text or model action extraction."""
         if self._closed.is_set() or not isinstance(action, str) or action not in ALLOWED_ACTIONS or type(cancel) is not bool:
             return Reply("Неподдерживаемое действие.", speak=False)
-        preferences = self.store.preferences()
         if source == "gesture":
-            if (action not in {"volume_up", "volume_down", "minimize"} or token is not None
-                    or not preferences["gestures_enabled"] or not self.owner.enabled or not self.owner.allowed()):
-                return Reply("Жест не выполнен: требуется подтверждённый владелец и включённый режим жестов.", speak=False)
-        elif source == "remote":
+            return Reply("Управление жестами удалено.", speak=False)
+        preferences = self.store.preferences()
+        if source == "remote":
             # The HTTP adapter separately verifies both owner-device secrets.
             if not preferences["remote_control_approved"]:
                 return Reply("Удалённое управление не разрешено владельцем.", speak=False)

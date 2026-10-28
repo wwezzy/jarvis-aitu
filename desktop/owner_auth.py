@@ -30,7 +30,7 @@ _ASYNC_INFO = "00000036-0000-0000-c000-000000000046"
 _RESULT_SIGNATURE = ("pinterface({9fc2b0bb-e446-44e2-aa61-9cab8f636af2};"
                      "enum(Windows.Security.Credentials.UI.UserConsentVerificationResult;i4))")
 _RESULT_IID = str(uuid.uuid5(uuid.UUID("11f47ad5-7b73-42c0-abae-878b1e16adee"), _RESULT_SIGNATURE))
-_MESSAGE = "Подтвердите владельца Jarvis для голосовых команд и жестов."
+_MESSAGE = "Подтвердите владельца Jarvis для голосовых команд."
 _CALL = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
 _POINTER = ctypes.c_void_p
 _INT = ctypes.c_int32
@@ -48,7 +48,7 @@ _MESSAGES = {
     "window_invalid": "Откройте окно Jarvis и подтвердите владельца кнопкой в приложении.",
     "unsupported": "Эта проверка владельца требует Windows 11 или новее.",
     "unavailable": "Windows Hello недоступен; доступ не предоставлен.",
-    "disabled": "Защита голосовых команд и жестов владельцем выключена.",
+    "disabled": "Подтверждение владельца для голосовых команд выключено.",
     "session_inactive": "Сеанс Windows заблокирован или неактивен; подтвердите владельца заново.",
     "stale": "Проверка больше не актуальна; подтвердите владельца заново.",
     "invalid_request": "Некорректный запрос проверки владельца; доступ не предоставлен.",

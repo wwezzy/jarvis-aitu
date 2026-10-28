@@ -1,4 +1,4 @@
-"""MainWindow gesture/consent lifecycle with no camera, Hello or OS actions."""
+"""MainWindow without gestures; preserve optional Hello and worker lifecycle."""
 import ctypes
 import os
 import threading
@@ -13,7 +13,7 @@ pytest.importorskip("PySide6", reason="Optional desktop UI dependency")
 from PySide6.QtCore import QCoreApplication, QEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMainWindow  # noqa: E402
 
-from desktop import control_panel, owner_auth  # noqa: E402
+from desktop import owner_auth  # noqa: E402
 from desktop.core import DesktopCore, Reply  # noqa: E402
 from desktop.ui import MainWindow  # noqa: E402
 
@@ -56,25 +56,6 @@ class Verifier:
         return owner_auth.AuthResult(True, "verified", "Synthetic verified result")
 
 
-class Gestures:
-    instances = []
-
-    def __init__(self, on_intent, on_state, *, owner_gate):
-        self.on_intent, self.on_state, self.owner_gate = on_intent, on_state, owner_gate
-        self.starts = self.stops = 0
-        self.instances.append(self)
-
-    def start(self):
-        self.starts += 1
-        if not self.owner_gate(None):
-            return False
-        self.on_state("Камера включена.")
-        return True
-
-    def stop(self):
-        self.stops += 1
-        self.on_state("Камера выключена.")
-        return True
 
 
 @pytest.fixture(scope="module")
@@ -95,8 +76,6 @@ def wait_for(app, condition):
 
 @pytest.fixture
 def window(app, tmp_path, monkeypatch):
-    Gestures.instances = []
-    monkeypatch.setattr(control_panel, "GestureService", Gestures)
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "isolated-profile"))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "isolated-home"))
     monkeypatch.setattr(DesktopCore, "due_events", lambda *_a, **_kw: [])
@@ -107,7 +86,7 @@ def window(app, tmp_path, monkeypatch):
     monkeypatch.setattr(QMainWindow, "nativeEvent", lambda *_a: (False, 0))
     executed, verifier = [], Verifier()
     core = DesktopCore(tmp_path / "state", executor=lambda action: executed.append(action) or "Synthetic action result")
-    core.store.set_preferences({"voice_owner_required": True, "gestures_enabled": True})
+    core.store.set_preferences({"voice_owner_required": True})
     core.owner = owner_auth.OwnerSession(True, verifier=verifier, session_check=lambda: True)
     widget = MainWindow(core, voice_factory=Voice, enable_tray=False,
                         enable_integrations=False, quiet_start=True,
@@ -130,23 +109,28 @@ def window(app, tmp_path, monkeypatch):
     app.processEvents()
 
 
-def enable_gestures(app, window):
-    assert window.core.owner.verify(1234).success  # Fake verifier, no Windows API.
-    window.controls._poll_owner()
-    window.controls.gesture_toggle.setChecked(True)
-    wait_for(app, lambda: not window.controls.busy and bool(Gestures.instances))
-    return Gestures.instances[-1]
 
 
 def test_construction_refresh_and_navigation_never_create_camera_or_prompt_hello(window, app):
-    assert Gestures.instances == [] and window.test_verifier.calls == []
+    assert window.test_verifier.calls == []
     for _ in range(3):
         window.refresh()
         window.navigate(window.CONTROLS_PAGE)
         wait_for(app, lambda: not window.controls.busy)
-    assert Gestures.instances == [] and window.test_verifier.calls == []
-    assert not window.controls.gesture_toggle.isChecked()
-    assert not window.core.store.preferences()["gestures_enabled"]
+    assert window.test_verifier.calls == []
+    assert not hasattr(window.controls, "gesture_toggle")
+    assert not hasattr(window.controls, "_gesture_intent")
+    assert window.test_executed == []
+
+
+def test_windows_lock_event_revokes_optional_hello_without_camera_resources(window, app):
+    assert window.core.owner.verify(1234).success  # Fake verifier, no Windows API.
+    message = MSG()
+    message.message, message.wParam = 0x02B1, 7
+    assert window.nativeEvent(b"windows_generic_MSG", ctypes.addressof(message)) == (False, 0)
+    app.processEvents()
+    assert not window.core.owner.allowed()
+    assert not hasattr(window.controls, "_gesture_service")
     assert window.test_executed == []
 
 
@@ -167,29 +151,8 @@ def test_failed_session_hook_denies_owner_prompt_and_revokes_existing_grant(wind
     assert "блокировки сеанса" in window.controls.status.text()
 
 
-def test_windows_lock_event_revokes_owner_before_queued_gesture_dispatch(window, app):
-    service = enable_gestures(app, window)
-    service.on_intent("volume_up")  # Queued Qt callback; not processed yet.
-    message = MSG()
-    message.message, message.wParam = 0x02B1, 7  # WM_WTSSESSION_CHANGE / SESSION_LOCK.
-    assert window.nativeEvent(b"windows_generic_MSG", ctypes.addressof(message)) == (False, 0)
-    wait_for(app, lambda: not window.controls.busy and service.stops > 0)
-    assert not window.core.owner.allowed()
-    assert window.test_executed == []
-    assert not window.controls.gesture_toggle.isChecked() and not service.owner_gate(None)
 
 
-def test_valid_gesture_uses_core_policy_and_reply_then_shutdown_blocks_late_callback(window, app):
-    service = enable_gestures(app, window)
-    service.on_intent("volume_down")
-    wait_for(app, lambda: window.test_executed == ["volume_down"] and not window.controls.busy)
-    window._quitting = True
-    window.close()
-    service.on_intent("volume_up")
-    service.on_state("Камера включена.")
-    wait_for(app, lambda: window._resources_closed)
-    assert window.test_executed == ["volume_down"]
-    assert window.voice.closed == 1 and window.test_closes == [True]
 
 
 def test_main_window_waits_for_actual_controls_thread_then_closes_core_exactly_once(window, app):

@@ -26,7 +26,8 @@ $arguments = @('-m', 'PyInstaller', '--noconfirm', '--clean', '--noupx', '--oned
     '--collect-all', 'onnxruntime',
     '--collect-all', 'ctranslate2', '--collect-all', 'tokenizers',
     '--hidden-import', 'sounddevice', '--hidden-import', 'pythoncom', '--hidden-import', 'win32com.client')
-$arguments += @('--hidden-import', 'desktop.gestures')
+$arguments += @('--exclude-module', 'desktop.gestures', '--exclude-module', 'desktop.gesture_worker',
+                '--exclude-module', 'mediapipe', '--exclude-module', 'cv2')
 $fontPath = Join-Path $PSScriptRoot 'assets\Inter.ttf'
 $fontNotice = Join-Path $PSScriptRoot 'assets\OFL-Inter.txt'
 if (-not (Test-Path -LiteralPath $fontPath) -or -not (Test-Path -LiteralPath $fontNotice)) {

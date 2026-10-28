@@ -1,4 +1,5 @@
-"""Offscreen controls use fake consent/camera/actions, never real devices."""
+"""Offscreen catalog and consent controls; camera functionality is removed."""
+import builtins
 import os
 import struct
 import threading
@@ -93,27 +94,6 @@ class FakeCore:
         return True
 
 
-class FakeGesture:
-    instances = []
-    stop_result = True
-
-    def __init__(self, on_intent, on_state, *, owner_gate):
-        self.on_intent, self.on_state, self.owner_gate = on_intent, on_state, owner_gate
-        self.starts = self.stops = 0
-        self.instances.append(self)
-
-    def start(self):
-        self.starts += 1
-        if not self.owner_gate(None):
-            return False
-        self.on_state("Камера включена.")
-        return True
-
-    def stop(self):
-        self.stops += 1
-        if self.stop_result:
-            self.on_state("Камера выключена.")
-        return self.stop_result
 
 
 @pytest.fixture(scope="module")
@@ -121,11 +101,6 @@ def app():
     return QApplication.instance() or QApplication([])
 
 
-@pytest.fixture(autouse=True)
-def no_camera(monkeypatch):
-    FakeGesture.instances = []
-    FakeGesture.stop_result = True
-    monkeypatch.setattr(module, "GestureService", FakeGesture)
 
 
 @pytest.fixture
@@ -185,11 +160,38 @@ def make_exe(path):
 def test_constructor_and_refresh_never_activate_camera_or_consent(panel, app):
     panel.refresh()
     settled(app, panel)
-    assert not panel.gesture_toggle.isChecked()
-    assert panel.core.store.values["gestures_enabled"] is False
-    assert FakeGesture.instances == [] and panel.core.owner.verifications == []
+    assert not hasattr(panel, "gesture_toggle") and not hasattr(panel, "_gestures_changed")
+    assert not hasattr(module, "GestureService")
+    assert panel.core.owner.verifications == []
     assert not panel.app_add.isEnabled() and not panel.remote_approve.isEnabled()
     assert panel.core.commands == panel.core.controls == []
+
+
+def test_verified_owner_and_refresh_have_no_camera_import_or_dispatch_path(panel, app, monkeypatch):
+    original = builtins.__import__
+    def guarded_import(name, *args, **kwargs):
+        if name.split(".")[0] in {"cv2", "mediapipe"} or name in {"desktop.gestures", "desktop.gesture_worker"}:
+            pytest.fail("Removed camera runtime was imported")
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    enable_owner(panel)
+    for _ in range(3):
+        panel.refresh()
+        settled(app, panel)
+        panel._poll_owner()
+    assert not hasattr(panel._signals, "gesture") and not hasattr(panel._signals, "camera_state")
+    assert not hasattr(panel, "_gesture_service")
+    assert panel.core.commands == panel.core.controls == []
+
+
+def test_shutdown_preserves_phone_pairing_revokes_owner_without_camera_workers(panel, app):
+    enable_owner(panel)
+    panel.core.remote = True
+    panel.shutdown()
+    settled(app, panel, condition=lambda: panel.shutdown_complete)
+    assert panel.core.remote and not panel.core.owner.verified
+    assert panel.core.controls == [] and not panel.owner_timer.isActive()
+    assert panel._worker_threads == {}
 
 
 def test_root_picker_scan_editor_save_and_open_use_selected_id_core_route(panel, app, tmp_path, monkeypatch):
@@ -726,73 +728,12 @@ def test_close_cancels_pending_verification_and_ignores_late_result(panel, app):
     assert panel.status.text() == before and not panel.owner_timer.isActive()
 
 
-def test_gestures_require_explicit_owner_then_finite_rechecked_intents(panel, app):
-    enable_owner(panel)
-    panel.gesture_toggle.setChecked(True)
-    settled(app, panel)
-    service = FakeGesture.instances[-1]
-    assert service.starts == 1 and service.owner_gate(None)
-    assert panel.core.store.values["gestures_enabled"] is True
-    service.on_intent("volume_up")
-    settled(app, panel, condition=lambda: len(panel.core.controls) == 1)
-    assert panel.core.controls == [("volume_up", "gesture")]
-    service.on_intent("shutdown")
-    app.processEvents()
-    assert len(panel.core.controls) == 1
-    panel.core.owner.verified = False
-    service.on_intent("volume_down")
-    app.processEvents()
-    assert len(panel.core.controls) == 1
-    panel._poll_owner()
-    settled(app, panel, condition=lambda: service.stops > 0 and not panel._stopping)
-    assert not panel.gesture_toggle.isChecked() and not service.owner_gate(None)
 
 
-def test_stop_blocks_queued_and_previous_generation_gestures(panel, app):
-    enable_owner(panel)
-    panel.gesture_toggle.setChecked(True)
-    settled(app, panel)
-    old = FakeGesture.instances[-1]
-    old.on_intent("minimize")  # Queued, not yet handled by GUI.
-    panel.gesture_toggle.setChecked(False)
-    settled(app, panel, condition=lambda: not panel._stopping)
-    assert panel.core.controls == [] and panel.core.store.values["gestures_enabled"] is False
-    panel.gesture_toggle.setChecked(True)
-    settled(app, panel)
-    old.on_intent("volume_up")
-    old.on_state("Камера включена.")
-    app.processEvents()
-    assert panel.core.controls == []
 
 
-def test_delayed_camera_stop_is_reported_honestly_until_completion(panel, app):
-    enable_owner(panel)
-    FakeGesture.stop_result = False
-    panel.gesture_toggle.setChecked(True)
-    settled(app, panel)
-    service = FakeGesture.instances[-1]
-    panel.gesture_toggle.setChecked(False)
-    settled(app, panel, condition=lambda: service.stops > 0)
-    assert "останавливается" in panel.gesture_status.text() and not panel.gesture_toggle.isChecked()
-    assert not panel.gesture_toggle.isEnabled()
-    service.on_state("Камера выключена.")
-    settled(app, panel, condition=lambda: not panel._stopping)
-    assert panel.gesture_status.text() == "Камера выключена." and panel.gesture_toggle.isEnabled()
 
 
-def test_shutdown_stops_gestures_preserves_phone_pairing_and_blocks_future_dispatch(panel, app):
-    enable_owner(panel)
-    panel.gesture_toggle.setChecked(True)
-    settled(app, panel)
-    service = FakeGesture.instances[-1]
-    panel.core.remote = True
-    panel.shutdown()
-    service.on_intent("volume_up")
-    service.on_state("Камера включена.")
-    app.processEvents()
-    assert panel.core.remote and not panel.core.owner.verified
-    assert panel.core.controls == [] and not panel.core.store.values["gestures_enabled"]
-    assert not service.owner_gate(None)
 
 
 def test_remote_rendering_uses_status_allowlist_and_no_secret_payload(panel):
@@ -888,20 +829,3 @@ def test_shutdown_complete_waits_for_canceled_verification_thread_exit(panel, ap
     assert panel.status.text() == before
 
 
-def test_shutdown_requests_camera_stop_without_waiting_but_reports_cleanup_thread(panel, app):
-    enable_owner(panel)
-    panel.gesture_toggle.setChecked(True)
-    settled(app, panel)
-    service = FakeGesture.instances[-1]
-    entered, released = threading.Event(), threading.Event()
-    def slow_stop():
-        entered.set()
-        assert released.wait(2)
-        return True
-    service.stop = slow_stop
-    panel.shutdown()
-    assert entered.wait(1)
-    assert not panel.shutdown_complete and not service.owner_gate(None)
-    released.set()
-    settled(app, panel, condition=lambda: panel.shutdown_complete)
-    assert not panel.core.store.values["gestures_enabled"]

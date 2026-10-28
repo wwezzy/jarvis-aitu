@@ -1,4 +1,4 @@
-"""Explicit local controls for catalogs, owner consent and optional gestures.
+"""Explicit local controls for catalogs and optional owner consent.
 
 No camera, Windows Hello prompt or program is started by construction/refresh.
 Worker callbacks enter Qt through signals; late results after shutdown have no
@@ -14,11 +14,7 @@ from PySide6.QtWidgets import (
     QLabel, QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
-from desktop.gesture_worker import IsolatedGestureService as GestureService
-
-
 _EDITORS = (("PyCharm", "pycharm"), ("IntelliJ IDEA", "idea"), ("Visual Studio Code", "vscode"), ("Проводник", "explorer"))
-_GESTURES = frozenset({"volume_up", "volume_down", "minimize"})
 
 
 def _label(text):
@@ -30,9 +26,6 @@ def _label(text):
 
 class _Signals(QObject):
     completed = Signal(int, bool, object)
-    gesture = Signal(int, str)
-    camera_state = Signal(int, str)
-    camera_stopped = Signal(int, bool)
 
 
 class ControlsPanel(QWidget):
@@ -40,20 +33,13 @@ class ControlsPanel(QWidget):
         super().__init__()
         self.core, self.main_window = core, main_window
         self.on_reply, self.remote_status = on_reply, remote_status
-        self._closing, self._camera_requested = threading.Event(), threading.Event()
+        self._closing = threading.Event()
         self._signals = _Signals(self)
         self._signals.completed.connect(self._completed, Qt.ConnectionType.QueuedConnection)
-        self._signals.gesture.connect(self._gesture_intent, Qt.ConnectionType.QueuedConnection)
-        self._signals.camera_state.connect(self._camera_state, Qt.ConnectionType.QueuedConnection)
-        self._signals.camera_stopped.connect(self._camera_stopped, Qt.ConnectionType.QueuedConnection)
         self._jobs, self._job_number, self._refresh_pending = {}, 0, False
         self._worker_lock = threading.Lock()
         self._worker_number, self._worker_threads = 0, {}
-        self._gesture_generation, self._gesture_service, self._stopping = 0, None, {}
         self._build()
-        # A saved preference is a record of the last explicit session, not a
-        # permission to open the camera at the next launch.
-        self._save_camera_preference(False)
         self.owner_timer = QTimer(self)
         self.owner_timer.setInterval(1000)
         self.owner_timer.timeout.connect(self._poll_owner)
@@ -190,15 +176,6 @@ class ControlsPanel(QWidget):
         owner.addWidget(self.owner_verify)
         owner.addWidget(self.owner_status)
 
-        gestures = self._card("Жесты")
-        self.gesture_toggle = QCheckBox("Включить камеру и жесты в этом сеансе")
-        self.gesture_toggle.toggled.connect(self._gestures_changed)
-        gestures.addWidget(self.gesture_toggle)
-        gestures.addWidget(_label("После подтверждения владельца: большой палец вверх — громче, вниз — тише, открытая ладонь — свернуть окно. Сначала убери руки, затем удержи жест. Камера при запуске всегда выключена."))
-        gestures.addWidget(_label("Jarvis не записывает кадры и не хранит видео. Компонент MediaPipe может отправлять диагностические данные об использовании SDK. Жесты не подтверждают личность."))
-        self.gesture_status = _label("Камера выключена.")
-        gestures.addWidget(self.gesture_status)
-
         remote = self._card("Управление с телефона")
         remote.addWidget(_label("Удалённый доступ включается отдельно после подтверждения владельца. Секреты и ссылки входа здесь не отображаются; готовность подключения проверяется отдельно."))
         self.remote_status_label = _label("Проверяю готовность удалённого доступа…")
@@ -239,7 +216,6 @@ class ControlsPanel(QWidget):
         self.owner_verify.setEnabled(active and getattr(self.core.owner, "enabled", False) is True)
         self.remote_approve.setEnabled(active and allowed)
         self.remote_revoke.setEnabled(active)
-        self.gesture_toggle.setEnabled(not self._closing.is_set() and (self._camera_requested.is_set() or active and allowed and not self._stopping))
 
     def _run(self, function, callback=None, *, refresh=True, error_message=None):
         if self._closing.is_set() or self.busy:
@@ -353,11 +329,9 @@ class ControlsPanel(QWidget):
             self.owner_toggle.blockSignals(blocked)
             self.owner_status.setText((f"Владелец подтверждён. Осталось {seconds} сек." if verified else
                                        "Подтверди владельца кнопкой Windows Hello.") if enabled else
-                                      "Защита голосовых команд выключена. Для приложений, жестов и удалённого доступа нужна проверка владельца.")
+                                      "Защита голосовых команд выключена. Для приложений и удалённого доступа нужна проверка владельца.")
         except Exception:
             self.owner_status.setText("Не удалось проверить доступ владельца; новые разрешения не выдаются.")
-        if self._camera_requested.is_set() and not self._owner_allowed():
-            self._stop_gestures("Доступ владельца истёк. Останавливаю камеру…")
         self._sync_enabled()
 
     def _pick_root(self):
@@ -591,8 +565,6 @@ class ControlsPanel(QWidget):
         def done(accepted):
             if accepted is not True:
                 self.status.setText("Чтобы выключить защиту, сначала подтверди владельца.")
-            elif not enabled:
-                self._stop_gestures()
             self._poll_owner()
         self._run(change, done)
 
@@ -614,117 +586,6 @@ class ControlsPanel(QWidget):
             self._poll_owner()
         self._run(lambda: owner.verify(hwnd, cancel=closing), done)
 
-    def _save_camera_preference(self, enabled):
-        try:
-            self.core.store.set_preferences({"gestures_enabled": bool(enabled)})
-        except Exception:
-            pass  # A camera is never enabled merely because storage failed.
-
-    def _gestures_changed(self, enabled):
-        if not enabled:
-            self._stop_gestures()
-            return
-        if not self._owner_allowed() or self._stopping or self._closing.is_set() or self.busy:
-            self._set_camera_checked(False)
-            self.gesture_status.setText("Камера выключена. Сначала подтверди владельца.")
-            return
-        self._gesture_generation += 1
-        generation, signals = self._gesture_generation, self._signals
-        self._camera_requested.set()
-        self._save_camera_preference(True)
-        try:
-            service = GestureService(
-                lambda intent: self._emit(signals.gesture, generation, intent),
-                lambda state: self._emit(signals.camera_state, generation, state),
-                owner_gate=lambda _intent=None: self._camera_requested.is_set() and self._owner_allowed())
-        except Exception:
-            self._camera_requested.clear()
-            self._set_camera_checked(False)
-            self._save_camera_preference(False)
-            self.gesture_status.setText("Камера выключена: компоненты жестов недоступны.")
-            return
-        self._gesture_service = service
-        self.gesture_status.setText("Подготавливаю жесты. Камера включается только в этом сеансе…")
-        def started(success):
-            if generation != self._gesture_generation or not self._camera_requested.is_set():
-                return
-            if success is not True:
-                self.status.setText("Не удалось включить жесты. Проверь компоненты жестов и доступ владельца.")
-                self._stop_gestures("Камера не включена. Проверь компоненты жестов и доступ владельца.")
-        self._run(service.start, started, refresh=False)
-
-    def _emit(self, signal, *values):
-        if self._closing.is_set():
-            return
-        try:
-            signal.emit(*values)
-        except RuntimeError:
-            pass
-
-    def _set_camera_checked(self, enabled):
-        blocked = self.gesture_toggle.blockSignals(True)
-        self.gesture_toggle.setChecked(enabled)
-        self.gesture_toggle.blockSignals(blocked)
-
-    def _stop_gestures(self, message="Останавливаю камеру…"):
-        self._camera_requested.clear()
-        previous_generation = self._gesture_generation
-        self._gesture_generation += 1
-        self._set_camera_checked(False)
-        self._save_camera_preference(False)
-        service, self._gesture_service = self._gesture_service, None
-        if service is None:
-            self.gesture_status.setText(message if self._stopping else "Камера выключена.")
-            self._sync_enabled()
-            return
-        generation, signals = previous_generation, self._signals
-        self._stopping[generation] = service
-        self.gesture_status.setText(message)
-        self._sync_enabled()
-        def stop():
-            try:
-                stopped = service.stop() is True
-            except Exception:
-                stopped = False
-            self._emit(signals.camera_stopped, generation, stopped)
-        self._start_worker(stop, "JarvisGestureStop")
-
-    @Slot(int, bool)
-    def _camera_stopped(self, generation, stopped):
-        if self._closing.is_set():
-            return
-        if stopped:
-            self._stopping.pop(generation, None)
-        self.gesture_status.setText("Камера выключена." if not self._stopping else "Камера ещё останавливается. Дождись завершения.")
-        self._sync_enabled()
-
-    @Slot(int, str)
-    def _camera_state(self, generation, message):
-        if self._closing.is_set():
-            return
-        if generation in self._stopping and message == "Камера выключена.":
-            self._stopping.pop(generation, None)
-            self.gesture_status.setText("Камера выключена." if not self._stopping else "Камера ещё останавливается. Дождись завершения.")
-            self._sync_enabled()
-            return
-        if not self._closing.is_set() and generation == self._gesture_generation and self._camera_requested.is_set():
-            self.gesture_status.setText(message[:300])
-            if message == "Камера выключена.":
-                self._stop_gestures()
-
-    @Slot(int, str)
-    def _gesture_intent(self, generation, intent):
-        if (self._closing.is_set() or generation != self._gesture_generation or intent not in _GESTURES
-                or not self._camera_requested.is_set() or not self._owner_allowed() or self.busy):
-            return
-        core, closing, requested = self.core, self._closing, self._camera_requested
-        def execute():
-            if (closing.is_set() or not requested.is_set() or generation != self._gesture_generation
-                    or not self._owner_allowed()):
-                return None
-            return core.request_control(intent, source="gesture")
-        self._run(execute, lambda reply: self._reply(reply) if reply is not None else None, refresh=False)
-
     def _approve_remote(self):
         if not self._owner_allowed():
             self.status.setText("Сначала подтверди владельца через Windows Hello.")
@@ -744,14 +605,13 @@ class ControlsPanel(QWidget):
         self._closing.set()
         self._jobs.clear()
         self.owner_timer.stop()
-        self._stop_gestures()
         try:
             self.core.owner.revoke()
         except Exception:
             pass
         # Phone pairing survives a normal application exit. Its separate live
         # adapter gate blocks requests while quitting; explicit Revoke removes
-        # this durable consent. Hello and camera remain session-only grants.
+        # this durable consent. Hello remains a session-only grant.
 
     def closeEvent(self, event):
         self.shutdown()

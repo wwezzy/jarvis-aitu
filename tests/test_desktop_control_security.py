@@ -1,4 +1,4 @@
-"""Owner consent and finite gesture authority, without OS or camera access."""
+"""Owner consent and rejection of removed gesture authority, without devices."""
 from types import SimpleNamespace
 
 import pytest
@@ -43,19 +43,18 @@ def test_disabling_enabled_owner_policy_requires_fresh_consent(controlled):
 
 
 @pytest.mark.parametrize("action", sorted(ALLOWED_ACTIONS))
-def test_gestures_have_exactly_three_non_power_actions(controlled, action):
+def test_removed_gestures_never_execute_even_with_legacy_flag_and_verified_owner(controlled, action):
     core, _, actions = controlled
     assert core.owner.verify(123).success
     reply = core.request_control(action, source="gesture")
-    if action in {"volume_up", "volume_down", "minimize"}:
-        assert actions == [action]
-    else:
-        assert not actions
+    assert not actions
+    assert reply.text == "Управление жестами удалено." and not reply.speak
     assert reply.confirmation_id is None
+    assert core.store.snapshot()["recent"] == []
 
 
 @pytest.mark.parametrize("change", ["disabled_policy", "disabled_gestures", "expired", "revoked", "session_lock"])
-def test_queued_gesture_is_rechecked_at_core_dispatch(controlled, change):
+def test_old_queued_gesture_cannot_be_reactivated_by_owner_or_preference_state(controlled, change):
     core, clock, actions = controlled
     assert core.owner.verify(123).success
     if change == "disabled_policy":
@@ -82,8 +81,17 @@ def test_malformed_control_actions_fail_closed(controlled, bad):
 
 
 @pytest.mark.parametrize("source", ["model", "import", "voice", "typed", None, []])
-def test_only_trusted_gesture_adapter_has_control_entry(controlled, source):
+def test_model_and_untrusted_sources_have_no_control_authority(controlled, source):
     core, _, actions = controlled
     assert core.owner.verify(123).success
     core.request_control("volume_up", source=source)
     assert not actions
+
+
+def test_default_control_source_keeps_remote_approval_gate(controlled):
+    core, _, actions = controlled
+    reply = core.request_control("volume_up")
+    assert "Удалённое управление не разрешено" in reply.text and not actions
+    core.store.set_preferences({"remote_control_approved": True})
+    core.request_control("volume_up")
+    assert actions == ["volume_up"]
