@@ -146,6 +146,7 @@ class Orb(QWidget):
 
 class Events(QObject):
     recognized = Signal(int, str)
+    recognized_context = Signal(int, int, str)
     voice_state = Signal(str)
     progress = Signal(str)
     stream_chunk = Signal(int, str)
@@ -682,6 +683,7 @@ class MainWindow(QMainWindow):
         self._session_notifications_registered = register_session_notifications(int(self.winId()))
         self._build()
         self.events.recognized.connect(self._recognized_for_session)
+        self.events.recognized_context.connect(self._recognized_for_context)
         self.events.voice_state.connect(self._voice_state)
         self.events.progress.connect(self._model_progress)
         self.events.stream_chunk.connect(self._receive_stream_chunk)
@@ -726,6 +728,7 @@ class MainWindow(QMainWindow):
             factory = VoiceService
             state_dir = self.core.state_dir
             options["transcriber_factory"] = lambda: FallbackTranscription(state_dir)
+            options["on_command"] = self._command_callback(self._capture_session)
         voice = factory(on_text=self._recognition_callback(self._capture_session), on_state=self.events.voice_state.emit,
                         model_dir=self.model_dir, **options)
         voice.speech_enabled = bool(self.preferences.get("speech_enabled", True))
@@ -743,8 +746,24 @@ class MainWindow(QMainWindow):
                 self.events.recognized.emit(session_id, text)
         return recognized
 
+    def _command_callback(self, session_id):
+        bridge = weakref.ref(self.events)
+        def command(text, generation):
+            receiver = bridge()
+            if receiver is not None and isinstance(text, str) and type(generation) is int:
+                try:
+                    receiver.recognized_context.emit(session_id, generation, text)
+                except RuntimeError:
+                    pass
+        return command
+
     def _recognized_for_session(self, session_id, text):
         if session_id == self._capture_session:
+            self._voice_command(text)
+
+    def _recognized_for_context(self, session_id, generation, text):
+        if (session_id == self._capture_session and type(generation) is int
+                and generation == getattr(self.voice, "command_generation", None)):
             self._voice_command(text)
 
     def _build(self):
@@ -2212,6 +2231,9 @@ class MainWindow(QMainWindow):
         self._capture_session += 1
         session_id = self._capture_session
         self.voice.on_text = self._recognition_callback(session_id)
+        command_receiver = getattr(self.voice, "set_command_receiver", None)
+        if callable(command_receiver):
+            command_receiver(self._command_callback(session_id))
         self._capture_failed = False
         self._capture_error = None
         self.status.setText("Запускаю микрофон…")

@@ -84,10 +84,16 @@ class _Lifecycle:
         self._jobs, self._providers = set(), {}
 
     def _begin(self, external=None):
+        if external is not None and not isinstance(external, threading.Event):
+            raise ValueError("A cancellation event is required")
+        if external is not None and external.is_set():
+            raise CloudCancelled("canceled")
         owned = threading.Event()
         with self._lock:
             if self._closed.is_set():
                 raise CloudCancelled("closed")
+            if external is not None and external.is_set():
+                raise CloudCancelled("canceled")
             self._jobs.add(owned)
         return _Cancellation(owned, external, self._closed)
 
@@ -257,6 +263,7 @@ class FallbackTranscription(_Lifecycle):
         self._initialize_lifecycle()
 
     def _cloud_decoder(self, cancellation):
+        cancellation.check()
         if _cloud_configuration(self.environ, "JARVIS_CLOUD_STT_ENABLED") is None:
             return None
         cancellation.check()
@@ -313,10 +320,19 @@ class FallbackTranscription(_Lifecycle):
             self._end(cancellation)
 
     def transcribe(self, pcm, sample_rate):
+        return self.transcribe_cancelable(pcm, sample_rate)
+
+    def transcribe_cancelable(self, pcm, sample_rate, *, cancel_event=None):
+        """A caller-captured event also fences work not yet registered here.
+
+        A stale VoiceService job may reach this adapter only after interrupt()
+        has already canceled its previous jobs. Its captured, permanently-set
+        event must stop this call before a provider/configuration is touched.
+        """
         if (not isinstance(pcm, bytes) or not pcm or len(pcm) % 2 or type(sample_rate) is not int
                 or not 8000 <= sample_rate <= 48000 or len(pcm) > 12 * sample_rate * 2):
             raise ValueError("Expected mono16le audio, 8..48kHz and at most 12 seconds")
-        cancellation = self._begin()
+        cancellation = self._begin(cancel_event)
         if not self._decode_lock.acquire(blocking=False):
             self._end(cancellation)
             raise CloudUnavailable("busy")
@@ -324,12 +340,14 @@ class FallbackTranscription(_Lifecycle):
         try:
             cancellation.check()
             cloud = self._cloud_decoder(cancellation)
+            cancellation.check()
             configuration = _cloud_configuration(self.environ, "JARVIS_CLOUD_STT_ENABLED")
             if cloud is not None and _cloud_ready(cloud):
                 cancellation.check()
                 if _cloud_configuration(self.environ, "JARVIS_CLOUD_STT_ENABLED") != configuration:
                     raise CloudCancelled("configuration_changed")
                 try:
+                    cancellation.check()
                     text = ChatRouter._final(cloud.transcribe(pcm, sample_rate))
                     cancellation.check()
                     if len(text) > 500:

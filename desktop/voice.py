@@ -286,9 +286,12 @@ class VoiceService:
     """
 
     def __init__(self, on_text: Callable[[str], None], on_state: Callable[[str], None],
-                 model_dir: Path | None = None, *, transcriber_factory=None):
+                 model_dir: Path | None = None, *, transcriber_factory=None, on_command=None):
         if transcriber_factory is not None and not callable(transcriber_factory):
             raise ValueError("A transcriber factory is required")
+        if on_command is not None and not callable(on_command):
+            raise ValueError("A command receiver is required")
+        self._on_command = on_command
         self._transcriber_factory = transcriber_factory
         self.on_text, self.on_state = on_text, on_state
         self.model_dir = Path(model_dir) if model_dir else default_model_dir()
@@ -314,6 +317,7 @@ class VoiceService:
         self._halt_speech = threading.Event()
         self._closed = threading.Event()
         self._speech_generation = 0
+        self._command_cancel = threading.Event()
         self._waiting_clone = threading.Event()
         self._waiting_generation = None
         self._urgent_ack = None
@@ -505,7 +509,18 @@ class VoiceService:
             recognized.append(word["word"])
         return normalize(" ".join(recognized)) == normalize(full_text)
 
-    def _decode_command(self, text, pcm=None, sample_rate=None, *, confident=False):
+    def _decode_command(self, text, pcm=None, sample_rate=None, *, confident=False, request_context=None):
+        with self._lock:
+            context = request_context or (self._speech_generation, self._audio_epoch, self._stt, self._command_cancel)
+        generation, epoch, decoder, canceled = context
+
+        def current():
+            return (not canceled.is_set() and not self._stop.is_set() and not self._closed.is_set()
+                    and self._speech_generation == generation and self._audio_epoch == epoch
+                    and self._stt is decoder and self.multilingual_stt_enabled)
+
+        if canceled.is_set() or generation != self._speech_generation:
+            return None
         if not self.multilingual_stt_enabled or self._stt is None:
             return text
         # Text equality alone is not acoustic confidence. Only the caller's
@@ -520,13 +535,16 @@ class VoiceService:
         started = time.monotonic()
         self._count("decoder_requests")
         try:
-            decoded = self._stt.transcribe(pcm, sample_rate)
-            if self._stop.is_set() or self._closed.is_set():
+            bounded = getattr(decoder, "transcribe_cancelable", None)
+            decoded = (bounded(pcm, sample_rate, cancel_event=canceled) if callable(bounded)
+                       else decoder.transcribe(pcm, sample_rate))
+            if not current():
                 return None
             return strip_wake_prefix(decoded, verified=True)
         except Exception:
             self._count("decoder_failures")
-            self._emit(self.on_state, "Не удалось уверенно распознать команду. Повтори её или напиши текстом.")
+            if current():
+                self._emit(self.on_state, "Не удалось уверенно распознать команду. Повтори её или напиши текстом.")
             return None
         finally:
             with self._stats_lock:
@@ -580,7 +598,40 @@ class VoiceService:
             self._clear_audio()
             self._transcribing.clear()
 
-    def _recognized(self, text: str, pcm=None, sample_rate=None, *, words=None, english_candidate=False, pcm_start=None):
+    @property
+    def command_generation(self):
+        return self._speech_generation
+
+    def set_command_receiver(self, receiver):
+        if receiver is not None and not callable(receiver):
+            raise ValueError("A command receiver is required")
+        with self._lock:
+            self._on_command = receiver
+
+    def _emit_command(self, text, generation):
+        if generation != self._speech_generation or self._stop.is_set() or self._closed.is_set():
+            return
+        if self._on_command is None:
+            self._emit(self.on_text, text)
+        else:
+            try:
+                self._on_command(text, generation)
+            except Exception:
+                pass  # A closed GUI cannot revive or execute this command.
+
+    def _recognized(self, text: str, pcm=None, sample_rate=None, *, words=None, english_candidate=False,
+                    pcm_start=None, expected_generation=None):
+        with self._lock:
+            context = (self._speech_generation, self._audio_epoch, self._stt, self._command_cancel)
+        generation, epoch, decoder, canceled = context
+
+        def current():
+            return (not canceled.is_set() and not self._stop.is_set() and not self._closed.is_set()
+                    and generation == self._speech_generation and epoch == self._audio_epoch
+                    and decoder is self._stt)
+
+        if expected_generation is not None and expected_generation != generation:
+            return
         if (self._stop.is_set() or self._closed.is_set() or self._speaking.is_set()
                 or time.monotonic() - self._last_spoken < SPEECH_ECHO_TAIL):
             return
@@ -592,7 +643,7 @@ class VoiceService:
         english_decoded = None
         if english_candidate is True and not verified_wake and not armed:
             english_decoded = self._decode_english_wake(pcm, sample_rate, now)
-            if english_decoded is None:
+            if english_decoded is None or not current():
                 return
             text, verified_wake = english_decoded, True
         result = self.gate.feed(text, now)
@@ -610,6 +661,8 @@ class VoiceService:
             result = WakeDecision("cancel")
         if result.kind == "wake":
             if not bilingual_audio or self._complete_name_only(text, words, pcm, sample_rate, pcm_start):
+                if not current():
+                    return
                 self._count("wake_shortcuts")
                 self._emit(self.on_state, "Слушаю команду…")
                 self.say("Да, сэр")
@@ -622,8 +675,8 @@ class VoiceService:
             confident = result.kind == "command" and self._confident_alias(text, result.text, words)
             decoded = (strip_wake_prefix(english_decoded) if english_decoded is not None else
                        self._decode_command(result.text if result.kind == "command" else text,
-                                            pcm, sample_rate, confident=confident))
-            if self._stop.is_set() or self._closed.is_set():
+                                            pcm, sample_rate, confident=confident, request_context=context))
+            if not current():
                 return
             if decoded is None or not decoded.strip():
                 # A failed decoder cannot keep extending authorization. Retry
@@ -638,13 +691,13 @@ class VoiceService:
             self.gate.reset()
             if WakeGate.is_cancel(decoded):
                 self._emit(self.on_state, "Ожидаю слово «Джарвис»")
-                self._emit(self.on_text, "стоп")
+                self._emit_command("стоп", generation)
             else:
                 self._count("commands")
-                self._emit(self.on_text, decoded)
+                self._emit_command(decoded, generation)
         elif result.kind == "cancel":
             self._emit(self.on_state, "Ожидаю слово «Джарвис»")
-            self._emit(self.on_text, "стоп")
+            self._emit_command("стоп", generation)
 
     def _recognition_retry(self, deadline):
         """One audible clarification per real wake; it never renews permission."""
@@ -823,7 +876,8 @@ class VoiceService:
                                 pcm = utterance.pcm()
                                 pcm_start = max(0, (accepted_samples - len(pcm) // 2) / sample_rate) if pcm is not None else None
                                 self._recognized(result.get("text", ""), pcm, sample_rate,
-                                                 words=result.get("result"), english_candidate=candidate, pcm_start=pcm_start)
+                                                 words=result.get("result"), english_candidate=candidate, pcm_start=pcm_start,
+                                                 expected_generation=generation)
                         recognizer.Reset()
                         utterance.reset()
                         reset_english()
@@ -867,15 +921,11 @@ class VoiceService:
 
     def interrupt(self):
         """Stop old speech without stopping the microphone or authorizing actions."""
-        cancel_decoder = getattr(self._stt, "cancel", None)
-        if callable(cancel_decoder):
-            try:
-                cancel_decoder()
-            except Exception:
-                pass
         canceled = []
         with self._lock:
             self._speech_generation += 1
+            self._command_cancel.set()
+            self._command_cancel = threading.Event()
             self._halt_speech.set()
             self._urgent_ack = None
             while True:
@@ -886,6 +936,12 @@ class VoiceService:
                         canceled.append(item.completion)
                 except queue.Empty:
                     break
+        cancel_decoder = getattr(self._stt, "cancel", None)
+        if callable(cancel_decoder):
+            try:
+                cancel_decoder()
+            except Exception:
+                pass
         for completion in canceled:
             completion.finish(False)
 

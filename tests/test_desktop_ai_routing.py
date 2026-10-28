@@ -276,3 +276,59 @@ def test_late_local_native_decode_is_discarded_after_cancel(tmp_path):
     with pytest.raises(CloudCancelled):
         value.facade.transcribe_local(b"00" * 8000, 8000)
     assert value.facade.last_provider is None and not value.cloud.calls
+
+
+def test_transcription_captured_pre_canceled_event_is_inert_before_cloud_configuration(tmp_path):
+    class ForbiddenEnvironment(dict):
+        def get(self, *_args):
+            pytest.fail("Canceled recording inspected cloud configuration")
+    value = transcription(tmp_path, env=ForbiddenEnvironment(OPENAI_API_KEY=KEY, JARVIS_CLOUD_STT_ENABLED="1"))
+    captured = threading.Event()
+    captured.set()
+    with pytest.raises(CloudCancelled):
+        value.facade.transcribe_cancelable(b"00" * 8000, 8000, cancel_event=captured)
+    assert not value.made and not value.cloud.calls and not value.local.calls
+    assert value.cloud.prepared == value.local.prepared == 0 and not value.facade._jobs
+
+
+def test_interrupt_before_job_registration_cannot_start_a_late_cloud_or_local_call(tmp_path, monkeypatch):
+    value = transcription(tmp_path)
+    entered, release, captured = threading.Event(), threading.Event(), threading.Event()
+    original_begin = value.facade._begin
+    outcomes = []
+    def before_begin(external=None):
+        assert external is captured
+        entered.set()
+        assert release.wait(timeout=2)
+        return original_begin(external)
+    monkeypatch.setattr(value.facade, "_begin", before_begin)
+    def old_voice_job():
+        try:
+            value.facade.transcribe_cancelable(b"00" * 8000, 8000, cancel_event=captured)
+        except CloudCancelled:
+            outcomes.append("canceled")
+    worker = threading.Thread(target=old_voice_job)
+    worker.start()
+    try:
+        assert entered.wait(timeout=2)
+        assert not value.facade._jobs  # The original cancellation missed this job.
+        captured.set()  # VoiceService's permanently canceled entry token.
+        value.facade.cancel()
+    finally:
+        release.set()
+        worker.join(timeout=2)
+    assert not worker.is_alive() and outcomes == ["canceled"]
+    assert not value.made and not value.cloud.calls and not value.local.calls
+    assert value.cloud.prepared == value.local.prepared == 0
+    # A later explicitly captured fresh token remains usable.
+    monkeypatch.setattr(value.facade, "_begin", original_begin)
+    assert value.facade.transcribe_cancelable(b"00" * 8000, 8000, cancel_event=threading.Event()) == "Джарвис, привет"
+    assert len(value.cloud.calls) == 1
+
+
+@pytest.mark.parametrize("invalid", [True, "event", SimpleNamespace(is_set=lambda: False)])
+def test_transcription_cancel_token_must_be_a_real_event(tmp_path, invalid):
+    value = transcription(tmp_path)
+    with pytest.raises(ValueError, match="cancellation event"):
+        value.facade.transcribe_cancelable(b"00" * 8000, 8000, cancel_event=invalid)
+    assert not value.made
