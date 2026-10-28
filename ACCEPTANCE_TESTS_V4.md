@@ -1,5 +1,48 @@
 # Jarvis v4 staging acceptance
 
+## Additional Desktop 4.5 acceptance
+
+Record the exact installed source commit and whether each check is **observed**,
+**fake-provider only**, or **not performed**. The real key/account checks require
+the owner's secure setup flow. Never substitute synthetic recordings for live
+microphone acceptance or claim a historical PR merge includes later branch work.
+
+1. Verify 4.5's signed runtime, source hashes and version label; old workers have
+   exited, and original SQLite rows/catalogs/preferences are retained. Gesture
+   UI, camera workers, MediaPipe and OpenCV are absent from the new runtime.
+2. Open Notes at narrow and wide window sizes. Search a disposable vault, create
+   a new Markdown note, return to an unsaved draft, open a selected note in
+   Obsidian, and switch to earlier SQLite notes. Existing files must not be
+   overwritten; links/commands in note content must not execute or enter AI context.
+3. With the cloud disconnected, try typed help, tasks, notes, calculator and a
+   canceled power confirmation. These must not require an LLM. A model reply
+   saying “shutdown/open/run” must produce no native action.
+4. After secure key provisioning choose OpenAI mode. Say “Джарвис”, pause,
+   “что ты умеешь”; then “как дела”, “ты меня слышишь”, “доброе утро”, and
+   “открой калькулятор”. Test quiet/normal voice and RU/EN. Record failures with
+   the fixed diagnostic reason and microphone level, never audio or private text
+   in public reports. Measure end of speech to first useful answer; no 300 ms claim.
+5. Verify audible Cedar speech for typed and spoken replies; Stop/mute/change
+   voice while connecting and during playback. No late PCM, repeated utterance,
+   different fallback speaker, background retry or leaked provider error is allowed.
+   This pipeline suppresses mic input while speaking; full-duplex is not claimed.
+6. Repeat the public wake acknowledgement. Only a fully completed matching ACK
+   may be cached in bounded RAM; no extra API call for its cache hit. Check shared
+   allowance accounting for chat/STT/speech, cancellation, key revocation, quota
+   refusal and unknown usage. The allowance must not be presented as account balance.
+7. In a prepared signed Yandex Music app with login/availability, request “включи
+   песню”. Require the same native Player to show Pause and advancing track time
+   before success. Also test paused queue, cold My Vibe, missing login, changed app,
+   browser video foreground and cancellation. An unconfirmed state is not success.
+   Restore the prior paused state after a short acceptance sample.
+8. Test the full morning recording→music continuation and cancel before it ends.
+   Verify evening planning at 22:00, current Tue/Thu/Sun flexible workouts, and
+   no invented completed tasks. Optionally verify Windows Hello expiry and lock
+   revocation; it verifies the Windows user, not the identity of a voice.
+
+Live API, live microphone/prosody, actual music audio, physical Hello and iPhone
+acceptance remain separate from CI. Do not mark them passed unless observed.
+
 Run on a dedicated staging bot, service, PostgreSQL copy and Redis namespace/database. Do not deploy or modify production. Record commit, environment type, timestamp, observed result and pass/fail for each step. Use synthetic material, not real personal data in screenshots/PR comments. Unperformed credentialed checks remain unperformed; mocks are not live acceptance.
 
 ## Automated quality gate

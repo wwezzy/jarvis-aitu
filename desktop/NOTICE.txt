@@ -1,4 +1,4 @@
-Jarvis Desktop 4.4.1
+Jarvis Desktop 4.5.0
 
 This is an independent local personal assistant. It is not affiliated with
 Marvel, Disney, the Iron Man films or the third-party JARVIS installer.
@@ -6,6 +6,11 @@ The public distribution contains no user reference recordings or private
 voice-model weights. Optional personal voice conditioning uses recordings
 explicitly supplied by the user; no identity, endorsement or commercial
 voice rights are claimed.
+
+Optional OpenAI speech is AI-generated, using a built-in voice rather than an
+actor identity. Post-wake transcription and supplied reply text are sent to
+OpenAI only when explicitly configured. The WebSocket transport uses the
+websockets package (BSD-3-Clause). No API credential is distributed.
 
 The app uses offline Vosk recognition and optionally CPU neural Piper speech.
 Installed Windows speech remains an explicit selectable fallback.

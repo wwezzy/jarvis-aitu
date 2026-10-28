@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$PythonPath,
     [string]$ModelDir,
     [string]$OutputDir,
@@ -77,11 +77,11 @@ VSVersionInfo(
   kids=[StringFileInfo([StringTable('040904B0', [
     StringStruct('CompanyName','Jarvis personal project'),
     StringStruct('FileDescription','Jarvis local desktop assistant'),
-    StringStruct('FileVersion','4.4.1.0'),
+    StringStruct('FileVersion','4.5.0.0'),
     StringStruct('InternalName','JarvisDesktop'),
     StringStruct('OriginalFilename','JarvisDesktop.exe'),
     StringStruct('ProductName','Jarvis Desktop'),
-    StringStruct('ProductVersion','4.4.1')])]),
+    StringStruct('ProductVersion','4.5.0')])]),
     VarFileInfo([VarStruct('Translation',[1033,1200])])])
 '@ | Set-Content -LiteralPath $versionPath -Encoding utf8
 $arguments += @('--version-file', $versionPath)
@@ -150,6 +150,6 @@ if (-not $IsccPath) {
 if (-not $IsccPath) { throw 'Portable build succeeded. Install official Inno Setup or pass -IsccPath to build the per-user installer.' }
 & $IsccPath ('/DBundleDir=' + $bundlePath) ('/DOutputDir=' + $outputPath) (Join-Path $PSScriptRoot 'installer.iss')
 if ($LASTEXITCODE -ne 0) { throw 'Inno Setup compilation failed.' }
-$installer = Join-Path $outputPath 'JarvisDesktop-Setup-4.4.1.exe'
+$installer = Join-Path $outputPath 'JarvisDesktop-Setup-4.5.0.exe'
 if (-not (Test-Path -LiteralPath $installer)) { throw 'Installer output not found.' }
 Get-FileHash -LiteralPath $installer -Algorithm SHA256 | Select-Object Algorithm, Hash, Path

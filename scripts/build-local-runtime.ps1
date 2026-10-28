@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$InstallRoot,
     [string]$PythonPath,
     [string]$ModelDir,
@@ -10,7 +10,7 @@ $ErrorActionPreference = 'Stop'
 $repoPath = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 if (-not $PythonPath) { $PythonPath = Join-Path $repoPath '.venv\Scripts\python.exe' }
 $PythonPath = (Resolve-Path -LiteralPath $PythonPath).Path
-if (-not $InstallRoot) { $InstallRoot = Join-Path $env:USERPROFILE 'Applications\JarvisDesktopLocal-4.4.1' }
+if (-not $InstallRoot) { $InstallRoot = Join-Path $env:USERPROFILE 'Applications\JarvisDesktopLocal-4.5.0' }
 $installPath = [IO.Path]::GetFullPath($InstallRoot)
 if ((Test-Path -LiteralPath $installPath) -and (Get-ChildItem -LiteralPath $installPath -Force | Select-Object -First 1)) {
     throw 'The destination is not empty. Choose a new versioned installation directory; existing files are never deleted.'
@@ -150,7 +150,7 @@ runpy.run_path(str(APP / "desktop_app.py"), run_name="__main__")
 $launcherPath = Join-Path $installPath 'launcher.pyw'
 [IO.File]::WriteAllText($launcherPath, $launcher, [Text.UTF8Encoding]::new($false))
 $manifest = @{
-    version = '4.4.1'; kind = 'isolated-source-runtime'; sourceCommit = (& git -C $repoPath rev-parse HEAD).Trim()
+    version = '4.5.0'; kind = 'isolated-source-runtime'; sourceCommit = (& git -C $repoPath rev-parse HEAD).Trim()
     runtimeSigner = $signature.SignerCertificate.Subject
     pythonwSha256 = (Get-FileHash -LiteralPath (Join-Path $runtimePath 'pythonw.exe') -Algorithm SHA256).Hash
     personalDataBundled = $false; cloudCredentialsBundled = $false
@@ -159,7 +159,13 @@ $manifest = @{
 }
 $sourceHashes = @{}
 foreach ($sourceFile in @(Get-Item -LiteralPath (Join-Path $appPath 'desktop_app.py')) + @(Get-ChildItem -LiteralPath $desktopPath -File -Filter '*.py')) {
-    $relativeSource = [IO.Path]::GetRelativePath($appPath, $sourceFile.FullName).Replace('\', '/')
+    # GetRelativePath is unavailable in Windows PowerShell 5.1/.NET Framework.
+    # Every enumerated source must remain under this already-validated app root.
+    $sourcePrefix = $appPath.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    if (-not $sourceFile.FullName.StartsWith($sourcePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'An application source escaped the installation root.'
+    }
+    $relativeSource = $sourceFile.FullName.Substring($sourcePrefix.Length).Replace('\', '/')
     $sourceHashes[$relativeSource] = (Get-FileHash -LiteralPath $sourceFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 $manifest.sourceFilesSha256 = $sourceHashes
@@ -216,7 +222,7 @@ if (-not $NoShortcut) {
     $shortcut.Description = 'JARVIS — локальный голосовой ассистент'
     $shortcut.Save()
     Write-Output ('Start Menu shortcut: ' + $shortcutPath)
-    $downloadPath = Join-Path $env:USERPROFILE 'Downloads\Jarvis-Desktop-4.4.1'
+    $downloadPath = Join-Path $env:USERPROFILE 'Downloads\Jarvis-Desktop-4.5.0'
     New-Item -ItemType Directory -Path $downloadPath -Force | Out-Null
     Copy-Item -LiteralPath $shortcutPath -Destination (Join-Path $downloadPath 'JARVIS.lnk') -Force
     Write-Output ('Ready launch shortcut: ' + (Join-Path $downloadPath 'JARVIS.lnk'))

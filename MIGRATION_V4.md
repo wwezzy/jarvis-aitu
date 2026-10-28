@@ -1,5 +1,45 @@
 # Jarvis v4 migration and rollback
 
+## Desktop 4.5 local upgrade (2026-10-28)
+
+The owner selected a local application without a paid Render subscription.
+The original server staging procedure below remains available; it is not run
+against production for the desktop upgrade. PR #9 was already merged; later
+branch work updates its description only, without reopening it or creating a PR.
+
+1. Back up the private Desktop SQLite files with the SQLite backup API, and
+   keep that backup outside Git. Preserve catalogs, phone configuration, vault
+   configuration and personal voice assets; omit observation history from export.
+2. Build into a new `JarvisDesktopLocal-4.5.0` directory. Both Windows PowerShell
+   5.1 and PowerShell 7 are supported. Verify interpreter signatures, manifest
+   hashes and runtime imports before changing shortcuts. Do not delete earlier
+   runtimes: a private voice environment may still pin an earlier interpreter.
+3. Exit the old window normally and wait for its workers. Launch the new version
+   and check its version label, notes, catalogs and preferences. Retarget only
+   the owned shortcuts/startup entry after this acceptance. Camera/gesture modules
+   are excluded; Windows Hello remains optional.
+4. OpenAI use requires a privately provisioned `OPENAI_API_KEY`. Use the secure
+   Platform project picker and confirmation of the exact env-file destination.
+   Only afterward may the installed app receive a private credential-source
+   manifest pointing to that confirmed file. No secret enters the repository,
+   package, command line or shortcut. Selecting OpenAI in Settings enables its
+   chat, post-wake STT and speech; otherwise those flags default off.
+5. `cloud-ai.sqlite3` migrates from ledger schema 1 to 2 transactionally on the
+   first reservation. All previous known/unknown charges are retained; speech
+   joins the same daily allowance as chat/STT. Main Desktop data remains schema 3.
+   Defaults: $0.25 and 100 attempts per UTC+5 day. Unknown outcomes retain their
+   reservation; validated completed provider usage may settle conservatively.
+6. Run the additional desktop acceptance below and in HANDSFREE.md. Fake providers
+   and generic recordings do not establish account access or live microphone quality.
+
+Rollback: in 4.5 select the previous local voice before exit, then launch the
+previous owned shortcut and retarget startup if needed. Leave SQLite content and
+Markdown files intact; do not downgrade/reset the cloud ledger. Older versions
+cannot use schema-2 cloud accounting, so keep their cloud flags disabled. The
+pre-upgrade backup is for recovery, not an automatic destructive data rollback.
+
+Full model/environment/phone setup: [HANDSFREE.md](HANDSFREE.md).
+
 This guide is for an isolated staging service and a staging database copy. No production migration/deployment is part of PR #9. Never point test commands at a live database.
 
 ## Before migration
