@@ -13,6 +13,13 @@ from desktop.core import DesktopCore
 from desktop import media
 
 
+@pytest.fixture(autouse=True)
+def no_live_native_player_automation(monkeypatch):
+    # Native My Vibe behavior has its own fully injected process/pipe tests.
+    # Existing synthetic setup manifests must never inspect a real app window.
+    monkeypatch.setattr(media, "_request_yandex_ui_play", lambda *_args, **_options: "unavailable")
+
+
 def test_revocation_during_native_player_verification_prevents_launch_and_browser_fallback(monkeypatch):
     authorized = [True]
     def verify():
