@@ -263,7 +263,11 @@ $output | ConvertTo-Json -Compress
     # enumerates sessions, changes volume, opens a browser or plays any audio.
     encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
     result = subprocess.run(["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-        shell=False, capture_output=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW)
+        # CI may cold-compile PowerShell classes and load Windows modules much
+        # more slowly than the policy itself. Keep the production bridge's
+        # isolated module environment; its own shorter action deadline stays.
+        shell=False, capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW,
+        env=media.powershell_environment(Path("C:/Windows/System32")))
     assert result.returncode == 0, "Synthetic Windows media policy failed"
     states = {row["kind"]: (row["state"], row["calls"]) for row in json.loads(result.stdout.decode("utf-8-sig"))}
     assert states == {"Video": ("not_music", 0), "Unknown": ("not_music", 0), "Music": ("playing", 1),

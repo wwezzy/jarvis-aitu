@@ -333,7 +333,9 @@ def test_stalled_recognition_health_stops_owned_camera_even_when_child_can_send_
 
 def test_failed_own_job_assignment_never_sends_camera_configuration(service, monkeypatch):
     instance, _, _, _, processes, _, _ = service
-    monkeypatch.setattr(worker.os, "name", "nt")
+    # Exercise the Windows job requirement without changing pathlib's global
+    # host selection: Linux cannot construct WindowsPath objects.
+    monkeypatch.setattr(worker, "os", SimpleNamespace(**(vars(worker.os) | {"name": "nt"})))
     instance._job_factory = lambda _: SimpleNamespace(handle=None, close=lambda: None)
     assert not instance.start()
     assert processes[0].terminated and not processes[0].writes
