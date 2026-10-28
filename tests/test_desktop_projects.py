@@ -36,7 +36,7 @@ def test_fresh_catalog_has_no_roots_projects_or_implicit_home_scan(tmp_path):
     assert catalog.scan() == {"projects": [], "scanned": 0, "truncated": False}
     assert desktop_database.read_bytes() == b"existing personal data remains untouched"
     with sqlite3.connect(catalog.path) as database:
-        assert database.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert database.execute("PRAGMA user_version").fetchone()[0] == 3
 
 
 def test_root_registration_and_aliases_survive_restart_without_duplicates(catalog):
@@ -375,3 +375,210 @@ def test_catalog_schema_one_upgrades_without_losing_roots_projects_or_aliases(tm
     store.set_editor(1, "idea")
     assert ProjectCatalog(state).resolve("Ассистент")["project"]["editor"] == "idea"
     assert (folder / "pyproject.toml").is_file()
+
+
+@pytest.mark.parametrize("marker", [".idea", "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle.kts"])
+def test_common_pycharm_and_intellij_projects_are_discovered(catalog, marker):
+    store, root = catalog
+    folder = root / "Design and Analysis"
+    folder.mkdir()
+    if marker == ".idea":
+        (folder / marker).mkdir()
+    else:
+        (folder / marker).write_text("untrusted project metadata", encoding="utf-8")
+    assert store.scan()["projects"][0]["path"] == str(folder)
+
+
+def test_id_selection_opens_exact_ambiguous_project_and_rename_preserves_aliases(catalog):
+    store, root = catalog
+    first = store.add_project(project(root / "One" / "Shared"))
+    second = store.add_project(project(root / "Two" / "Shared"))
+    store.set_aliases(second["id"], ["Second project"])
+    store.set_editor(second["id"], "idea")
+    calls = []
+    assert store.open_project("Shared", executor=lambda *args: calls.append(args))["status"] == "ambiguous"
+    assert store.open_project_id(second["id"], executor=lambda *args: calls.append(args))["status"] == "requested"
+    assert calls == [(Path(second["path"]), "idea")]
+    renamed = store.rename(second["id"], "Research and Development")
+    assert renamed["id"] == second["id"] and renamed["aliases"] == ["Second project"]
+    assert renamed["editor"] == "idea" and store.resolve("Research and Development")["project"]["id"] == second["id"]
+    assert store.resolve("Shared")["project"]["id"] == first["id"]
+
+
+def test_removed_project_and_root_ids_never_target_new_records_even_after_restart(catalog):
+    store, root = catalog
+    old_root = store.roots()[0]
+    old_project = store.add_project(project(root / "Old"))
+    store.remove_root(old_root["id"])
+    reopened = ProjectCatalog(store.state_dir)
+    new_root = reopened.register_root(root)
+    new_project = reopened.add_project(project(root / "New"))
+    assert new_root["id"] > old_root["id"] and new_project["id"] > old_project["id"]
+    assert reopened.open_project_id(old_project["id"])["status"] == "missing"
+    with pytest.raises(ValueError):
+        reopened.scan(old_root["id"])
+
+
+@pytest.mark.parametrize("bad", [True, 0, -1, "1", None])
+def test_project_id_and_rename_only_accept_existing_integer_records(catalog, bad):
+    with pytest.raises(ValueError):
+        catalog[0].open_project_id(bad)
+    with pytest.raises(ValueError):
+        catalog[0].rename(bad, "Project")
+
+
+def test_project_owner_guard_is_rechecked_after_resolution(catalog, monkeypatch):
+    store, root = catalog
+    saved = store.add_project(project(root / "Saved"))
+    allowed, calls = [True], []
+    original = store.resolve
+    def revoked(name):
+        result = original(name)
+        allowed[0] = False
+        return result
+    monkeypatch.setattr(store, "resolve", revoked)
+    result = store.open_project(saved["name"], executor=lambda *args: calls.append(args), authorization_guard=lambda: allowed[0])
+    assert result["status"] == "denied" and calls == []
+
+
+def test_project_native_guard_is_rechecked_after_expensive_editor_verification(tmp_path, monkeypatch):
+    system = tmp_path / "Windows/System32"
+    system.mkdir(parents=True)
+    app = tmp_path / "idea64.exe"
+    app.write_bytes(b"fixture never executed")
+    allowed, calls = [True], []
+    monkeypatch.setattr(module, "_system_directory", lambda: system)
+    def verify(*_a):
+        allowed[0] = False
+        return app
+    monkeypatch.setattr(module, "_verified_jetbrains", verify)
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *a, **kw: calls.append((a, kw)))
+    with pytest.raises(PermissionError):
+        module._native_open(tmp_path, "idea", authorization_guard=lambda: allowed[0])
+    assert calls == []
+
+
+def test_linked_root_is_rejected_before_registration_without_symlink_privileges(catalog, tmp_path, monkeypatch):
+    store, root = catalog
+    original = Path.resolve
+    monkeypatch.setattr(Path, "resolve", lambda path, *a, **kw: tmp_path / "Outside" if path == root else original(path, *a, **kw))
+    with pytest.raises(ValueError):
+        store.register_root(root)
+    assert store.open_project_id(999)["status"] == "missing"
+
+
+def test_removal_during_editor_verification_cancels_native_project_launch(catalog, tmp_path, monkeypatch):
+    store, root = catalog
+    store.executor = None  # Native bridge below is fully replaced with fakes.
+    saved = store.add_project(project(root / "Saved"))
+    store.set_editor(saved["id"], "idea")
+    system = tmp_path / "Windows/System32"
+    system.mkdir(parents=True)
+    app = tmp_path / "idea64.exe"
+    app.write_bytes(b"fixture never executed")
+    calls = []
+    monkeypatch.setattr(module, "_system_directory", lambda: system)
+    def removed(*_a):
+        store.remove(saved["id"])
+        return app
+    monkeypatch.setattr(module, "_verified_jetbrains", removed)
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *a, **kw: calls.append((a, kw)))
+    assert store.open_project_id(saved["id"], authorization_guard=lambda: True)["status"] == "denied"
+    assert calls == []
+
+
+def test_jetbrains_discovery_avoids_recursing_runtime_and_plugin_trees(tmp_path, monkeypatch):
+    programs = tmp_path / "ProgramFiles"
+    install = programs / "JetBrains/PyCharm 2026.2"
+    binary = install / "bin/pycharm64.exe"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"fixture never executed")
+    runtime = install / "jbr"
+    runtime.mkdir()
+    plugins = install / "plugins"
+    plugins.mkdir()
+    for key in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("ProgramFiles", str(programs))
+    scandir = module.os.scandir
+    def inspect(folder):
+        assert Path(folder) not in {runtime, plugins, binary.parent}
+        return scandir(folder)
+    monkeypatch.setattr(module.os, "scandir", inspect)
+    assert module._jetbrains_candidates("pycharm") == {binary}
+
+
+@pytest.mark.parametrize("editor,product,filename", [
+    ("pycharm", "PyCharm 2026.2.1", "pycharm64.exe"),
+    ("pycharm", "PyCharm Community Edition 2024.3.2", "pycharm64.exe"),
+    ("pycharm", "PyCharm 2026.3 EAP", "pycharm64.exe"),
+    ("idea", "IntelliJ IDEA 2026.2.2", "idea64.exe"),
+    ("idea", "IntelliJ IDEA Ultimate 2026.3 RC2", "idea64.exe"),
+])
+def test_versioned_per_user_jetbrains_installations_are_verified_candidates(tmp_path, monkeypatch, editor, product, filename):
+    local = tmp_path / "LocalAppData"
+    binary = local / "Programs" / product / "bin" / filename
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"fixture never executed")
+    unrelated = local / "Programs/Unrelated Application"
+    unrelated.mkdir()
+    for key in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    scan = module.os.scandir
+    def inspect(folder):
+        assert Path(folder) != unrelated
+        return scan(folder)
+    monkeypatch.setattr(module.os, "scandir", inspect)
+    assert module._jetbrains_candidates(editor) == {binary}
+    assert module._verified_jetbrains(tmp_path, editor, runner=lambda *_a, **_kw: code_response(binary)) == binary
+    assert module._verified_jetbrains(tmp_path, editor, runner=lambda *_a, **_kw: code_response(binary, sha256="0" * 64)) is None
+
+
+@pytest.mark.parametrize("name", ["PyCharm unrelated", "PyCharm Plugin", "PyCharm;command", "PyCharm 2026.2.1 copied", "Some PyCharm 2026.2"])
+def test_versioned_product_discovery_does_not_accept_arbitrary_prefixes(name):
+    assert not module._jetbrains_product_name(name, "pycharm")
+
+
+def test_unrelated_program_subtrees_do_not_spend_jetbrains_discovery_budget(tmp_path, monkeypatch):
+    local = tmp_path / "LocalAppData"
+    programs = local / "Programs"
+    unrelated = programs / "Unrelated Application"
+    unrelated.mkdir(parents=True)
+    binary = programs / "PyCharm 2026.2.1/bin/pycharm64.exe"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"fixture never executed")
+    for key in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    original = module.os.scandir
+    def only_matching_subtrees(folder):
+        assert Path(folder) != unrelated  # Its potentially huge tree stays untouched.
+        return original(folder)
+    monkeypatch.setattr(module.os, "scandir", only_matching_subtrees)
+    assert module._jetbrains_candidates("pycharm") == {binary}
+
+
+def test_local_programs_enumeration_reads_at_most_two_hundred_names(tmp_path, monkeypatch):
+    local = tmp_path / "LocalAppData"
+    programs = local / "Programs"
+    programs.mkdir(parents=True)
+    for key in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    count = []
+    class Entries:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def __iter__(self):
+            for number in range(1000):
+                count.append(number)
+                yield SimpleNamespace(name=f"Unrelated{number}")
+    original = module.os.scandir
+    monkeypatch.setattr(module.os, "scandir", lambda folder: Entries() if Path(folder) == programs else original(folder))
+    assert module._jetbrains_candidates("pycharm") == set()
+    assert len(count) == 200

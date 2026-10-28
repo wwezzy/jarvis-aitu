@@ -11,7 +11,7 @@ import threading
 from PySide6.QtCore import QObject, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QInputDialog,
-    QLabel, QPushButton, QVBoxLayout, QWidget,
+    QLabel, QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
 from desktop.gesture_worker import IsolatedGestureService as GestureService
@@ -122,7 +122,10 @@ class ControlsPanel(QWidget):
         projects = self._card("Проекты")
         projects.addWidget(_label("Выбери папки с проектами. Поиск ограничен двумя уровнями и 200 проектами; файлы проектов не запускаются."))
         self.root_combo = QComboBox()
+        self.root_combo.currentIndexChanged.connect(self._root_selected)
         projects.addWidget(self.root_combo)
+        self.root_details = _label("Разрешённые папки ещё не выбраны.")
+        projects.addWidget(self.root_details)
         row = QHBoxLayout()
         self.root_picker = self._button("Добавить папку", self._pick_root)
         self.root_scan = self._button("Найти проекты", self._scan)
@@ -137,13 +140,18 @@ class ControlsPanel(QWidget):
         self.project_combo.currentIndexChanged.connect(self._project_selected)
         self.editor_combo.currentIndexChanged.connect(self._editor_changed)
         projects.addWidget(self.project_combo)
+        self.project_details = _label("Добавь проект или найди его в выбранной папке.")
+        projects.addWidget(self.project_details)
         projects.addWidget(self.editor_combo)
         row = QGridLayout()
         self.project_add = self._button("Добавить проект вручную", self._pick_project)
-        self.project_alias = self._button("Задать имя для команды", self._alias_project)
+        self.project_name = self._button("Изменить имя", self._rename_project)
+        self.project_alias = self._button("Имена для команд…", self._alias_project)
         self.project_open = self._button("Открыть проект", self._open_project)
         self.project_remove = self._button("Убрать из списка", self._remove_project)
-        for index, widget in enumerate((self.project_add, self.project_alias, self.project_open, self.project_remove)):
+        self.catalog_refresh = self._button("Обновить списки", self.refresh)
+        for index, widget in enumerate((self.project_add, self.project_name, self.project_alias,
+                                        self.project_open, self.project_remove, self.catalog_refresh)):
             row.addWidget(widget, index // 2, index % 2)
         projects.addLayout(row)
         projects.addWidget(_label("«Убрать» меняет только список Jarvis. Папки и файлы остаются на месте."))
@@ -151,17 +159,26 @@ class ControlsPanel(QWidget):
         apps = self._card("Мои приложения")
         apps.addWidget(_label("Выбери файл приложения и дай ему короткое имя. Добавление требует подтверждённого владельца; после обновления файла доступ нужно подтвердить заново. Аргументы и команды оболочки не поддерживаются."))
         self.app_combo = QComboBox()
+        self.app_combo.currentIndexChanged.connect(self._app_selected)
         for combo in (self.root_combo, self.project_combo, self.app_combo):
             combo.setMinimumContentsLength(12)
             combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         apps.addWidget(self.app_combo)
-        row = QHBoxLayout()
+        self.app_details = _label("Приложения ещё не добавлены.")
+        apps.addWidget(self.app_details)
+        row = QGridLayout()
         self.app_add = self._button("Добавить приложение…", self._pick_app)
+        self.app_name = self._button("Изменить имя", self._rename_app)
+        self.app_alias = self._button("Имена для команд…", self._alias_app)
+        self.app_reapprove = self._button("Подтвердить обновлённый файл…", self._reapprove_app)
         self.app_open = self._button("Открыть приложение", self._open_app)
         self.app_remove = self._button("Убрать доступ", self._remove_app)
-        for widget in (self.app_add, self.app_open, self.app_remove):
-            row.addWidget(widget)
+        for index, widget in enumerate((self.app_add, self.app_name, self.app_alias,
+                                        self.app_reapprove, self.app_open, self.app_remove)):
+            row.addWidget(widget, index // 2, index % 2)
         apps.addLayout(row)
+        self.status = _label("")
+        self._layout.addWidget(self.status)
 
         owner = self._card("Подтверждение владельца")
         self.owner_toggle = QCheckBox("Подтверждать владельца перед командами")
@@ -192,8 +209,6 @@ class ControlsPanel(QWidget):
         row.addWidget(self.remote_approve)
         row.addWidget(self.remote_revoke)
         remote.addLayout(row)
-        self.status = _label("")
-        self._layout.addWidget(self.status)
 
     def _owner_allowed(self):
         try:
@@ -210,13 +225,15 @@ class ControlsPanel(QWidget):
 
     def _sync_enabled(self):
         active, allowed = not self.busy and not self._closing.is_set(), self._owner_allowed()
-        for widget in (self.root_picker, self.project_add, self.owner_toggle):
+        for widget in (self.root_picker, self.project_add, self.owner_toggle, self.catalog_refresh):
             widget.setEnabled(active)
         for widget in (self.root_scan, self.root_remove):
             widget.setEnabled(active and self.root_combo.count() > 0)
-        for widget in (self.project_alias, self.project_open, self.project_remove, self.editor_combo):
+        for widget in (self.project_name, self.project_alias, self.project_open, self.project_remove, self.editor_combo):
             widget.setEnabled(active and self.project_combo.count() > 0)
         self.app_add.setEnabled(active and allowed)
+        for widget in (self.app_name, self.app_alias, self.app_reapprove):
+            widget.setEnabled(active and allowed and self.app_combo.count() > 0)
         self.app_open.setEnabled(active and self.app_combo.count() > 0)
         self.app_remove.setEnabled(active and self.app_combo.count() > 0)
         self.owner_verify.setEnabled(active and getattr(self.core.owner, "enabled", False) is True)
@@ -224,12 +241,12 @@ class ControlsPanel(QWidget):
         self.remote_revoke.setEnabled(active)
         self.gesture_toggle.setEnabled(not self._closing.is_set() and (self._camera_requested.is_set() or active and allowed and not self._stopping))
 
-    def _run(self, function, callback=None, *, refresh=True):
+    def _run(self, function, callback=None, *, refresh=True, error_message=None):
         if self._closing.is_set() or self.busy:
             return False
         self._job_number += 1
         number, signals, closing = self._job_number, self._signals, self._closing
-        self._jobs[number] = (callback, refresh)
+        self._jobs[number] = (callback, refresh, error_message)
         self._sync_enabled()
         def execute():
             try:
@@ -249,7 +266,7 @@ class ControlsPanel(QWidget):
 
     @Slot(int, bool, object)
     def _completed(self, number, success, value):
-        callback, refresh = self._jobs.pop(number, (None, False))
+        callback, refresh, error_message = self._jobs.pop(number, (None, False, None))
         if self._closing.is_set():
             return
         if success:
@@ -259,7 +276,7 @@ class ControlsPanel(QWidget):
                 except Exception:
                     self.status.setText("Не удалось обновить состояние управления. Попробуй обновить список.")
         else:
-            self.status.setText("Не удалось выполнить действие. Проверь доступ и выбранный файл; сохранённые данные остаются на месте.")
+            self.status.setText(error_message or "Не удалось выполнить действие. Проверь доступ и выбранный файл; сохранённые данные остаются на месте.")
         self._sync_enabled()
         if refresh or self._refresh_pending:
             self._refresh_pending = False
@@ -287,7 +304,12 @@ class ControlsPanel(QWidget):
         blocked = combo.blockSignals(True)
         combo.clear()
         for record in records:
-            combo.addItem(str(record[field]), dict(record))
+            text = str(record[field])
+            # Identical display names remain selectable without guessing which
+            # record a spoken alias would resolve to. Item data keeps the ID.
+            if sum(str(other[field]).casefold() == text.casefold() for other in records) > 1:
+                text += f" · #{record['id']}"
+            combo.addItem(text, dict(record))
         for index in range(combo.count()):
             if combo.itemData(index).get("id") == current_id:
                 combo.setCurrentIndex(index)
@@ -299,7 +321,9 @@ class ControlsPanel(QWidget):
         self._fill(self.root_combo, roots, field="label")
         self._fill(self.project_combo, projects)
         self._fill(self.app_combo, apps)
+        self._root_selected()
         self._project_selected()
+        self._app_selected()
         self._remote_report(remote)
         self._poll_owner()
 
@@ -349,9 +373,20 @@ class ControlsPanel(QWidget):
         if not isinstance(root, dict):
             return
         catalog, root_id = self.core.projects, root["id"]
+        self.status.setText("Ищу проекты: до двух уровней, не больше 200 проектов…")
         def done(result):
-            self.status.setText(f"Найдено проектов: {len(result['projects'])}." + (" Достигнут предел поиска; можно добавить нужный проект вручную." if result["truncated"] else ""))
-        self._run(lambda: catalog.scan(root_id, max_depth=2, limit=200), done)
+            count = len(result["projects"])
+            text = (f"Найдено проектов: {count}." if count else
+                    "Проекты не найдены. Проверь, что папка доступна, или добавь проект вручную.")
+            self.status.setText(text + (" Достигнут предел поиска; можно добавить нужный проект вручную." if result["truncated"] else ""))
+        self._run(lambda: catalog.scan(root_id, max_depth=2, limit=200), done,
+                  error_message="Не удалось найти проекты. Проверь выбранную папку или добавь проект вручную.")
+
+    def _root_selected(self, *_):
+        root = self.root_combo.currentData()
+        self.root_details.setText("Папка для поиска: " + root["path"] if isinstance(root, dict) else
+                                  "Разрешённые папки ещё не выбраны.")
+        self._sync_enabled()
 
     def _remove_root(self):
         root = self.root_combo.currentData()
@@ -368,14 +403,59 @@ class ControlsPanel(QWidget):
             self._run(lambda: catalog.add_project(path), lambda _: self.status.setText("Проект добавлен."))
 
     def _alias_project(self):
-        project = self.project_combo.currentData()
-        if not isinstance(project, dict) or self.busy:
+        self._edit_aliases(self.project_combo, self.core.projects)
+
+    def _rename_project(self):
+        self._rename(self.project_combo, self.core.projects)
+
+    def _rename(self, combo, catalog, *, owner_required=False):
+        record = combo.currentData()
+        if not isinstance(record, dict) or self.busy or self._closing.is_set():
             return
-        alias, accepted = QInputDialog.getText(self, "Имя проекта", "Короткое уникальное имя для команды:")
-        if accepted and alias.strip():
-            catalog, project_id = self.core.projects, project["id"]
-            aliases = [*project.get("aliases", [])[-9:], alias]
-            self._run(lambda: catalog.set_aliases(project_id, aliases), lambda _: self.status.setText("Имя проекта сохранено."))
+        if owner_required and not self._owner_allowed():
+            self.status.setText("Для изменения приложения подтверди владельца через Windows Hello.")
+            return
+        name, accepted = QInputDialog.getText(self, "Имя в списке", "Новое короткое имя (до 80 символов):", text=record["name"])
+        if not accepted:
+            return
+        if not name.strip():
+            self.status.setText("Имя не может быть пустым. Прежнее имя сохранено.")
+            return
+        record_id = record["id"]
+        def save():
+            if owner_required and not self._owner_allowed():
+                raise PermissionError("Owner access expired")
+            options = {"approval_guard": self._owner_allowed} if owner_required else {}
+            return catalog.rename(record_id, name, **options)
+        self._run(save, lambda _: self.status.setText("Имя сохранено. Папка или файл не переименованы."),
+                  error_message=("Не удалось сохранить имя. Используй до 80 букв, цифр, пробелов и знаков . _ - +; запись должна оставаться в списке."
+                                 + (" Проверь подтверждение владельца." if owner_required else "")))
+
+    def _edit_aliases(self, combo, catalog, *, owner_required=False):
+        record = combo.currentData()
+        if not isinstance(record, dict) or self.busy or self._closing.is_set():
+            return
+        if owner_required and not self._owner_allowed():
+            self.status.setText("Для изменения команд приложения подтверди владельца через Windows Hello.")
+            return
+        text, accepted = QInputDialog.getMultiLineText(
+            self, "Имена для команд", "Короткие уникальные имена, по одному на строку, не больше 10. Пустой список уберёт дополнительные имена:",
+            "\n".join(record.get("aliases", [])))
+        if not accepted:
+            return
+        aliases = [value.strip() for value in text.splitlines() if value.strip()]
+        if len(aliases) > 10:
+            self.status.setText("Можно сохранить не больше 10 имён. Прежние имена сохранены.")
+            return
+        record_id = record["id"]
+        def save():
+            if owner_required and not self._owner_allowed():
+                raise PermissionError("Owner access expired")
+            options = {"approval_guard": self._owner_allowed} if owner_required else {}
+            return catalog.set_aliases(record_id, aliases, **options)
+        self._run(save, lambda _: self.status.setText("Имена для команд сохранены. Само имя записи тоже доступно для команд."),
+                  error_message=("Не удалось сохранить имена. Каждое имя — до 80 букв, цифр, пробелов и знаков . _ - +; пути и ссылки не подходят."
+                                 + (" Проверь подтверждение владельца." if owner_required else "")))
 
     def _project_selected(self, *_):
         project = self.project_combo.currentData()
@@ -384,30 +464,29 @@ class ControlsPanel(QWidget):
             blocked = self.editor_combo.blockSignals(True)
             self.editor_combo.setCurrentIndex(index)
             self.editor_combo.blockSignals(blocked)
+            aliases = ", ".join(project.get("aliases", [])) or "нет дополнительных имён"
+            availability = ("Папка доступна." if project.get("available") is True else
+                            "Папка сейчас недоступна. Проверь её расположение и обнови список.")
+            self.project_details.setText(f"{availability}\nПапка: {project['path']}\n"
+                                         f"Команда: «открой проект {project['name']}».\nИмена для команд: {aliases}")
+        else:
+            self.project_details.setText("Добавь проект или найди его в выбранной папке.")
+        self._sync_enabled()
 
     def _editor_changed(self, *_):
         project, editor = self.project_combo.currentData(), self.editor_combo.currentData()
-        if isinstance(project, dict) and editor:
+        if isinstance(project, dict) and editor in {value for _title, value in _EDITORS}:
             catalog, project_id = self.core.projects, project["id"]
             self._run(lambda: catalog.set_editor(project_id, editor), lambda _: self.status.setText("Редактор проекта сохранён."))
-
-    @staticmethod
-    def _unique_name(catalog, record, field):
-        for name in (*record.get("aliases", []), record["name"]):
-            resolved = catalog.resolve(name)
-            if resolved["status"] == "found" and resolved[field]["id"] == record["id"]:
-                return name
-        raise ValueError("An unambiguous alias is required")
 
     def _open_project(self):
         project = self.project_combo.currentData()
         if isinstance(project, dict):
-            core = self.core
+            core, record_id = self.core, project["id"]
             def execute():
-                name = self._unique_name(core.projects, project, "project")
                 if self._closing.is_set():
                     return None
-                return core.handle("открой проект " + name, source="typed")
+                return core.open_catalog_item("project", record_id, source="button")
             self._run(execute, self._reply)
 
     def _remove_project(self):
@@ -431,18 +510,63 @@ class ControlsPanel(QWidget):
             if not self._owner_allowed():
                 raise PermissionError("Owner access expired")
             return catalog.register_app(path, alias, approval=True, approval_guard=self._owner_allowed)
-        self._run(register, lambda _: self.status.setText("Приложение добавлено. После изменения файла потребуется новое подтверждение."))
+        self._run(register, lambda _: self.status.setText("Приложение добавлено. После изменения файла потребуется новое подтверждение."),
+                  error_message="Не удалось добавить приложение. Проверь подтверждение владельца и выбери обычный файл приложения .exe; оболочки и команды не поддерживаются.")
 
     def _open_app(self):
         app = self.app_combo.currentData()
         if isinstance(app, dict):
-            core = self.core
+            core, record_id = self.core, app["id"]
             def execute():
-                name = self._unique_name(core.apps, app, "app")
                 if self._closing.is_set():
                     return None
-                return core.handle("открой приложение " + name, source="typed")
+                return core.open_catalog_item("app", record_id, source="button")
             self._run(execute, self._reply)
+
+    def _rename_app(self):
+        self._rename(self.app_combo, self.core.apps, owner_required=True)
+
+    def _alias_app(self):
+        self._edit_aliases(self.app_combo, self.core.apps, owner_required=True)
+
+    def _app_selected(self, *_):
+        app = self.app_combo.currentData()
+        if isinstance(app, dict):
+            aliases = ", ".join(app.get("aliases", [])) or "нет дополнительных имён"
+            self.app_details.setText(f"Файл: {app['path']}\nКоманда: «открой приложение {app['name']}».\nИмена для команд: {aliases}\n"
+                                     "Файл проверяется при каждом запуске. Если он обновился, подтверди его заново.")
+        else:
+            self.app_details.setText("Приложения ещё не добавлены.")
+        self._sync_enabled()
+
+    def _confirm_reapproval(self, app):
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setWindowTitle("Повторное разрешение приложения")
+        dialog.setTextFormat(Qt.TextFormat.PlainText)
+        dialog.setText(f"Разрешить текущую версию «{app['name']}»?\n{app['path']}")
+        dialog.setInformativeText("Подтверждай только знакомое приложение после ожидаемого обновления. Эта кнопка не запускает файл.")
+        dialog.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        return dialog.exec() == QMessageBox.StandardButton.Yes
+
+    def _reapprove_app(self):
+        app = self.app_combo.currentData()
+        if not isinstance(app, dict) or self.busy or self._closing.is_set():
+            return
+        if not self._owner_allowed():
+            self.status.setText("Для повторного разрешения подтверди владельца через Windows Hello.")
+            return
+        if not self._confirm_reapproval(app):
+            self.status.setText("Повторное разрешение отменено. Прежние разрешения не изменены.")
+            return
+        catalog, app_id = self.core.apps, app["id"]
+        def approve():
+            if not self._owner_allowed():
+                raise PermissionError("Owner access expired")
+            return catalog.reapprove(app_id, approval=True, approval_guard=self._owner_allowed)
+        self._run(approve, lambda _: self.status.setText("Текущая версия файла разрешена. Приложение не запускалось."),
+                  error_message="Не удалось подтвердить файл. Проверь владельца и выбранное приложение; прежнее разрешение не изменено.")
 
     def _remove_app(self):
         app = self.app_combo.currentData()

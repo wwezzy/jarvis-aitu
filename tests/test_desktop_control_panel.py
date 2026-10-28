@@ -61,9 +61,16 @@ class FakeCore:
         self.apps = AppCatalog(state, inspector=lambda _: "Useful.exe")
         self.owner, self.store = FakeOwner(), FakeStore()
         self.commands, self.controls, self.remote = [], [], False
+        self.catalog_requests = []
 
     def handle(self, text, source="typed"):
         self.commands.append((text, source, threading.get_ident()))
+        return Reply("Запрос обработан.")
+
+    def open_catalog_item(self, kind, record_id, *, source="button"):
+        if self.owner.enabled and not self.owner.allowed():
+            return Reply("Подтверди владельца через Windows Hello.")
+        self.catalog_requests.append((kind, record_id, source, threading.get_ident()))
         return Reply("Запрос обработан.")
 
     def request_control(self, action, source="gesture"):
@@ -185,7 +192,7 @@ def test_constructor_and_refresh_never_activate_camera_or_consent(panel, app):
     assert panel.core.commands == panel.core.controls == []
 
 
-def test_root_picker_scan_editor_save_and_open_use_original_typed_core_route(panel, app, tmp_path, monkeypatch):
+def test_root_picker_scan_editor_save_and_open_use_selected_id_core_route(panel, app, tmp_path, monkeypatch):
     root = tmp_path / "Projects"
     make_project(root / "Jarvis")
     monkeypatch.setattr(module.QFileDialog, "getExistingDirectory", lambda *_a, **_kw: str(root))
@@ -198,10 +205,12 @@ def test_root_picker_scan_editor_save_and_open_use_original_typed_core_route(pan
     panel.editor_combo.setCurrentIndex(panel.editor_combo.findData("pycharm"))
     settled(app, panel)
     assert panel.core.projects.projects()[0]["editor"] == "pycharm"
+    enable_owner(panel)
     panel.project_open.click()
     settled(app, panel)
-    text, source, worker_thread = panel.core.commands[-1]
-    assert (text, source) == ("открой проект Jarvis", "typed")
+    kind, record_id, source, worker_thread = panel.core.catalog_requests[-1]
+    assert (kind, record_id, source) == ("project", panel.project_combo.currentData()["id"], "button")
+    assert panel.core.commands == []
     assert worker_thread != threading.get_ident() and panel.test_replies[-1].text == "Запрос обработан."
 
 
@@ -212,7 +221,7 @@ def test_manual_project_alias_and_catalog_removal_preserve_files(panel, app, tmp
     monkeypatch.setattr(module.QFileDialog, "getExistingDirectory", lambda *_a, **_kw: str(folder))
     panel.project_add.click()
     settled(app, panel)
-    monkeypatch.setattr(module.QInputDialog, "getText", lambda *_a, **_kw: ("Мой помощник", True))
+    monkeypatch.setattr(module.QInputDialog, "getMultiLineText", lambda *_a, **_kw: ("Мой помощник", True))
     panel.project_alias.click()
     settled(app, panel)
     assert panel.core.projects.resolve("Мой помощник")["status"] == "found"
@@ -254,10 +263,399 @@ def test_explicit_app_picker_registration_open_and_remove(panel, app, tmp_path, 
     assert panel.core.apps.apps()[0]["name"] == "Редактор"
     panel.app_open.click()
     settled(app, panel)
-    assert panel.core.commands[-1][:2] == ("открой приложение Редактор", "typed")
+    assert panel.core.catalog_requests[-1][:3] == ("app", panel.app_combo.currentData()["id"], "button")
+    assert panel.core.commands == []
     panel.app_remove.click()
     settled(app, panel)
     assert panel.core.apps.apps() == [] and path.is_file()
+
+
+def saved_project(panel, tmp_path, name="Saved"):
+    root = tmp_path / "Projects"
+    folder = make_project(root / name)
+    panel.core.projects.register_root(root)
+    return panel.core.projects.add_project(folder)
+
+
+def saved_app(panel, tmp_path):
+    path = make_exe(tmp_path / "Useful.exe")
+    return panel.core.apps.register_app(path, "Редактор", approval=True)
+
+
+def test_project_name_and_alias_editor_replace_and_clear_without_renaming_files(panel, app, tmp_path, monkeypatch):
+    record = saved_project(panel, tmp_path)
+    panel.core.projects.set_aliases(record["id"], ["Старое имя"])
+    panel.refresh()
+    settled(app, panel)
+    monkeypatch.setattr(module.QInputDialog, "getText", lambda *_a, **kw: ("Учебный проект", True))
+    panel.project_name.click()
+    settled(app, panel)
+    assert panel.project_combo.currentData()["id"] == record["id"]
+    assert panel.project_combo.currentText() == "Учебный проект"
+    assert panel.core.projects.resolve("Учебный проект")["status"] == "found"
+    prefilled = []
+    def aliases(*args, **_kwargs):
+        prefilled.append(args[3])
+        return "Помощник\n  Джарвис  ", True
+    monkeypatch.setattr(module.QInputDialog, "getMultiLineText", aliases)
+    panel.project_alias.click()
+    settled(app, panel)
+    assert prefilled == ["Старое имя"]
+    current = panel.core.projects.projects()[0]
+    assert set(current["aliases"]) == {"Помощник", "Джарвис"}
+    assert panel.core.projects.resolve("Старое имя")["status"] == "missing"
+    monkeypatch.setattr(module.QInputDialog, "getMultiLineText", lambda *_a, **_kw: ("\n  ", True))
+    panel.project_alias.click()
+    settled(app, panel)
+    assert panel.core.projects.projects()[0]["aliases"] == []
+    assert (tmp_path / "Projects" / "Saved" / "pyproject.toml").is_file()
+    assert not panel.core.catalog_requests and not panel.core.commands
+
+
+def test_cancelled_or_blank_name_and_cancelled_alias_edit_preserve_record(panel, app, tmp_path, monkeypatch):
+    record = saved_project(panel, tmp_path)
+    panel.refresh()
+    settled(app, panel)
+    for response in (("Changed", False), ("   ", True)):
+        monkeypatch.setattr(module.QInputDialog, "getText", lambda *_a, result=response, **_kw: result)
+        panel.project_name.click()
+        settled(app, panel)
+        assert panel.core.projects.projects()[0]["name"] == record["name"]
+    monkeypatch.setattr(module.QInputDialog, "getMultiLineText", lambda *_a, **_kw: ("Changed", False))
+    panel.project_alias.click()
+    settled(app, panel)
+    assert panel.core.projects.projects()[0]["aliases"] == []
+
+
+def test_alias_editor_reports_limit_and_invalid_names_without_partial_writes(panel, app, tmp_path, monkeypatch):
+    record = saved_project(panel, tmp_path)
+    panel.core.projects.set_aliases(record["id"], ["Сохранённое"])
+    panel.refresh()
+    settled(app, panel)
+    for text in ("\n".join(f"Имя {i}" for i in range(11)), "<img src=private-token>"):
+        monkeypatch.setattr(module.QInputDialog, "getMultiLineText", lambda *_a, result=text, **_kw: (result, True))
+        panel.project_alias.click()
+        settled(app, panel)
+        assert panel.core.projects.projects()[0]["aliases"] == ["Сохранённое"]
+        assert "private-token" not in panel.status.text()
+    assert "80" in panel.status.text()
+
+
+def test_app_name_and_alias_edits_preserve_approval_and_require_current_owner(panel, app, tmp_path, monkeypatch):
+    record = saved_app(panel, tmp_path)
+    panel.refresh()
+    settled(app, panel)
+    assert not panel.app_name.isEnabled() and not panel.app_alias.isEnabled()
+    enable_owner(panel)
+    monkeypatch.setattr(module.QInputDialog, "getText", lambda *_a, **_kw: ("Мой редактор", True))
+    panel.app_name.click()
+    settled(app, panel)
+    monkeypatch.setattr(module.QInputDialog, "getMultiLineText", lambda *_a, **_kw: ("Код\nРедактор кода", True))
+    panel.app_alias.click()
+    settled(app, panel)
+    current = panel.core.apps.apps()[0]
+    assert (current["id"], current["path"], current["sha256"], current["approved_at"]) == tuple(record[key] for key in ("id", "path", "sha256", "approved_at"))
+    assert current["name"] == "Мой редактор" and set(current["aliases"]) == {"Код", "Редактор кода"}
+    assert panel.core.apps.resolve("Мой редактор")["status"] == "found"
+    def expired(*_a, **_kw):
+        panel.core.owner.verified = False
+        return "Нельзя сохранить", True
+    monkeypatch.setattr(module.QInputDialog, "getMultiLineText", expired)
+    panel.app_alias.click()
+    settled(app, panel)
+    assert panel.core.apps.apps()[0]["aliases"] == current["aliases"]
+    assert not panel.core.catalog_requests
+
+
+@pytest.mark.parametrize("operation", ["rename", "set_aliases"])
+def test_app_metadata_edit_passes_live_guard_for_late_owner_revocation(panel, app, tmp_path, monkeypatch, operation):
+    saved_app(panel, tmp_path)
+    before = panel.core.apps.apps()[0]
+    panel.refresh()
+    settled(app, panel)
+    enable_owner(panel)
+    original = getattr(panel.core.apps, operation)
+    guards, errors = [], []
+    def revoke_before_write(record_id, value, *, approval_guard):
+        guards.append(approval_guard)
+        assert approval_guard() is True
+        # A queued/blocked catalog operation must consult the current owner,
+        # rather than preserve the truth value captured at button click.
+        panel.core.owner.verified = False
+        assert approval_guard() is False
+        try:
+            return original(record_id, value, approval_guard=approval_guard)
+        except Exception as error:
+            errors.append(type(error))
+            raise
+    monkeypatch.setattr(panel.core.apps, operation, revoke_before_write)
+    monkeypatch.setattr(module.QInputDialog, "getText", lambda *_a, **_kw: ("Новое имя", True))
+    monkeypatch.setattr(module.QInputDialog, "getMultiLineText", lambda *_a, **_kw: ("Новый псевдоним", True))
+    (panel.app_name if operation == "rename" else panel.app_alias).click()
+    settled(app, panel)
+    assert len(guards) == 1 and callable(guards[0])
+    assert errors == [PermissionError]
+    assert panel.core.apps.apps()[0] == before
+    assert "Проверь подтверждение владельца" in panel.status.text()
+    assert panel.core.catalog_requests == []
+
+
+def test_duplicate_project_names_open_the_selected_id_without_text_resolution(panel, app, tmp_path):
+    root = tmp_path / "Projects"
+    first, second = make_project(root / "one" / "Same"), make_project(root / "two" / "Same")
+    panel.core.projects.register_root(root)
+    a, b = panel.core.projects.add_project(first), panel.core.projects.add_project(second)
+    assert panel.core.projects.resolve("Same")["status"] == "ambiguous"
+    panel.refresh()
+    settled(app, panel)
+    assert panel.project_combo.itemText(0) != panel.project_combo.itemText(1)
+    enable_owner(panel)
+    panel.project_combo.setCurrentIndex(1)
+    panel.project_open.click()
+    settled(app, panel)
+    assert panel.core.catalog_requests[-1][:3] == ("project", b["id"], "button")
+    assert a["id"] != b["id"] and panel.core.commands == []
+
+
+def test_duplicate_app_names_open_selected_id_and_refresh_keeps_selection(panel, app, tmp_path):
+    first = panel.core.apps.register_app(make_exe(tmp_path / "One.exe"), "Редактор", approval=True)
+    second = panel.core.apps.register_app(make_exe(tmp_path / "Two.exe"), "Редактор", approval=True)
+    panel.refresh()
+    settled(app, panel)
+    enable_owner(panel)
+    panel.app_combo.setCurrentIndex(1)
+    panel.refresh()
+    settled(app, panel)
+    assert panel.app_combo.currentData()["id"] == second["id"]
+    assert panel.app_combo.itemText(0) != panel.app_combo.itemText(1)
+    panel.app_open.click()
+    settled(app, panel)
+    assert panel.core.catalog_requests[-1][:3] == ("app", second["id"], "button")
+    assert first["id"] != second["id"] and panel.core.commands == []
+
+
+def test_selected_project_id_is_captured_before_worker_and_later_selection_changes(panel, app, tmp_path, monkeypatch):
+    root = tmp_path / "Projects"
+    first, second = make_project(root / "First"), make_project(root / "Second")
+    panel.core.projects.register_root(root)
+    record = panel.core.projects.add_project(first)
+    panel.core.projects.add_project(second)
+    panel.refresh()
+    settled(app, panel)
+    enable_owner(panel)
+    entered, release, requests = threading.Event(), threading.Event(), []
+    def open_item(kind, record_id, *, source):
+        entered.set()
+        assert release.wait(2)
+        requests.append((kind, record_id, source))
+        return Reply("Выбранный проект обработан.")
+    monkeypatch.setattr(panel.core, "open_catalog_item", open_item)
+    panel.project_open.click()
+    try:
+        assert entered.wait(1)
+        panel.project_combo.setCurrentIndex(1)
+    finally:
+        release.set()
+    settled(app, panel)
+    assert requests == [("project", record["id"], "button")]
+    assert panel.project_combo.currentData()["id"] != record["id"]
+
+
+def test_owner_revocation_before_selected_open_is_checked_in_core(panel, app, tmp_path):
+    saved_project(panel, tmp_path)
+    panel.refresh()
+    settled(app, panel)
+    enable_owner(panel)
+    panel.core.owner.verified = False
+    panel.project_open.click()
+    settled(app, panel)
+    assert panel.core.catalog_requests == [] and panel.core.commands == []
+    assert "Подтверди владельца" in panel.status.text()
+
+
+def test_project_scan_reports_zero_and_bounded_truncation_with_fixed_errors(panel, app, tmp_path, monkeypatch):
+    root = tmp_path / "Projects"
+    root.mkdir()
+    panel.core.projects.register_root(root)
+    panel.refresh()
+    settled(app, panel)
+    calls = []
+    def scan(root_id, **kwargs):
+        calls.append((root_id, kwargs))
+        return {"projects": [], "truncated": False}
+    monkeypatch.setattr(panel.core.projects, "scan", scan)
+    panel.root_scan.click()
+    assert "Ищу" in panel.status.text()
+    settled(app, panel)
+    assert "Проекты не найдены" in panel.status.text()
+    assert calls[0][1] == {"max_depth": 2, "limit": 200}
+    monkeypatch.setattr(panel.core.projects, "scan", lambda *_a, **_kw: {"projects": [object()], "truncated": True})
+    panel.root_scan.click()
+    settled(app, panel)
+    assert "1" in panel.status.text() and "предел" in panel.status.text()
+    def failed(*_a, **_kw):
+        raise OSError("C:/private/token-value")
+    monkeypatch.setattr(panel.core.projects, "scan", failed)
+    panel.root_scan.click()
+    settled(app, panel)
+    assert "Не удалось найти проекты" in panel.status.text() and "token-value" not in panel.status.text()
+
+
+def test_same_named_root_folders_show_selected_path_and_scan_selected_id(panel, app, tmp_path, monkeypatch):
+    first, second = tmp_path / "one" / "Projects", tmp_path / "two" / "Projects"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    a, b = panel.core.projects.register_root(first), panel.core.projects.register_root(second)
+    panel.refresh()
+    settled(app, panel)
+    assert panel.root_combo.itemText(0) != panel.root_combo.itemText(1)
+    panel.root_combo.setCurrentIndex(1)
+    assert str(second) in panel.root_details.text() and panel.root_details.textFormat() == Qt.TextFormat.PlainText
+    scanned = []
+    def scan(root_id, **_kwargs):
+        scanned.append(root_id)
+        return {"projects": [], "truncated": False}
+    monkeypatch.setattr(panel.core.projects, "scan", scan)
+    panel.root_scan.click()
+    settled(app, panel)
+    assert scanned == [b["id"]] and a["id"] != b["id"]
+
+
+def test_missing_project_folder_is_shown_and_refresh_button_recovers_status(panel, app, tmp_path):
+    saved_project(panel, tmp_path)
+    folder = tmp_path / "Projects" / "Saved"
+    moved = folder.with_name("Moved")
+    folder.rename(moved)
+    panel.refresh()
+    settled(app, panel)
+    assert "недоступна" in panel.project_details.text()
+    moved.rename(folder)
+    panel.catalog_refresh.click()
+    settled(app, panel)
+    assert "Папка доступна" in panel.project_details.text()
+
+
+def test_details_and_names_are_literal_and_do_not_make_registered_hash_claims(panel):
+    unsafe = '<img src="https://private.test/token">'
+    panel._apply_snapshot(([], [{"id": 7, "name": unsafe, "path": unsafe, "aliases": [unsafe], "editor": "explorer", "available": False}],
+                           [{"id": 9, "name": unsafe, "path": unsafe, "aliases": [unsafe]}], None))
+    assert panel.project_combo.currentText() == panel.app_combo.currentText() == unsafe
+    for label in (panel.project_details, panel.app_details):
+        assert label.textFormat() == Qt.TextFormat.PlainText
+        assert unsafe in label.text()
+    assert "проверяется при каждом запуске" in panel.app_details.text()
+
+
+def test_editor_dispatch_is_finite_even_if_combo_data_is_injected(panel, app, tmp_path, monkeypatch):
+    saved_project(panel, tmp_path)
+    panel.refresh()
+    settled(app, panel)
+    monkeypatch.setattr(panel.core.projects, "set_editor", lambda *_a, **_kw: pytest.fail("Unrecognized editor dispatched"))
+    panel.editor_combo.addItem("Не разрешён", "powershell")
+    panel.editor_combo.setCurrentIndex(panel.editor_combo.count() - 1)
+    assert not panel.busy and panel.core.projects.projects()[0]["editor"] == "explorer"
+
+
+def test_updated_app_needs_explicit_reapproval_and_never_launches_in_settings(panel, app, tmp_path, monkeypatch):
+    record = saved_app(panel, tmp_path)
+    path = tmp_path / "Useful.exe"
+    path.write_bytes(path.read_bytes() + b"updated")
+    launches = []
+    assert panel.core.apps.open_app("Редактор", executor=launches.append)["status"] == "changed"
+    panel.refresh()
+    settled(app, panel)
+    assert not panel.app_reapprove.isEnabled()
+    enable_owner(panel)
+    confirmations = []
+    monkeypatch.setattr(panel, "_confirm_reapproval", lambda app: confirmations.append(app["id"]) or True)
+    panel.app_reapprove.click()
+    settled(app, panel)
+    current = panel.core.apps.apps()[0]
+    assert confirmations == [record["id"]]
+    assert current["id"] == record["id"] and current["aliases"] == record["aliases"]
+    assert current["sha256"] != record["sha256"] and current["size"] > record["size"]
+    assert launches == [] and panel.core.catalog_requests == []
+    assert "не запускалось" in panel.status.text()
+
+
+def test_cancelled_reapproval_and_owner_expiry_preserve_previous_hash(panel, app, tmp_path, monkeypatch):
+    record = saved_app(panel, tmp_path)
+    path = tmp_path / "Useful.exe"
+    path.write_bytes(path.read_bytes() + b"updated")
+    panel.refresh()
+    settled(app, panel)
+    enable_owner(panel)
+    monkeypatch.setattr(panel, "_confirm_reapproval", lambda _app: False)
+    panel.app_reapprove.click()
+    settled(app, panel)
+    assert panel.core.apps.apps()[0]["sha256"] == record["sha256"] and "отменено" in panel.status.text()
+    def expired(_app):
+        panel.core.owner.verified = False
+        return True
+    monkeypatch.setattr(panel, "_confirm_reapproval", expired)
+    panel.app_reapprove.click()
+    settled(app, panel)
+    assert panel.core.apps.apps()[0]["sha256"] == record["sha256"]
+    assert "подтвердить файл" in panel.status.text()
+
+
+def test_reapproval_rechecks_owner_after_file_inspection_and_rolls_back(panel, app, tmp_path, monkeypatch):
+    record = saved_app(panel, tmp_path)
+    path = tmp_path / "Useful.exe"
+    path.write_bytes(path.read_bytes() + b"updated")
+    panel.refresh()
+    settled(app, panel)
+    enable_owner(panel)
+    monkeypatch.setattr(panel, "_confirm_reapproval", lambda _app: True)
+    inspected = []
+    def inspector(_path):
+        inspected.append(True)
+        panel.core.owner.verified = False
+        return "Useful.exe"
+    panel.core.apps.inspector = inspector
+    panel.app_reapprove.click()
+    settled(app, panel)
+    assert inspected == [True]
+    assert panel.core.apps.apps()[0]["sha256"] == record["sha256"]
+    assert panel.core.catalog_requests == []
+
+
+def test_reapproval_requires_policy_enabled_even_if_owner_allowed_returns_true(panel, app, tmp_path, monkeypatch):
+    saved_app(panel, tmp_path)
+    panel.refresh()
+    settled(app, panel)
+    panel.core.owner.enabled = False
+    monkeypatch.setattr(panel, "_confirm_reapproval", lambda _app: pytest.fail("Approval offered without owner policy"))
+    panel._reapprove_app()
+    assert "подтверди владельца" in panel.status.text()
+
+
+def test_reapproval_cannot_recreate_deleted_record_or_start_a_program(panel, app, tmp_path, monkeypatch):
+    record = saved_app(panel, tmp_path)
+    panel.refresh()
+    settled(app, panel)
+    enable_owner(panel)
+    def removed(_app):
+        panel.core.apps.remove(record["id"])
+        return True
+    monkeypatch.setattr(panel, "_confirm_reapproval", removed)
+    panel.app_reapprove.click()
+    settled(app, panel)
+    assert panel.core.apps.apps() == [] and panel.core.catalog_requests == []
+    assert "Не удалось подтвердить файл" in panel.status.text()
+
+
+def test_reapproval_dialog_displays_literal_data_and_defaults_to_cancel(panel, monkeypatch):
+    dialogs = []
+    def execute(dialog):
+        dialogs.append(dialog)
+        assert dialog.textFormat() == Qt.TextFormat.PlainText
+        assert dialog.defaultButton() == dialog.button(module.QMessageBox.StandardButton.Cancel)
+        assert '<img src="private">' in dialog.text()
+        return module.QMessageBox.StandardButton.Cancel
+    monkeypatch.setattr(module.QMessageBox, "exec", execute)
+    assert panel._confirm_reapproval({"name": '<img src="private">', "path": "C:/local/Useful.exe"}) is False
+    assert len(dialogs) == 1
 
 
 def test_owner_expiring_during_dialog_cannot_approve_app(panel, app, tmp_path, monkeypatch):

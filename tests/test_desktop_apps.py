@@ -1,6 +1,7 @@
 """Only an explicitly approved unchanged GUI executable may be launched."""
 import sqlite3
 import struct
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -230,3 +231,159 @@ def test_newer_schema_is_not_overwritten(tmp_path):
         AppCatalog(tmp_path)
     with sqlite3.connect(tmp_path / "app_catalog.db") as database:
         assert database.execute("PRAGMA user_version").fetchone()[0] == 9
+
+
+def test_id_selection_resolves_ambiguity_and_metadata_edits_preserve_approval(catalog, tmp_path):
+    first = catalog.register_app(executable(tmp_path / "One.exe"), "Editor", approval=True)
+    second = catalog.register_app(executable(tmp_path / "Two.exe"), "Editor", approval=True)
+    calls = []
+    assert catalog.open_app("Editor", executor=calls.append)["status"] == "ambiguous"
+    assert catalog.open_app_id(second["id"], executor=calls.append)["status"] == "requested"
+    assert calls == [tmp_path / "Two.exe"]
+    catalog.rename(second["id"], "Research and Development")
+    catalog.set_aliases(second["id"], ["Second app", "Мой редактор"])
+    updated = catalog.resolve("Мой редактор")["app"]
+    assert updated["id"] == second["id"] and updated["sha256"] == second["sha256"]
+    assert catalog.resolve("Editor")["app"]["id"] == first["id"]
+    catalog.set_aliases(second["id"], [])
+    assert catalog.resolve("Мой редактор")["status"] == "missing"
+
+
+def test_app_id_is_not_reused_after_deletion_and_restart(catalog, tmp_path):
+    old = catalog.register_app(executable(tmp_path / "Old.exe"), "Old", approval=True)
+    catalog.remove(old["id"])
+    reopened = AppCatalog(catalog.state_dir, inspector=lambda _: "Useful.exe")
+    new = reopened.register_app(executable(tmp_path / "New.exe"), "New", approval=True)
+    assert new["id"] > old["id"]
+    assert reopened.open_app_id(old["id"])["status"] == "missing"
+
+
+def test_reapprove_keeps_id_name_aliases_and_refreshes_changed_executable_pin(catalog, tmp_path):
+    path = executable(tmp_path / "Useful.exe")
+    old = catalog.register_app(path, "Original", approval=True)
+    catalog.rename(old["id"], "My editor")
+    catalog.set_aliases(old["id"], ["Edit stuff"])
+    executable(path, body=b"updated application")
+    assert catalog.open_app_id(old["id"])["status"] == "changed"
+    new = catalog.reapprove(old["id"], approval=True, approval_guard=lambda: True)
+    assert new["id"] == old["id"] and new["sha256"] != old["sha256"]
+    assert new["name"] == "My editor" and new["aliases"] == ["Edit stuff"]
+
+
+def test_reapprove_cannot_resurrect_app_deleted_during_inspection(catalog, tmp_path):
+    path = executable(tmp_path / "Useful.exe")
+    old = catalog.register_app(path, "Original", approval=True)
+    def removed(_):
+        catalog.remove(old["id"])
+        catalog.register_app(executable(tmp_path / "Replacement.exe"), "Replacement", approval=True)
+        return "Useful.exe"
+    # Avoid recursive inspection in the independently approved replacement.
+    def inspect(path):
+        if path.name == "Useful.exe":
+            return removed(path)
+        return "Replacement.exe"
+    catalog.inspector = inspect
+    with pytest.raises(ValueError):
+        catalog.reapprove(old["id"], approval=True, approval_guard=lambda: True)
+    assert [app["name"] for app in catalog.apps()] == ["Replacement"]
+    assert catalog.apps()[0]["id"] > old["id"]
+
+
+def test_reapprove_revoked_during_inspection_keeps_original_hash_and_aliases(catalog, tmp_path):
+    path = executable(tmp_path / "Useful.exe")
+    old = catalog.register_app(path, "Original", approval=True)
+    executable(path, body=b"updated application")
+    allowed = [True]
+    def revoked(_):
+        allowed[0] = False
+        return "Useful.exe"
+    catalog.inspector = revoked
+    with pytest.raises(PermissionError):
+        catalog.reapprove(old["id"], approval=True, approval_guard=lambda: allowed[0])
+    current = catalog.apps()[0]
+    assert current["sha256"] == old["sha256"] and current["aliases"] == old["aliases"]
+
+
+def test_app_owner_guard_is_rechecked_after_hashing(catalog, tmp_path, monkeypatch):
+    path = executable(tmp_path / "Useful.exe")
+    old = catalog.register_app(path, "Original", approval=True)
+    original, allowed, calls = module._fingerprint, [True], []
+    def revoked(path):
+        value = original(path)
+        allowed[0] = False
+        return value
+    monkeypatch.setattr(module, "_fingerprint", revoked)
+    assert catalog.open_app_id(old["id"], executor=calls.append, authorization_guard=lambda: allowed[0])["status"] == "denied"
+    assert calls == []
+
+
+@pytest.mark.parametrize("original", ["python3.13t.exe", "python3.12_d.exe", "pythonw3.14t_d.exe", "pypy3.exe"])
+def test_versioned_free_threaded_and_debug_python_binaries_stay_blocked(catalog, tmp_path, original):
+    path = executable(tmp_path / "Renamed.exe")
+    catalog.inspector = lambda _: original
+    with pytest.raises(ValueError):
+        catalog.register_app(path, "Useful app", approval=True)
+
+
+def test_version_resource_dll_load_is_restricted_to_windows_system32(tmp_path, monkeypatch):
+    calls = []
+    class Function:
+        def __call__(self, *_args):
+            return 0
+    library = SimpleNamespace(GetFileVersionInfoSizeW=Function(), GetFileVersionInfoW=Function(), VerQueryValueW=Function())
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="nt"))
+    def load(*args, **kwargs):
+        calls.append((args, kwargs))
+        return library
+    monkeypatch.setattr(module.ctypes, "WinDLL", load, raising=False)
+    assert module._original_filename(tmp_path / "Useful.exe") is None
+    assert calls == [(("version.dll",), {"use_last_error": True, "winmode": 0x800})]
+
+
+@pytest.mark.parametrize("operation,calls_before_revoke", [("rename", 1), ("set_aliases", 2)])
+def test_metadata_permission_expiry_before_commit_rolls_back_every_field(catalog, tmp_path, operation, calls_before_revoke):
+    old = catalog.register_app(executable(tmp_path / "Useful.exe"), "Original", approval=True)
+    calls = []
+    def guard():
+        calls.append(True)
+        return len(calls) <= calls_before_revoke
+    with pytest.raises(PermissionError):
+        if operation == "rename":
+            catalog.rename(old["id"], "Updated", approval_guard=guard)
+        else:
+            catalog.set_aliases(old["id"], ["Updated"], approval_guard=guard)
+    assert catalog.apps()[0] == old
+
+
+def test_removing_app_permission_during_hashing_cancels_launch(catalog, tmp_path, monkeypatch):
+    path = executable(tmp_path / "Useful.exe")
+    old = catalog.register_app(path, "Original", approval=True)
+    original, calls = module._fingerprint, []
+    def removed(path):
+        value = original(path)
+        catalog.remove(old["id"])
+        return value
+    monkeypatch.setattr(module, "_fingerprint", removed)
+    assert catalog.open_app_id(old["id"], executor=calls.append, authorization_guard=lambda: True)["status"] == "denied"
+    assert calls == []
+
+
+def test_schema_one_app_rows_upgrade_without_id_reuse_or_lost_approval(tmp_path):
+    path = executable(tmp_path / "Useful.exe")
+    digest = module._fingerprint(path)
+    state = tmp_path / "state"
+    state.mkdir()
+    with sqlite3.connect(state / "app_catalog.db") as database:
+        database.executescript("""
+            CREATE TABLE approved_apps(id INTEGER PRIMARY KEY,path TEXT UNIQUE,name TEXT,sha256 TEXT,size INTEGER,approved_at REAL);
+            CREATE TABLE approved_app_aliases(app_id INTEGER REFERENCES approved_apps(id) ON DELETE CASCADE,alias TEXT,normalized TEXT,PRIMARY KEY(app_id,normalized));
+            PRAGMA user_version=1;
+        """)
+        database.execute("INSERT INTO approved_apps VALUES(73,?,?,?,?,?)", (str(path), "Saved", digest[0], digest[1], 100.0))
+        database.execute("INSERT INTO approved_app_aliases VALUES(73,'Original alias','original alias')")
+    store = AppCatalog(state, inspector=lambda _: "Useful.exe")
+    old = store.resolve("Original alias")["app"]
+    assert old["id"] == 73 and old["approved_at"] == 100.0 and old["sha256"] == digest[0]
+    store.remove(73)
+    new = AppCatalog(state, inspector=lambda _: "Useful.exe").register_app(path, "New", approval=True)
+    assert new["id"] == 74 and store.open_app_id(73)["status"] == "missing"

@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -28,7 +29,8 @@ MAX_ROOTS = 20
 MAX_ENTRIES = 4000
 EDITORS = frozenset({"explorer", "vscode", "pycharm", "idea"})
 _EXCLUDED = {"node_modules", "venv", "env", "__pycache__"}
-_MARKERS = (".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod", "CMakeLists.txt", "requirements.txt")
+_MARKERS = (".git", ".idea", "pyproject.toml", "package.json", "Cargo.toml", "go.mod", "CMakeLists.txt", "requirements.txt",
+            "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts")
 
 
 def _name(value):
@@ -72,6 +74,17 @@ def _identifier(value):
     return value
 
 
+def _require_authorization(guard):
+    if guard is None:
+        return
+    try:
+        authorized = callable(guard) and guard() is True
+    except Exception:
+        authorized = False
+    if not authorized:
+        raise PermissionError("Owner authorization is no longer active")
+
+
 def _hidden(entry):
     return entry.name.startswith(".") or bool(getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_HIDDEN)
 
@@ -96,7 +109,7 @@ class ProjectCatalog:
         self.executor = executor
         with self._connection() as database:
             version = database.execute("PRAGMA user_version").fetchone()[0]
-            if version > 2:
+            if version > 3:
                 raise RuntimeError("Project catalog is newer than this application")
             database.executescript("""
                 BEGIN IMMEDIATE;
@@ -114,11 +127,18 @@ class ProjectCatalog:
                     PRIMARY KEY(project_id, normalized)
                 );
                 CREATE INDEX IF NOT EXISTS project_alias_lookup ON project_aliases(normalized);
+                CREATE TABLE IF NOT EXISTS project_sequences (
+                    kind TEXT PRIMARY KEY CHECK(kind IN ('root','project')), next_id INTEGER NOT NULL CHECK(next_id>0)
+                );
+                INSERT OR IGNORE INTO project_sequences SELECT 'root',COALESCE(MAX(id),0)+1 FROM project_roots;
+                INSERT OR IGNORE INTO project_sequences SELECT 'project',COALESCE(MAX(id),0)+1 FROM projects;
             """)
             columns = {row[1] for row in database.execute("PRAGMA table_info(projects)")}
             if "editor" not in columns:
                 database.execute("ALTER TABLE projects ADD COLUMN editor TEXT NOT NULL DEFAULT 'explorer' CHECK(editor IN ('explorer','vscode','pycharm','idea'))")
-            database.execute("PRAGMA user_version=2")
+            database.execute("UPDATE project_sequences SET next_id=max(next_id,COALESCE((SELECT MAX(id)+1 FROM project_roots),1)) WHERE kind='root'")
+            database.execute("UPDATE project_sequences SET next_id=max(next_id,COALESCE((SELECT MAX(id)+1 FROM projects),1)) WHERE kind='project'")
+            database.execute("PRAGMA user_version=3")
 
     @contextmanager
     def _connection(self):
@@ -144,8 +164,9 @@ class ProjectCatalog:
             if row is None:
                 if database.execute("SELECT count(*) FROM project_roots").fetchone()[0] >= MAX_ROOTS:
                     raise ValueError("At most 20 project roots can be approved")
-                cursor = database.execute("INSERT INTO project_roots(path,label) VALUES(?,?)", (str(folder), label))
-                root_id = cursor.lastrowid
+                root_id = database.execute("SELECT next_id FROM project_sequences WHERE kind='root'").fetchone()[0]
+                database.execute("UPDATE project_sequences SET next_id=next_id+1 WHERE kind='root'")
+                database.execute("INSERT INTO project_roots(id,path,label) VALUES(?,?,?)", (root_id, str(folder), label))
             else:
                 root_id = row["id"]
                 database.execute("UPDATE project_roots SET label=? WHERE id=?", (label, root_id))
@@ -175,8 +196,9 @@ class ProjectCatalog:
             if row is None:
                 if database.execute("SELECT count(*) FROM projects").fetchone()[0] >= MAX_PROJECTS:
                     raise _CatalogFull("The catalog contains 200 projects; remove an old record first")
-                cursor = database.execute("INSERT INTO projects(root_id,path,name) VALUES(?,?,?)", (root["id"], str(folder), title))
-                project_id = cursor.lastrowid
+                project_id = database.execute("SELECT next_id FROM project_sequences WHERE kind='project'").fetchone()[0]
+                database.execute("UPDATE project_sequences SET next_id=next_id+1 WHERE kind='project'")
+                database.execute("INSERT INTO projects(id,root_id,path,name) VALUES(?,?,?,?)", (project_id, root["id"], str(folder), title))
             else:
                 project_id = row["id"]
             if alias is not None:
@@ -197,6 +219,13 @@ class ProjectCatalog:
                 raise ValueError("Project not found")
             database.execute("DELETE FROM project_aliases WHERE project_id=?", (project_id,))
             database.executemany("INSERT INTO project_aliases VALUES(?,?,?)", ((project_id, alias, key) for key, alias in values.items()))
+
+    def rename(self, project_id, name):
+        title = _name(name)
+        with self._connection() as database:
+            if not database.execute("UPDATE projects SET name=? WHERE id=?", (title, _identifier(project_id))).rowcount:
+                raise ValueError("Project not found")
+        return next(project for project in self.projects() if project["id"] == project_id)
 
     def set_editor(self, project_id, editor):
         if editor not in EDITORS:
@@ -293,14 +322,34 @@ class ProjectCatalog:
         with self._connection() as database:
             return bool(database.execute("DELETE FROM project_roots WHERE id=?", (_identifier(root_id),)).rowcount)
 
-    def open_project(self, name, editor=None, *, executor=None):
+    def open_project(self, name, editor=None, *, executor=None, authorization_guard=None):
         if editor is not None and editor not in EDITORS:
             raise ValueError("Choose Explorer, VS Code, PyCharm or IntelliJ IDEA")
+        try:
+            _require_authorization(authorization_guard)
+        except PermissionError:
+            return {"status": "denied", "project": None, "suggestions": [], "message": "Доступ владельца истёк или отозван. Подтверди владельца заново."}
         result = self.resolve(name)
         if result["status"] != "found":
             result["message"] = ("Нашёл несколько проектов с таким именем. Уточни уникальное название или псевдоним."
                                  if result["status"] == "ambiguous" else "Не нашёл проект в разрешённых папках. Добавь его через настройки проектов.")
             return result
+        return self._open_registered(result, editor, executor, authorization_guard)
+
+    def open_project_id(self, project_id, editor=None, *, executor=None, authorization_guard=None):
+        project_id = _identifier(project_id)
+        if editor is not None and editor not in EDITORS:
+            raise ValueError("Choose Explorer, VS Code, PyCharm or IntelliJ IDEA")
+        try:
+            _require_authorization(authorization_guard)
+        except PermissionError:
+            return {"status": "denied", "project": None, "suggestions": [], "message": "Доступ владельца истёк или отозван. Подтверди владельца заново."}
+        project = next((project for project in self.projects() if project["id"] == project_id and project["available"]), None)
+        if project is None:
+            return {"status": "missing", "project": None, "suggestions": [], "message": "Этот проект больше не доступен в каталоге. Обнови список и выбери его заново."}
+        return self._open_registered({"status": "found", "project": project, "suggestions": []}, editor, executor, authorization_guard)
+
+    def _open_registered(self, result, editor, executor, authorization_guard):
         project = result["project"]
         editor = project["editor"] if editor is None else editor
         try:
@@ -312,7 +361,20 @@ class ProjectCatalog:
             folder = _folder(project["path"])
             if not _inside(folder, _folder(root["path"])):
                 raise ValueError("Project folder changed")
-            (executor or self.executor or _native_open)(folder, editor)
+            def current_access():
+                _require_authorization(authorization_guard)
+                with self._connection() as database:
+                    current = database.execute("SELECT projects.path,projects.root_id,project_roots.path AS root_path FROM projects JOIN project_roots ON project_roots.id=projects.root_id WHERE projects.id=?", (project["id"],)).fetchone()
+                return (current is not None and current["path"] == project["path"] and current["root_id"] == project["root_id"]
+                        and current["root_path"] == root["path"] and _inside(_folder(current["path"]), _folder(current["root_path"])))
+            _require_authorization(current_access)
+            custom_executor = executor or self.executor
+            if custom_executor is not None:
+                custom_executor(folder, editor)
+            else:
+                _native_open(folder, editor, authorization_guard=current_access)
+        except PermissionError:
+            return {**result, "status": "denied", "message": "Доступ к проекту изменился или отозван. Обнови список и при необходимости подтверди владельца."}
         except (OSError, ValueError, RuntimeError, StopIteration, subprocess.SubprocessError):
             return {**result, "status": "failed", "message": "Не удалось открыть проект. Проверь, доступна ли папка и установлен ли выбранный редактор."}
         application = {"explorer": "Проводнике", "vscode": "Visual Studio Code", "pycharm": "PyCharm", "idea": "IntelliJ IDEA"}[editor]
@@ -391,6 +453,14 @@ def _system_directory():
     return Path(buffer.value)
 
 
+def _jetbrains_product_name(name, editor):
+    product = r"pycharm(?: (?:professional|community)(?: edition)?)?" if editor == "pycharm" else r"intellij idea(?: (?:ultimate|community)(?: edition)?)?"
+    channel = r"(?:eap|rc|beta|preview)(?:[ ._-]?\d{1,3})?"
+    version = r"20\d{2}(?:\.\d{1,3}){0,3}"
+    suffix = rf"(?: (?:{version}(?:[ ._-]{channel})?|{channel}))?"
+    return isinstance(name, str) and len(name) <= 100 and re.fullmatch(product + suffix, name, re.IGNORECASE) is not None
+
+
 def _jetbrains_candidates(editor):
     """Bounded metadata walk in official installation trees, not the home."""
     if editor not in {"pycharm", "idea"}:
@@ -403,8 +473,23 @@ def _jetbrains_candidates(editor):
         products = (("PyCharm", "PyCharm Professional", "PyCharm Community") if editor == "pycharm" else
                     ("IntelliJ IDEA", "IntelliJ IDEA Ultimate", "IntelliJ IDEA Community"))
         roots.extend(local / "Programs" / product for product in products)
+        # Standalone per-user installations include their version in the
+        # product folder. Only inspect this one level; unrelated applications
+        # never enter the recursive JetBrains discovery budget below.
+        try:
+            programs = _folder(local / "Programs")
+            with os.scandir(programs) as children:
+                for child in itertools.islice(children, 200):
+                    try:
+                        if (_jetbrains_product_name(child.name, editor) and not _hidden(child)
+                                and child.is_dir(follow_symlinks=False) and not child.is_symlink()):
+                            roots.append(Path(child.path))
+                    except OSError:
+                        continue
+        except (OSError, ValueError):
+            pass
     found, entries = set(), 0
-    for root in roots:
+    for root in dict.fromkeys(roots):
         queue = [(root, 0)]
         while queue and entries < 1000 and len(found) < 10:
             folder, depth = queue.pop(0)
@@ -412,17 +497,18 @@ def _jetbrains_candidates(editor):
                 folder = _folder(folder)
                 if not _inside(folder, root):
                     continue
-                candidate = folder / filename
-                if folder.name.casefold() == "bin" and candidate.is_file() and candidate.resolve(strict=True) == candidate:
+                candidate = folder / filename if folder.name.casefold() == "bin" else folder / "bin" / filename
+                if candidate.is_file() and candidate.resolve(strict=True) == candidate:
                     found.add(candidate)
-                if depth >= 5:
+                if depth >= 5 or folder.name.casefold() == "bin":
                     continue
                 with os.scandir(folder) as iterator:
                     for entry in iterator:
                         entries += 1
                         if entries >= 1000:
                             break
-                        if not _hidden(entry) and entry.is_dir(follow_symlinks=False) and not entry.is_symlink():
+                        if (entry.name.casefold() not in {"jbr", "jre", "lib", "plugins", "license", "licenses", "logs", "caches"}
+                                and not _hidden(entry) and entry.is_dir(follow_symlinks=False) and not entry.is_symlink()):
                             queue.append((Path(entry.path), depth + 1))
             except (OSError, ValueError):
                 continue
@@ -466,7 +552,7 @@ def _verified_jetbrains(system, editor, *, runner=None):
         return None
 
 
-def _native_open(folder, editor):
+def _native_open(folder, editor, *, authorization_guard=None):
     system = _system_directory()
     if editor == "explorer":
         executable = system.parent / "explorer.exe"
@@ -478,6 +564,7 @@ def _native_open(folder, editor):
         raise ValueError("Unapproved project editor")
     if executable is None or not executable.is_file():
         raise OSError("Verified project application is unavailable")
+    _require_authorization(authorization_guard)
     arguments = [str(executable), "--new-window", str(folder)] if editor == "vscode" else [str(executable), str(folder)]
     subprocess.Popen(arguments, shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, cwd=str(system), env=powershell_environment(system))

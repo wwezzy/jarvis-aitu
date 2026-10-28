@@ -21,7 +21,7 @@ import time
 from contextlib import closing, contextmanager
 
 from desktop.native_runtime import powershell_environment
-from desktop.project_catalog import _folder, _identifier, _key, _name, _system_directory
+from desktop.project_catalog import _folder, _identifier, _key, _name, _require_authorization, _system_directory
 
 
 MAX_APPS = 100
@@ -39,7 +39,7 @@ _BLOCKED = frozenset({
 
 def _blocked(filename):
     stem = ntpath.basename(filename).casefold().removesuffix(".exe")
-    return stem in _BLOCKED or bool(re.fullmatch(r"(?:pythonw?|pypy|pypyw)(?:[0-9.]+|_d)?|unins\d*", stem))
+    return stem in _BLOCKED or bool(re.fullmatch(r"(?:pythonw?|pypyw?)(?:[0-9]+(?:\.[0-9]+)*)?t?(?:_d)?|unins\d*", stem))
 
 
 def _executable(raw):
@@ -63,34 +63,47 @@ def _fingerprint(path):
         if not 128 <= before.st_size <= MAX_EXE_BYTES:
             raise ValueError("Executable size is outside the supported range")
         header = stream.read(64)
-        if header[:2] != b"MZ":
+        if len(header) != 64 or header[:2] != b"MZ":
             raise ValueError("Not a Windows executable")
         offset = struct.unpack_from("<I", header, 60)[0]
         if not 64 <= offset <= min(1024 * 1024, before.st_size - 26):
             raise ValueError("Invalid executable header")
         stream.seek(offset)
-        signature, machine, _sections, _stamp, _table, _symbols, optional_size, characteristics = struct.unpack("<4sHHIIIHH", stream.read(24))
-        magic = struct.unpack("<H", stream.read(2))[0]
+        coff, magic_bytes = stream.read(24), stream.read(2)
+        if len(coff) != 24 or len(magic_bytes) != 2:
+            raise ValueError("Executable changed while reading its header")
+        signature, machine, _sections, _stamp, _table, _symbols, optional_size, characteristics = struct.unpack("<4sHHIIIHH", coff)
+        magic = struct.unpack("<H", magic_bytes)[0]
         if (signature != b"PE\x00\x00" or machine not in {0x14C, 0x8664, 0xAA64} or optional_size < 2
                 or offset + 24 + optional_size > before.st_size or magic not in {0x10B, 0x20B}
                 or not characteristics & 2 or characteristics & 0x2000):
             raise ValueError("Not a supported Windows application")
         stream.seek(0)
-        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        digest, read = hashlib.sha256(), 0
+        while True:
+            chunk = stream.read(min(1024 * 1024, before.st_size + 1 - read))
+            if not chunk:
+                break
+            read += len(chunk)
+            if read > before.st_size:
+                raise ValueError("Executable grew while checking it")
+            digest.update(chunk)
+        if read != before.st_size:
+            raise ValueError("Executable changed while checking it")
         after = os.fstat(stream.fileno())
     current = path.stat()
     def identity(item):
         return item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns
     if identity(before) != identity(after) or identity(after) != identity(current):
         raise ValueError("Executable changed while checking it")
-    return digest, current.st_size
+    return digest.hexdigest(), current.st_size
 
 
 def _original_filename(path):
     """Read Windows version resource; a renamed known runtime is still denied."""
     if os.name != "nt":
         raise RuntimeError("Native executable approval requires Windows")
-    version = ctypes.WinDLL("version", use_last_error=True)
+    version = ctypes.WinDLL("version.dll", use_last_error=True, winmode=0x800)
     version.GetFileVersionInfoSizeW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_uint)]
     version.GetFileVersionInfoSizeW.restype = ctypes.c_uint
     version.GetFileVersionInfoW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p]
@@ -134,7 +147,7 @@ class AppCatalog:
         self.executor = executor
         self.inspector = inspector or _original_filename
         with self._connection() as database:
-            if database.execute("PRAGMA user_version").fetchone()[0] > 1:
+            if database.execute("PRAGMA user_version").fetchone()[0] > 2:
                 raise RuntimeError("App catalog is newer than this application")
             database.executescript("""
                 BEGIN IMMEDIATE;
@@ -149,7 +162,12 @@ class AppCatalog:
                     PRIMARY KEY(app_id,normalized)
                 );
                 CREATE INDEX IF NOT EXISTS approved_app_alias_lookup ON approved_app_aliases(normalized);
-                PRAGMA user_version=1;
+                CREATE TABLE IF NOT EXISTS app_sequence (
+                    id INTEGER PRIMARY KEY CHECK(id=1), next_id INTEGER NOT NULL CHECK(next_id>0)
+                );
+                INSERT OR IGNORE INTO app_sequence SELECT 1,COALESCE(MAX(id),0)+1 FROM approved_apps;
+                UPDATE app_sequence SET next_id=max(next_id,COALESCE((SELECT MAX(id)+1 FROM approved_apps),1)) WHERE id=1;
+                PRAGMA user_version=2;
                 COMMIT;
             """)
 
@@ -189,8 +207,9 @@ class AppCatalog:
             if row is None:
                 if database.execute("SELECT count(*) FROM approved_apps").fetchone()[0] >= MAX_APPS:
                     raise ValueError("At most 100 applications may be approved")
-                cursor = database.execute("INSERT INTO approved_apps(path,name,sha256,size,approved_at) VALUES(?,?,?,?,?)", (str(executable), title, digest, size, time.time()))
-                app_id = cursor.lastrowid
+                app_id = database.execute("SELECT next_id FROM app_sequence WHERE id=1").fetchone()[0]
+                database.execute("UPDATE app_sequence SET next_id=next_id+1 WHERE id=1")
+                database.execute("INSERT INTO approved_apps(id,path,name,sha256,size,approved_at) VALUES(?,?,?,?,?,?)", (app_id, str(executable), title, digest, size, time.time()))
             else:
                 app_id = row["id"]
                 database.execute("UPDATE approved_apps SET sha256=?,size=?,approved_at=? WHERE id=?", (digest, size, time.time(), app_id))
@@ -199,6 +218,56 @@ class AppCatalog:
                 raise ValueError("At most 10 aliases per app")
             database.execute("INSERT OR IGNORE INTO approved_app_aliases VALUES(?,?,?)", (app_id, title, key))
             require_current_approval()  # A revocation rolls back all permission changes.
+        return next(app for app in self.apps() if app["id"] == app_id)
+
+    def rename(self, app_id, name, *, approval_guard=None):
+        _require_authorization(approval_guard)
+        title = _name(name)
+        with self._connection() as database:
+            if not database.execute("UPDATE approved_apps SET name=? WHERE id=?", (title, _identifier(app_id))).rowcount:
+                raise ValueError("App not found")
+            _require_authorization(approval_guard)
+        return next(app for app in self.apps() if app["id"] == app_id)
+
+    def set_aliases(self, app_id, aliases, *, approval_guard=None):
+        _require_authorization(approval_guard)
+        app_id = _identifier(app_id)
+        if not isinstance(aliases, (list, tuple)) or len(aliases) > 10:
+            raise ValueError("Provide at most 10 app aliases")
+        values = {_key(alias): _name(alias) for alias in aliases}
+        with self._connection() as database:
+            database.execute("BEGIN IMMEDIATE")
+            _require_authorization(approval_guard)
+            if not database.execute("SELECT 1 FROM approved_apps WHERE id=?", (app_id,)).fetchone():
+                raise ValueError("App not found")
+            database.execute("DELETE FROM approved_app_aliases WHERE app_id=?", (app_id,))
+            database.executemany("INSERT INTO approved_app_aliases VALUES(?,?,?)", ((app_id, alias, key) for key, alias in values.items()))
+            _require_authorization(approval_guard)
+
+    def reapprove(self, app_id, *, approval=False, approval_guard=None):
+        app_id = _identifier(app_id)
+        if approval is not True:
+            raise PermissionError("Approve executable selection in local owner settings")
+        _require_authorization(approval_guard)
+        with self._connection() as database:
+            row = database.execute("SELECT path FROM approved_apps WHERE id=?", (app_id,)).fetchone()
+        if row is None:
+            raise ValueError("App no longer exists")
+        path = row["path"]
+        executable = _executable(path)
+        digest, size = _fingerprint(executable)
+        original = self.inspector(executable)
+        if original is not None and (not isinstance(original, str) or not original or len(original) > 512 or _blocked(original)):
+            raise ValueError("Shells and runtimes cannot be registered by renaming them")
+        if _fingerprint(executable) != (digest, size):
+            raise ValueError("Executable changed during approval")
+        with self._connection() as database:
+            database.execute("BEGIN IMMEDIATE")
+            _require_authorization(approval_guard)
+            updated = database.execute("UPDATE approved_apps SET sha256=?,size=?,approved_at=? WHERE id=? AND path=?", (digest, size, time.time(), app_id, path)).rowcount
+            if not updated:
+                raise ValueError("App changed or was removed during approval")
+            _require_authorization(approval_guard)
         return next(app for app in self.apps() if app["id"] == app_id)
 
     def apps(self):
@@ -226,24 +295,57 @@ class AppCatalog:
         with self._connection() as database:
             return bool(database.execute("DELETE FROM approved_apps WHERE id=?", (_identifier(app_id),)).rowcount)
 
-    def open_app(self, name, *, executor=None):
+    def open_app(self, name, *, executor=None, authorization_guard=None):
+        try:
+            _require_authorization(authorization_guard)
+        except PermissionError:
+            return {"status": "denied", "app": None, "suggestions": [], "message": "Доступ владельца истёк или отозван. Подтверди владельца заново."}
         result = self.resolve(name)
         if result["status"] != "found":
             result["message"] = ("Нашёл несколько приложений. Уточни уникальный псевдоним." if result["status"] == "ambiguous" else
                                  "Приложение не добавлено. Выбери его файл через настройки и подтверди доступ.")
             return result
+        return self._open_registered(result, executor, authorization_guard)
+
+    def open_app_id(self, app_id, *, executor=None, authorization_guard=None):
+        app_id = _identifier(app_id)
+        try:
+            _require_authorization(authorization_guard)
+        except PermissionError:
+            return {"status": "denied", "app": None, "suggestions": [], "message": "Доступ владельца истёк или отозван. Подтверди владельца заново."}
+        app = next((app for app in self.apps() if app["id"] == app_id), None)
+        if app is None:
+            return {"status": "missing", "app": None, "suggestions": [], "message": "Это приложение удалено из каталога. Обнови список и выбери его заново."}
+        return self._open_registered({"status": "found", "app": app, "suggestions": []}, executor, authorization_guard)
+
+    def _open_registered(self, result, executor, authorization_guard):
         app = result["app"]
+        def current_access():
+            _require_authorization(authorization_guard)
+            with self._connection() as database:
+                row = database.execute("SELECT path,sha256,size FROM approved_apps WHERE id=?", (app["id"],)).fetchone()
+            return (row is not None and row["path"] == app["path"] and row["sha256"] == app["sha256"]
+                    and row["size"] == app["size"] and _executable(row["path"]) == Path(app["path"]))
         try:
             executable = _executable(app["path"])
-            if _fingerprint(executable) != (app["sha256"], app["size"]):
+            fingerprint = _fingerprint(executable)
+            _require_authorization(current_access)
+            if fingerprint != (app["sha256"], app["size"]):
                 return {**result, "status": "changed", "message": "Файл приложения изменился. Выбери и подтверди его заново в настройках; сейчас я его не запускаю."}
-            (executor or self.executor or _native_launch)(executable)
+            custom_executor = executor or self.executor
+            if custom_executor is not None:
+                custom_executor(executable)
+            else:
+                _native_launch(executable, authorization_guard=current_access)
+        except PermissionError:
+            return {**result, "status": "denied", "message": "Доступ к приложению изменился или отозван. Обнови список и при необходимости подтверди владельца."}
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, struct.error):
             return {**result, "status": "failed", "message": "Не удалось запустить приложение. Проверь файл и повторно подтверди его в настройках."}
         return {**result, "status": "requested", "message": f"Запускаю «{app['name']}»."}
 
 
-def _native_launch(executable):
+def _native_launch(executable, *, authorization_guard=None):
     system = _system_directory()
+    _require_authorization(authorization_guard)
     subprocess.Popen([str(executable)], shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, cwd=str(system), env=powershell_environment(system))

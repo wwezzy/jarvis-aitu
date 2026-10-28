@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import secrets
+import threading
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -103,6 +104,7 @@ ALIASES = {alias: action for action, aliases in _ALIASES.items() for alias in al
 ACTION_LABELS = {"lock": "блокировку компьютера", "shutdown": "выключение компьютера",
                  "restart": "перезагрузку компьютера", "hibernate": "гибернацию компьютера"}
 HELP = ("Могу открыть YouTube, браузер по умолчанию, Google Chrome, блокнот, проводник и калькулятор; изменить громкость, свернуть окна. "
+        "Открываю добавленные тобой приложения и проекты в выбранном редакторе: «открой проект Jarvis», «открой приложение Редактор». Их имена и доступ настраиваются в разделе «Управление». "
         "«Открой Яндекс Музыку», «включи музыку» и «включи утреннюю музыку» различают открытие плеера и подтверждённое воспроизведение. "
         "«Разверни окно» разворачивает активное окно, «разверни ютуб» — одно найденное окно браузера с YouTube в заголовке. "
         "Попробуй: «добавь задачу закончить проект», «задачи», «готово 1», «следующий шаг», "
@@ -154,7 +156,7 @@ _CAPABILITIES = {"помощь", "команды", "список команд", 
     "как ты можешь помочь", "чем можешь помочь", "чем ты можешь помочь", "help", "/help",
     "what can you do", "what do you do", "what can you open", "what are your capabilities", "what commands do you know",
     "tell me what you can do", "show commands"}
-_POLITE_REQUEST = re.compile(r"^(?:можешь(?: ты)?|будь добр|будь добра|прошу тебя|can you|could you|would you|will you)\s+")
+_POLITE_REQUEST = re.compile(r"^(?:можешь(?: ты)?|будь добр|будь добра|прошу тебя|can you|could you|would you|will you)[\s,]+")
 _ACTION_WORDS = re.compile(r"\b(?:откр\w*|запус\w*|включ\w*|выключ\w*|закр\w*|удал\w*|выполн\w*|перезагруз\w*|заблокир\w*|свер\w*|развер\w*|громк\w*|громче|тише|open|launch|start|play|resume|close|delete|run|shutdown|restart|lock|hibernate|mute|unmute|minimize|maximize)\b")
 
 
@@ -179,6 +181,22 @@ def _desktop_action(phrase):
     if body != phrase and action in RISKY_ACTIONS and body in {"выключи", "выключить", "shutdown", "hibernate", "гибернация", "перезагрузка"}:
         return None
     return action
+
+
+def _catalog_request_frame(text):
+    """Remove only outer request frames; names remain literal capabilities.
+
+    Jarvis can itself be a project name, and Please Reply is a valid name.
+    Never erase words inside a name or treat its last word as an address.
+    """
+    value = re.sub(r"\s+", " ", text.casefold().replace("ё", "е").strip()).rstrip(".!?").strip()
+    for _ in range(2):
+        value = re.sub(r"^(?:джарвис|джарсис|джарвиз|jarvis)[\s,:.!?—-]+", "", value)
+        value = re.sub(r"^(?:пожалуйста|please)[\s,]+", "", value)
+        value = _POLITE_REQUEST.sub("", value, count=1).lstrip(" ,")
+    for _ in range(2):
+        value = re.sub(r",\s*(?:пожалуйста|please|джарвис|jarvis|сэр|sir)$", "", value).rstrip()
+    return value
 
 
 def _desktop_information(phrase):
@@ -221,10 +239,12 @@ def _desktop_clarification(phrase):
     commandlike = bool(re.match(r"^(?:откр\w*|запус\w*|включ\w*|выключ\w*|закр\w*|удал\w*|выполн\w*|перезагруз\w*|заблокир\w*|свер\w*|развер\w*|open|launch|start|play|resume|close|delete|run|shutdown|restart|lock|hibernate|mute|unmute|minimize|maximize|/pc\w*)\b", body))
     commandlike = commandlike or bool(re.match(r"^(?:сделай|увелич\w*|уменьш\w*|прибав\w*|убав\w*|громче|тише|volume|turn)\b", body)
                                       and re.search(r"громк|громче|тише|звук|volume|sound|computer|laptop|\bpc\b", body))
-    nonrequest = bool(re.match(r"^(?:не\b|не надо\b|don't\b|do not\b|never\b|скажи\b|процитируй\b|цитата\b|в тексте\b|в документе\b|(?:он|она|я|ты) сказал\w*\b|мне сказали\b|the document\b|he said\b|she said\b|say\b|quote\b)", body)
-                      or any(mark in body for mark in ('"', "'", "`", "«", "»", "“", "”")))
+    nonrequest = bool(re.match(r"^(?:не\b|не надо\b|not\b|don't\b|do not\b|never\b|скажи\b|процитируй\b|цитата\b|в тексте\b|в документе\b|(?:он|она|я|ты) сказал\w*\b|мне сказали\b|the document\b|he said\b|she said\b|say\b|quote\b)", body)
+                      or any(mark in body for mark in ('"', "'", "`", "«", "»", "“", "”", "‘", "’")))
     if nonrequest and _ACTION_WORDS.search(body):
         return "В этой формулировке есть отрицание, цитата или описание команды. Для выполнения пришли отдельную прямую просьбу, например «открой браузер»."
+    if re.match(r"^(?:сначала|потом|затем|first|firstly|then)\b", body) and _ACTION_WORDS.search(body):
+        return "Пришли отдельную прямую команду для одного действия. Составные просьбы не выполняю автоматически."
     if commandlike or body in _APP_NAMES:
         if re.search(r"музык|music|yandex|яндекс", body):
             return "Уточни одно действие: «открой Яндекс Музыку» — открыть плеер; «включи музыку» — попробовать продолжить музыку."
@@ -278,6 +298,7 @@ def _duration(count: str, unit: str) -> int:
 
 class DesktopCore:
     def __init__(self, state_dir: Path, executor=None, *, personal_path: Path | None = None):
+        self._closed = threading.Event()
         self.store = LocalStore(state_dir)
         self.organizer = LocalOrganizer(self.store)
         from desktop.observations import ObservationMonitor
@@ -360,9 +381,29 @@ class DesktopCore:
         return result
 
     def close(self):
+        if self._closed.is_set():
+            return
+        self._closed.set()
         self.owner.revoke()
         self.observations.reset()
         self.store.close()
+
+    def _catalog_authorized(self):
+        try:
+            return not self._closed.is_set() and (not self.owner.enabled or self.owner.allowed() is True)
+        except Exception:
+            return False
+
+    def open_catalog_item(self, kind, record_id, *, source="button"):
+        """Trusted local selection uses an ID, never a generated chat command."""
+        if (source != "button" or not isinstance(kind, str) or kind not in {"project", "app"}
+                or type(record_id) is not int or record_id < 1):
+            return Reply("Выбери проект или приложение в разделе «Управление».")
+        if not self._catalog_authorized():
+            return Reply("Сначала подтверди владельца кнопкой Windows Hello в разделе «Управление».")
+        opener = self.projects.open_project_id if kind == "project" else self.apps.open_app_id
+        result = opener(record_id, authorization_guard=self._catalog_authorized)
+        return self._answer(Reply(result["message"]))
 
     def set_owner_required(self, enabled):
         if type(enabled) is not bool:
@@ -381,7 +422,7 @@ class DesktopCore:
 
     def request_control(self, action, *, source="gesture", token=None, cancel=False):
         """Trusted gesture/paired-phone adapters; no text or model action extraction."""
-        if not isinstance(action, str) or action not in ALLOWED_ACTIONS or type(cancel) is not bool:
+        if self._closed.is_set() or not isinstance(action, str) or action not in ALLOWED_ACTIONS or type(cancel) is not bool:
             return Reply("Неподдерживаемое действие.", speak=False)
         preferences = self.store.preferences()
         if source == "gesture":
@@ -451,7 +492,8 @@ class DesktopCore:
         if len(reply.text) > MAX_REPLY_CHARS:
             label = "\n\n[Краткий фрагмент ответа: достигнут лимит чата. Исходные заметки сохранены полностью в разделе «Заметки».]"
             reply = replace(reply, text=reply.text[:MAX_REPLY_CHARS - len(label)] + label)
-        self.store.record("assistant", reply.text)
+        if not self._closed.is_set():
+            self.store.record("assistant", reply.text)
         return reply
 
     def _personal_snapshot(self):
@@ -546,7 +588,9 @@ class DesktopCore:
         return self._answer(Reply(result, action=action))
 
     def handle(self, text: str, source: str = "typed", *, on_chunk=None) -> Reply:
-        if source not in {"typed", "voice"}:
+        if self._closed.is_set():
+            return Reply("Jarvis завершает работу. Повтори команду после запуска.", speak=False)
+        if not isinstance(source, str) or source not in {"typed", "voice"}:
             return Reply("Импортированный текст и ответы ИИ не могут запускать команды компьютера.")
         if self.owner.enabled and not self.owner.allowed():
             return Reply("Сначала подтверди владельца кнопкой Windows Hello в разделе «Управление».")
@@ -572,30 +616,31 @@ class DesktopCore:
         information = _desktop_information(intent_phrase)
         if information is not None:
             return self._answer(Reply(information))
-        action = _desktop_action(intent_phrase)
-        if action:
-            return self._request_action(action)
         if intent_phrase in {"проекты", "мои проекты", "projects"}:
             items = self.projects.projects()
             return self._answer(Reply("\n".join(item["name"] for item in items[:30]) if items else "Добавь проект или разрешённую папку в настройках Jarvis."))
         if intent_phrase in {"приложения", "мои приложения", "apps"}:
             items = self.apps.apps()
             return self._answer(Reply("\n".join(item["name"] for item in items[:30]) if items else "Добавь свои приложения в настройках. Браузер, Chrome, Яндекс Музыка и системные утилиты уже поддерживаются."))
-        project = re.fullmatch(r"(?:открой|открыть|запусти|запустить|open|launch)\s+(?:проект|project)\s+(.+)", intent_phrase)
+        catalog_frame = _catalog_request_frame(text)
+        project = re.fullmatch(r"(?:открой|открыть|запусти|запустить|open|launch)\s+(?:проект|project)\s+(.+)", catalog_frame)
         if project:
             try:
-                result = self.projects.open_project(project[1])
+                result = self.projects.open_project(project[1], authorization_guard=self._catalog_authorized)
                 return self._answer(Reply(result["message"]))
             except ValueError:
                 return self._answer(Reply("Укажи одно имя проекта из каталога, без пути, ссылки или дополнительных команд."))
-        application = re.fullmatch(r"(?:открой|открыть|запусти|запустить|включи|open|launch|start)\s+(?:(?:приложение|app)\s+)?(.+)", intent_phrase)
+        application = re.fullmatch(r"(?:открой|открыть|запусти|запустить|включи|open|launch|start)\s+(?:(приложение|app)\s+)?(.+)", catalog_frame)
         if application:
             try:
-                found = self.apps.resolve(application[1])
-                if found["status"] != "missing" or intent_phrase.startswith(("открой приложение ", "open app ")):
-                    return self._answer(Reply(self.apps.open_app(application[1])["message"]))
+                found = self.apps.resolve(application[2])
+                if found["status"] != "missing" or application[1]:
+                    return self._answer(Reply(self.apps.open_app(application[2], authorization_guard=self._catalog_authorized)["message"]))
             except ValueError:
                 return self._answer(Reply("Укажи одно имя приложения из каталога, без пути, ссылки или дополнительных команд."))
+        action = _desktop_action(intent_phrase)
+        if action:
+            return self._request_action(action)
         if intent_phrase in {"джарвис", "jarvis", "да", "привет", "как дела", "как твои дела", "как у тебя дела",
                              "ты здесь", "ты тут", "how are you", "hello", "are you there"}:
             return self._answer(Reply("На связи, сэр. Скажи команду или выбери следующий шаг."))

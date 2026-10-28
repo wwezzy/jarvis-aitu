@@ -38,7 +38,8 @@ def pcm_active(data):
     """An acoustic buffer trigger, never a wake/intent decision.
 
     Use zero-mean energy so silence and a DC offset do not start an utterance.
-    Only an exact recognized wake can send these bounded samples to Whisper.
+    A verified wake or a finite keyword candidate can hand off these samples.
+    Candidates still require an exact leading wake before any command window.
     """
     if not isinstance(data, bytes) or len(data) < 4 or len(data) % 2:
         return False
