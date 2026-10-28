@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from desktop.actions import ALLOWED_ACTIONS, RISKY_ACTIONS, execute_windows_action
+from desktop.arithmetic import calculate, is_arithmetic_request
 from desktop.organizer import LocalOrganizer
 from desktop.store import LocalStore
 
@@ -549,7 +550,7 @@ class DesktopCore:
                  "план на завтра", "план завтра", "что у меня завтра", "завтра", "напоминания", "таймеры", "reminders", "timers"}
         known.update(PERSONAL_COMMANDS)
         from desktop.computer_controls import parse_command
-        if parse_command(text) is not None:
+        if is_arithmetic_request(text) or parse_command(text) is not None:
             return "command"
         known.update({"пауза планировщика", "возобнови планировщик", "тихий режим", "отключи тихий режим",
                       "выключи утренний план", "включи утренний план", "выключи вечерний план", "включи вечерний план",
@@ -754,6 +755,9 @@ class DesktopCore:
         canceled = re.fullmatch(r"(?:отмена|отмени|cancel|/cancel) ([a-f0-9]{32})", value)
         if canceled:
             return self.cancel(canceled[1])
+        arithmetic = calculate(text)
+        if arithmetic is not None:
+            return self._answer(Reply(arithmetic))
         intent_phrase = _intent_phrase(text)
         if self.request_kind(text, source) == "stop":
             return self._answer(Reply("Остановлено.", speak=False))
