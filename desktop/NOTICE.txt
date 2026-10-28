@@ -65,3 +65,12 @@ Microphone recording starts only after the app's microphone control is
 enabled. Audio is processed locally and not stored or uploaded by this app.
 Local notes, tasks and history remain on this Windows account. Uninstall
 retains them so that a future reinstall does not silently destroy data.
+
+Optional gesture runtime: MediaPipe (Apache-2.0) and OpenCV-contrib
+(Apache-2.0 with bundled third-party notices). Preserve the installed
+distribution license files and the separately downloaded model LICENSE/NOTICE.
+https://github.com/google-ai-edge/mediapipe
+https://github.com/opencv/opencv
+https://developers.google.com/edge/mediapipe/legal/tos
+Camera processing is opt-in and on-device; no frames are stored by Jarvis.
+MediaPipe SDK terms permit usage/performance diagnostic metadata.

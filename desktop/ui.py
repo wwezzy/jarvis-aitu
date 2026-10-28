@@ -604,6 +604,7 @@ class PlanPanel(QWidget):
 class MainWindow(QMainWindow):
     SETTINGS_PAGE = 4
     PLAN_PAGE = 5
+    CONTROLS_PAGE = 6
     MAX_PREVIEW_CHARS = 22000
 
     def __init__(self, core, voice_factory=None, model_dir: Path | None = None, enable_tray: bool = True, personal_path: Path | None = None, *, enable_integrations: bool = False, quiet_start: bool = False):
@@ -631,6 +632,7 @@ class MainWindow(QMainWindow):
         self._capture_requested = False
         self._quitting = False
         self._resources_closed = False
+        self._session_notifications_registered = False
         self._capture_failed = False
         self._capture_error = None
         self._request_serial = 0
@@ -659,6 +661,8 @@ class MainWindow(QMainWindow):
         self.resize(1120, 790)
         self.setMinimumSize(860, 620)
         self.setStyleSheet(STYLE)
+        from desktop.owner_auth import register_session_notifications
+        self._session_notifications_registered = register_session_notifications(int(self.winId()))
         self._build()
         self.events.recognized.connect(self._recognized_for_session)
         self.events.voice_state.connect(self._voice_state)
@@ -737,7 +741,7 @@ class MainWindow(QMainWindow):
         side.addWidget(label("ЛИЧНЫЙ АССИСТЕНТ", "eyebrow"))
         side.addSpacing(35)
         self.nav_buttons = []
-        self.nav_targets = [(0, "Ассистент"), (self.PLAN_PAGE, "План"), (1, "Мои задачи"), (2, "Заметки"), (3, "Мои данные"), (self.SETTINGS_PAGE, "Настройки")]
+        self.nav_targets = [(0, "Ассистент"), (self.PLAN_PAGE, "План"), (1, "Мои задачи"), (2, "Заметки"), (3, "Мои данные"), (self.CONTROLS_PAGE, "Управление"), (self.SETTINGS_PAGE, "Настройки")]
         for index, text in self.nav_targets:
             nav = button(text, lambda _checked=False, value=index: self.navigate(value), "nav")
             nav.setCheckable(True)
@@ -768,6 +772,13 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._settings_page())
         self.plan = PlanPanel(self.core, self._plan_changed)
         self.pages.addWidget(self.plan)
+        from desktop.control_panel import ControlsPanel
+        self.controls = ControlsPanel(self.core, main_window=self, on_reply=self._reply,
+                                      remote_status={"status": "not_configured"})
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setWidget(self.controls)
+        self.pages.addWidget(controls_scroll)
         main.addWidget(self.pages, 1)
         footer = QHBoxLayout()
         footer.addWidget(label("Управление голосом — только после включения микрофона", "muted"))
@@ -1236,6 +1247,7 @@ class MainWindow(QMainWindow):
         self.refresh_notes(snapshot=snapshot)
         self.plan.refresh()
         self.plan.refresh_evidence(snapshot.get("observations", {}))
+        self.controls.refresh()
         self._sync_organizer_preferences()
         self._set_checked_silently(self.activity_monitor_toggle, self.preferences.get("activity_monitor_enabled", False))
         self._refresh_usage_status()
@@ -1924,8 +1936,23 @@ class MainWindow(QMainWindow):
         self._quitting = True
         self.close()
 
+    def nativeEvent(self, event_type, message):
+        # Session lock/disconnect invalidates the in-memory Hello grant even
+        # when the assistant has no focus. No biometric material is accessed.
+        if self._session_notifications_registered:
+            try:
+                from ctypes.wintypes import MSG
+                native = MSG.from_address(int(message))
+                if native.message == 0x02B1:  # WM_WTSSESSION_CHANGE
+                    self.core.owner.handle_session_change(int(native.wParam))
+                    self.controls._poll_owner()
+            except (TypeError, ValueError, OSError):
+                self.core.owner.revoke()
+        return super().nativeEvent(event_type, message)
+
     def _finish_close(self):
-        if self.pool.activeThreadCount() == 0 and not self._integration_workers and self._phone_stop_complete:
+        if (self.pool.activeThreadCount() == 0 and not self._integration_workers
+                and self._phone_stop_complete and self.controls.shutdown_complete):
             self._close_timer.stop()
             self.close()
 
@@ -1938,6 +1965,11 @@ class MainWindow(QMainWindow):
                 self._tray_notice_shown = True
             return
         self._quitting = True
+        self.controls.shutdown()
+        if self._session_notifications_registered:
+            from desktop.owner_auth import unregister_session_notifications
+            unregister_session_notifications(int(self.winId()))
+            self._session_notifications_registered = False
         self._reminder_timer.stop()
         self._integration_timer.stop()
         self._phone_notifications.clear()
@@ -1957,7 +1989,8 @@ class MainWindow(QMainWindow):
         # Stop queued work immediately; let an already-running bounded adapter
         # finish without freezing the UI or closing its database under it.
         self.pool.clear()
-        if self.pool.activeThreadCount() or self._integration_workers or not self._phone_stop_complete:
+        if (self.pool.activeThreadCount() or self._integration_workers or not self._phone_stop_complete
+                or not self.controls.shutdown_complete):
             self.setEnabled(False)
             self.status.setText("Завершаю текущее действие. Микрофон выключен.")
             self._close_timer.start()

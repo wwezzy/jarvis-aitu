@@ -1,0 +1,6 @@
+# Optional camera gestures. Never installed or activated by normal startup.
+# Keep the same NumPy version as the CPU desktop runtime.
+--index-url https://pypi.org/simple
+mediapipe==1.2.0
+opencv-contrib-python==5.0.0.93
+numpy==2.5.4

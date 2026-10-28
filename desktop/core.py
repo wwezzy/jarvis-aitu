@@ -283,6 +283,12 @@ class DesktopCore:
         self.observations = ObservationMonitor(self.store)
         from desktop.usage import UsageLedger
         self.usage = UsageLedger(self.store)
+        from desktop.owner_auth import OwnerSession
+        from desktop.project_catalog import ProjectCatalog
+        from desktop.app_catalog import AppCatalog
+        self.owner = OwnerSession(enabled=self.store.preferences()["voice_owner_required"])
+        self.projects = ProjectCatalog(state_dir)
+        self.apps = AppCatalog(state_dir)
         self.executor = executor if executor is not None else execute_windows_action
         # A core used in tests/smoke mode never discovers global personal files.
         # Only the actual entry point may opt in with an identified local copy.
@@ -353,8 +359,62 @@ class DesktopCore:
         return result
 
     def close(self):
+        self.owner.revoke()
         self.observations.reset()
         self.store.close()
+
+    def set_owner_required(self, enabled):
+        if type(enabled) is not bool:
+            return False
+        if self.owner.enabled and not enabled and not self.owner.allowed():
+            return False
+        self.store.set_preferences({"voice_owner_required": enabled, **({"gestures_enabled": False} if not enabled else {})})
+        self.owner.set_enabled(enabled)
+        return True
+
+    def approve_remote(self, enabled):
+        if type(enabled) is not bool or enabled and not (self.owner.enabled and self.owner.allowed()):
+            return False
+        self.store.set_preferences({"remote_control_approved": enabled})
+        return True
+
+    def request_control(self, action, *, source="gesture", token=None, cancel=False):
+        """Trusted gesture/paired-phone adapters; no text or model action extraction."""
+        if not isinstance(action, str) or action not in ALLOWED_ACTIONS or type(cancel) is not bool:
+            return Reply("Неподдерживаемое действие.", speak=False)
+        preferences = self.store.preferences()
+        if source == "gesture":
+            if (action not in {"volume_up", "volume_down", "minimize"} or token is not None
+                    or not preferences["gestures_enabled"] or not self.owner.enabled or not self.owner.allowed()):
+                return Reply("Жест не выполнен: требуется подтверждённый владелец и включённый режим жестов.", speak=False)
+        elif source == "remote":
+            # The HTTP adapter separately verifies both owner-device secrets.
+            if not preferences["remote_control_approved"]:
+                return Reply("Удалённое управление не разрешено владельцем.", speak=False)
+            if token is not None:
+                if not isinstance(token, str) or not re.fullmatch(r"[a-f0-9]{32}", token):
+                    return Reply("Неверное подтверждение.", speak=False)
+                claimed = self.store.claim_confirmation(token, time.time())
+                if claimed != action or claimed not in RISKY_ACTIONS:
+                    return Reply("Подтверждение не соответствует действию, истекло или уже использовано.", speak=False)
+                if cancel:
+                    return self._answer(Reply("Удалённый запрос отменён до выполнения.", speak=False))
+                return self._execute(claimed)
+        else:
+            return Reply("Источник управления не разрешён.", speak=False)
+        if cancel:
+            return Reply("Нет подтверждения для отмены.", speak=False)
+        return self._request_action(action)
+
+    def _request_action(self, action):
+        if action in RISKY_ACTIONS:
+            token = secrets.token_hex(16)
+            self.store.create_confirmation(token, action, time.time())
+            return self._answer(Reply(
+                "Подтверди " + ACTION_LABELS[action] + " кнопкой в приложении в течение 60 секунд. "
+                + ("Сохрани открытые документы. После выполнения остается 30 секунд на отмену." if action in {"shutdown", "restart"} else "Несохраненная работа может быть прервана."),
+                action=action, confirmation_id=token))
+        return self._execute(action)
 
     def due_events(self, now=None, trigger="tick") -> list[Reply]:
         """Local plan notices are literal data, never passed to handle/model.
@@ -487,6 +547,8 @@ class DesktopCore:
     def handle(self, text: str, source: str = "typed", *, on_chunk=None) -> Reply:
         if source not in {"typed", "voice"}:
             return Reply("Импортированный текст и ответы ИИ не могут запускать команды компьютера.")
+        if self.owner.enabled and not self.owner.allowed():
+            return Reply("Сначала подтверди владельца кнопкой Windows Hello в разделе «Управление».", speak=False)
         if not isinstance(text, str) or not text.strip() or len(text) > 20000 or "\x00" in text:
             return Reply("Нужна непустая команда длиной до 20 000 символов.")
         request_id = self.store.record("user", text.strip())
@@ -506,15 +568,29 @@ class DesktopCore:
         if information is not None:
             return self._answer(Reply(information))
         action = _desktop_action(intent_phrase)
-        if action in RISKY_ACTIONS:
-            token = secrets.token_hex(16)
-            self.store.create_confirmation(token, action, time.time())
-            return self._answer(Reply(
-                "Подтверди " + ACTION_LABELS[action] + " кнопкой в приложении в течение 60 секунд. "
-                + ("Сохрани открытые документы. После выполнения остается 30 секунд на отмену." if action in {"shutdown", "restart"} else "Несохраненная работа может быть прервана."),
-                action=action, confirmation_id=token))
         if action:
-            return self._execute(action)
+            return self._request_action(action)
+        if intent_phrase in {"проекты", "мои проекты", "projects"}:
+            items = self.projects.projects()
+            return self._answer(Reply("\n".join(item["name"] for item in items[:30]) if items else "Добавь проект или разрешённую папку в настройках Jarvis."))
+        if intent_phrase in {"приложения", "мои приложения", "apps"}:
+            items = self.apps.apps()
+            return self._answer(Reply("\n".join(item["name"] for item in items[:30]) if items else "Добавь свои приложения в настройках. Браузер, Chrome, Яндекс Музыка и системные утилиты уже поддерживаются."))
+        project = re.fullmatch(r"(?:открой|открыть|запусти|запустить|open|launch)\s+(?:проект|project)\s+(.+)", intent_phrase)
+        if project:
+            try:
+                result = self.projects.open_project(project[1])
+                return self._answer(Reply(result["message"]))
+            except ValueError:
+                return self._answer(Reply("Укажи одно имя проекта из каталога, без пути, ссылки или дополнительных команд."))
+        application = re.fullmatch(r"(?:открой|открыть|запусти|запустить|включи|open|launch|start)\s+(?:(?:приложение|app)\s+)?(.+)", intent_phrase)
+        if application:
+            try:
+                found = self.apps.resolve(application[1])
+                if found["status"] != "missing" or intent_phrase.startswith(("открой приложение ", "open app ")):
+                    return self._answer(Reply(self.apps.open_app(application[1])["message"]))
+            except ValueError:
+                return self._answer(Reply("Укажи одно имя приложения из каталога, без пути, ссылки или дополнительных команд."))
         if value in {"джарвис", "jarvis", "да", "привет", "как дела", "ты здесь", "how are you", "hello", "are you there"}:
             return self._answer(Reply("На связи, сэр. Скажи команду или выбери следующий шаг."))
         if value in {"помощь", "команды", "что ты умеешь", "help", "/help"}:
@@ -644,6 +720,8 @@ class DesktopCore:
         return self._answer(Reply("Не распознал точную команду. " + HELP))
 
     def confirm(self, token: str, source: str = "button") -> Reply:
+        if self.owner.enabled and not self.owner.allowed():
+            return Reply("Подтверди владельца через Windows Hello перед выполнением.", speak=False)
         if source not in {"button", "typed"}:
             return self._answer(Reply("Для этого действия требуется кнопка подтверждения или исходная текстовая команда. Голос не подтверждает управление питанием."))
         if not isinstance(token, str) or not re.fullmatch(r"[a-f0-9]{32}", token):

@@ -65,7 +65,11 @@ def window(app, tmp_path):
     yield widget
     widget._quitting = True
     widget.close()
-    app.processEvents()
+    deadline = time.monotonic() + 3
+    while not widget._resources_closed and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.005)
+    assert widget._resources_closed
 
 
 def settled(app, window):
@@ -82,7 +86,7 @@ def settled(app, window):
 def test_startup_keeps_microphone_off_and_navigation_simple(app, window):
     assert window.voice.starts == 0
     assert not window.listening
-    assert [item.text() for item in window.nav_buttons] == ["Ассистент", "План", "Мои задачи", "Заметки", "Мои данные", "Настройки"]
+    assert [item.text() for item in window.nav_buttons] == ["Ассистент", "План", "Мои задачи", "Заметки", "Мои данные", "Управление", "Настройки"]
     window.navigate(1)
     assert window.pages.currentIndex() == 1
     window.navigate(window.SETTINGS_PAGE)

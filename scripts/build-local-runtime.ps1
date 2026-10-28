@@ -4,6 +4,7 @@ param(
     [string]$ModelDir,
     [string]$OllamaPath,
     [switch]$PersonalVoice,
+    [switch]$Gestures,
     [switch]$NoShortcut
 )
 $ErrorActionPreference = 'Stop'
@@ -57,6 +58,10 @@ if ($LASTEXITCODE -ne 0) { throw 'Runtime dependency installation failed; no sho
 if ($PersonalVoice) {
     & $PythonPath -m pip install --disable-pip-version-check --no-compile --target $sitePath --upgrade -r (Join-Path $repoPath 'requirements-personal-voice.txt')
     if ($LASTEXITCODE -ne 0) { throw 'Optional personal voice runtime installation failed.' }
+}
+if ($Gestures) {
+    & $PythonPath -m pip install --disable-pip-version-check --no-compile --target $sitePath --upgrade -r (Join-Path $repoPath 'requirements-gestures.txt')
+    if ($LASTEXITCODE -ne 0) { throw 'Optional gesture runtime installation failed.' }
 }
 # This is a CPU-only CTranslate2 installation. Its Windows wheel contains an
 # unused cuDNN dispatcher although v4.8.4 is built WITH_CUDNN=OFF. Do not ship
