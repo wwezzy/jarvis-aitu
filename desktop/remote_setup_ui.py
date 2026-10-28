@@ -17,7 +17,7 @@ import weakref
 
 from PySide6.QtCore import QObject, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QFrame, QLabel, QPushButton, QVBoxLayout, QWidget
 
 
 _OFFICIAL_INSTALLER = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
@@ -223,7 +223,7 @@ class RemoteSetupPanel(QWidget):
         content.addWidget(self.status_label)
         self.steps_label = _label(_STEPS)
         content.addWidget(self.steps_label)
-        row = QHBoxLayout()
+        row = QVBoxLayout()
         self.download_button = self._button("Скачать официальный установщик", self._download)
         self.installer_button = self._button("Проверить и открыть установщик", self._open_installer)
         row.addWidget(self.download_button)

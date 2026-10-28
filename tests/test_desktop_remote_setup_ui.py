@@ -155,6 +155,55 @@ def test_constructor_never_probes_downloads_authorizes_or_opens(panel, app):
     assert all(label.textFormat() == Qt.TextFormat.PlainText for label in panel.findChildren(QLabel))
 
 
+def test_controls_fit_minimum_window_without_horizontal_scrolling(app, tmp_path, monkeypatch):
+    from desktop.core import DesktopCore
+    from desktop.ui import MainWindow
+    from desktop import owner_auth
+
+    class SilentVoice:
+        def __init__(self, **_kwargs):
+            pass
+        def available(self):
+            return {"ready": False, "model": False, "reason": "Devices disabled for layout test"}
+        def start(self):
+            pytest.fail("Layout must never start a microphone")
+        def stop(self):
+            pass
+        def say(self, _text):
+            pass
+
+    monkeypatch.setattr(owner_auth, "register_session_notifications", lambda _hwnd: False)
+    monkeypatch.setattr(owner_auth, "unregister_session_notifications", lambda _hwnd: None)
+    core = DesktopCore(tmp_path / "isolated-layout", executor=lambda _action: pytest.fail("No OS action permitted"),
+                       personal_path=tmp_path / "absent-personal.sqlite3")
+    core.store.set_preferences({"speech_enabled": False, "organizer_enabled": False, "close_to_tray": False})
+    window = MainWindow(core, voice_factory=SilentVoice, enable_tray=False, enable_integrations=False,
+                        quiet_start=True, personal_path=tmp_path / "absent-personal.sqlite3")
+    try:
+        window.show()
+        window.resize(860, 620)
+        window.navigate(window.CONTROLS_PAGE)
+        settled(app, window.controls)
+        scroll = window.pages.widget(window.CONTROLS_PAGE)
+        assert window.width() == 860 and window.height() == 620
+        assert scroll.viewport().width() <= 600  # Sidebar and normal app margins remain present.
+        assert scroll.horizontalScrollBar().maximum() == 0
+        window.remote_setup.consent_button.setVisible(True)
+        app.processEvents()
+        assert scroll.horizontalScrollBar().maximum() == 0
+        scroll.ensureWidgetVisible(window.remote_setup.installer_button)
+        app.processEvents()
+        viewport = scroll.viewport().rect()
+        for button in (window.remote_setup.download_button, window.remote_setup.installer_button):
+            left = button.mapTo(scroll.viewport(), button.rect().topLeft()).x()
+            assert left >= viewport.left() and left + button.width() <= viewport.right() + 1
+    finally:
+        window.quit_application()
+        settled(app, window.controls, condition=lambda: window._resources_closed)
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
 def test_default_setup_constructor_is_lazy_and_keeps_same_api(app, tmp_path, monkeypatch):
     from desktop import remote_setup
     constructed = []
