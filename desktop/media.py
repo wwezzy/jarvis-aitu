@@ -16,6 +16,8 @@ import re
 import subprocess
 import time
 
+from desktop.native_runtime import powershell_environment
+
 MUSIC_URL = "https://music.yandex.ru/"
 MUSIC_ACTIONS = frozenset({"music_open", "music_play", "music_morning"})
 MEDIA_STATES = frozenset({"playing", "already_playing", "no_session", "not_music", "unknown_source",
@@ -98,6 +100,7 @@ def _request_music_play(system_dir: Path, runner=None, *, timeout=6) -> str:
     try:
         result = run([str(executable), "-NoLogo", "-NoProfile", "-NonInteractive", "-Mta", "-EncodedCommand", encoded],
                      shell=False, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,
+                     env=powershell_environment(system_dir),
                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if result.returncode or not isinstance(result.stdout, bytes) or len(result.stdout) > 4096:
             return "unavailable"

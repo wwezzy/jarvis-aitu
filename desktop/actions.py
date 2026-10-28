@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 ALLOWED_ACTIONS = frozenset({
-    "calculator", "notepad", "explorer", "youtube", "browser", "volume_up",
+    "calculator", "notepad", "explorer", "youtube", "browser", "chrome", "volume_up",
     "volume_down", "volume_mute", "volume_unmute", "minimize", "minimize_all", "lock",
     "shutdown", "restart", "hibernate", "cancel_shutdown", "maximize", "maximize_youtube",
     "music_open", "music_play", "music_morning",
@@ -184,6 +184,9 @@ def execute_windows_action(action: str) -> str:
     if not count or count >= len(buffer):
         raise OSError("System directory unavailable")
     system = Path(buffer.value)
+    if action == "chrome":
+        from desktop.known_apps import open_chrome
+        return open_chrome(system)
     if action in {"music_open", "music_play", "music_morning"}:
         from desktop.media import execute_music_action
         return execute_music_action(action, system)

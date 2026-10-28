@@ -80,6 +80,7 @@ _ALIASES = {
     "explorer": ("открой проводник", "открой файлы", "open explorer", "open files"),
     "youtube": ("открой ютуб", "открой youtube", "открой ютьюб", "open youtube"),
     "browser": ("открой браузер", "запусти браузер", "open browser"),
+    "chrome": ("открой гугл хром", "открой google chrome", "открой хром", "open chrome", "open google chrome"),
     "music_open": ("открой яндекс музыку", "открой яндекс музыку в браузере", "open yandex music"),
     "music_play": ("включи музыку", "включить музыку", "возобнови музыку", "play music", "resume music"),
     "music_morning": ("включи утреннюю музыку", "утренняя музыка", "play morning music"),
@@ -100,7 +101,7 @@ _ALIASES = {
 ALIASES = {alias: action for action, aliases in _ALIASES.items() for alias in aliases}
 ACTION_LABELS = {"lock": "блокировку компьютера", "shutdown": "выключение компьютера",
                  "restart": "перезагрузку компьютера", "hibernate": "гибернацию компьютера"}
-HELP = ("Могу открыть YouTube, браузер, блокнот, проводник и калькулятор; изменить громкость, свернуть окна. "
+HELP = ("Могу открыть YouTube, браузер по умолчанию, Google Chrome, блокнот, проводник и калькулятор; изменить громкость, свернуть окна. "
         "«Открой Яндекс Музыку», «включи музыку» и «включи утреннюю музыку» различают открытие плеера и подтверждённое воспроизведение. "
         "«Разверни окно» разворачивает активное окно, «разверни ютуб» — одно найденное окно браузера с YouTube в заголовке. "
         "Попробуй: «добавь задачу закончить проект», «задачи», «готово 1», «следующий шаг», "
@@ -108,6 +109,133 @@ HELP = ("Могу открыть YouTube, браузер, блокнот, про
         "«план на завтра», «добавь цель на завтра закончить проект», «я хожу в зал во вт чт вс», "
         "«фокус 25 минут», «напоминания», «отмени таймер 1», «расписание», «дедлайны» или «моя память». Управление питанием — только с отдельным подтверждением. "
         "Задачи и заметки сохраняются на этом компьютере; Render и ИИ для этих команд не нужны.")
+
+_APP_NAMES = {
+    "браузер": "browser", "мой браузер": "browser", "browser": "browser", "the browser": "browser", "my browser": "browser",
+    "google chrome": "chrome", "googlechrome": "chrome", "chrome": "chrome", "the chrome browser": "chrome", "гугл хром": "chrome", "гуглхром": "chrome", "хром": "chrome",
+    "калькулятор": "calculator", "calculator": "calculator", "the calculator": "calculator",
+    "блокнот": "notepad", "notepad": "notepad",
+    "проводник": "explorer", "файлы": "explorer", "explorer": "explorer", "file explorer": "explorer", "files": "explorer",
+    "ютуб": "youtube", "ютьюб": "youtube", "youtube": "youtube",
+    "яндекс музыка": "music_open", "яндекс музыку": "music_open", "яндекс музыки": "music_open",
+    "yandex music": "music_open", "yandexmusic": "music_open", "музыку": "music_open", "music": "music_open",
+}
+# Finite verbs/targets, never a fuzzy match or an extracted subcommand. Named
+# Yandex requests open that player; generic resume may use another music app.
+_NATURAL_ACTIONS = {verb + " " + target: action for target, action in _APP_NAMES.items()
+                    for verb in ("открой", "открыть", "запусти", "запустить", "включи", "включить", "open", "launch", "start")}
+_NATURAL_ACTIONS.update(ALIASES)
+for _imperative, _infinitive in (("открой", "открыть"), ("запусти", "запустить"), ("включи", "включить"),
+                               ("выключи", "выключить"), ("перезагрузи", "перезагрузить"),
+                               ("заблокируй", "заблокировать"), ("сверни", "свернуть"),
+                               ("разверни", "развернуть"), ("увеличь", "увеличить"),
+                               ("уменьши", "уменьшить"), ("отключи", "отключить"), ("отмени", "отменить")):
+    for _phrase, _action in ALIASES.items():
+        if _phrase.startswith(_imperative + " "):
+            _NATURAL_ACTIONS[_infinitive + _phrase[len(_imperative):]] = _action
+_NATURAL_ACTIONS.update({
+    "play yandex music": "music_open", "возобнови яндекс музыку": "music_open",
+    "возобновить музыку": "music_play", "включить утреннюю музыку": "music_morning",
+    "сделай потише": "volume_down", "потише": "volume_down", "убавь громкость": "volume_down",
+    "сделай погромче": "volume_up", "погромче": "volume_up", "прибавь громкость": "volume_up",
+    "minimize the window": "minimize", "minimize all windows": "minimize_all",
+    "maximize the window": "maximize", "mute the sound": "volume_mute", "unmute the sound": "volume_unmute",
+    "turn up the volume": "volume_up", "turn the volume up": "volume_up",
+    "turn down the volume": "volume_down", "turn the volume down": "volume_down",
+    "turn the sound off": "volume_mute", "turn the sound on": "volume_unmute",
+})
+for _verb, _action in {"shut down": "shutdown", "turn off": "shutdown", "shutdown": "shutdown",
+                       "restart": "restart", "lock": "lock", "hibernate": "hibernate"}.items():
+    for _target in ("computer", "the computer", "my computer", "pc", "my pc", "laptop", "the laptop", "my laptop"):
+        _NATURAL_ACTIONS[_verb + " " + _target] = _action
+_CAPABILITIES = {"помощь", "команды", "список команд", "что ты умеешь", "что ты можешь", "что ты можешь делать",
+    "что ты умеешь делать", "какие у тебя возможности", "какие у тебя функции", "какие команды ты знаешь",
+    "как ты можешь помочь", "чем можешь помочь", "чем ты можешь помочь", "help", "/help",
+    "what can you do", "what do you do", "what can you open", "what are your capabilities", "what commands do you know",
+    "tell me what you can do", "show commands"}
+_POLITE_REQUEST = re.compile(r"^(?:можешь(?: ты)?|будь добр|будь добра|прошу тебя|can you|could you|would you|will you)\s+")
+_ACTION_WORDS = re.compile(r"\b(?:откр\w*|запус\w*|включ\w*|выключ\w*|закр\w*|удал\w*|выполн\w*|перезагруз\w*|заблокир\w*|свер\w*|развер\w*|громк\w*|громче|тише|open|launch|start|play|resume|close|delete|run|shutdown|restart|lock|hibernate|mute|unmute|minimize|maximize)\b")
+
+
+def _intent_phrase(text):
+    """Only formatting/address frames; quotes and negation remain intact."""
+    value = re.sub(r"\s+", " ", text.casefold().replace("ё", "е").strip()).rstrip(".!?").strip()
+    value = re.sub(r"(?<!\w)(?:пожалуйста|please)(?!\w)", " ", value)
+    value = re.sub(r"[\s,]+", " ", value).strip()
+    value = re.sub(r"^(?:джарвис|джарсис|джарвиз|jarvis)[\s,:.!?—-]+", "", value)
+    value = re.sub(r"[\s,]+(?:джарвис|джарсис|джарвиз|jarvis|сэр|sir)$", "", value)
+    value = re.sub(r"\b(яндекс|yandex)[.·-]+\s*(?=музык[ауи]\b|music\b)", r"\1 ", value)
+    return re.sub(r"[\s,]+", " ", value).strip()
+
+
+def _desktop_action(phrase):
+    if any(mark in phrase for mark in ('"', "'", "`", "«", "»", "“", "”", "‘", "’")):
+        return None
+    body = _POLITE_REQUEST.sub("", phrase, count=1)
+    action = _NATURAL_ACTIONS.get(body)
+    # A polite modal without a power target is a capability/clarification
+    # question; do not infer a destructive target from it.
+    if body != phrase and action in RISKY_ACTIONS and body in {"выключи", "выключить", "shutdown", "hibernate", "гибернация", "перезагрузка"}:
+        return None
+    return action
+
+
+def _desktop_information(phrase):
+    body = _POLITE_REQUEST.sub("", phrase, count=1)
+    # Capability requests are read-only. Tolerate a trailing ASR fragment here
+    # without ever extracting an executable action from a longer utterance.
+    if re.match(r"^(?:что ты (?:умеешь|можешь)|расскажи что ты (?:умеешь|можешь))\b", body):
+        return HELP
+    if body in _CAPABILITIES or re.fullmatch(
+            r"(?:расскажи|рассказать|скажи|сказать|покажи|показать)(?: мне)? (?:что (?:ты )?(?:можешь|умеешь)(?: делать)?|о своих возможностях|про свои возможности)", body):
+        return HELP
+    if re.fullmatch(r"(?:ты (?:можешь|умеешь)|(?:можешь|умеешь) ли ты|are you able to|do you support|can you actually) .+", phrase):
+        return HELP
+    if (re.match(r"^(?:чем отличается|в чем разница|what is the difference|what's the difference)\b", phrase)
+            and re.search(r"музык|music", phrase)):
+        return ("Открыть Яндекс Музыку — запустить плеер. «Включи музыку» — попробовать продолжить музыку в доступном плеере. "
+                "О воспроизведении сообщаю только после подтверждения; первый вход и выбор подборки могут потребовать твоего действия.")
+    return None
+
+
+def _dialogue_history(history):
+    """Drop obsolete model denials of operational requests from AI context.
+
+    Classification is pure: do not call handle/organizer or mutate the complete
+    SQLite history. Only ordinary completed model conversations remain context.
+    """
+    selected = []
+    for index in range(0, len(history) - 1, 2):
+        question, answer = history[index:index + 2]
+        phrase = _intent_phrase(question["content"])
+        if (_desktop_information(phrase) is not None or _desktop_action(phrase) is not None
+                or _desktop_clarification(phrase) is not None):
+            continue
+        selected.extend((dict(question), dict(answer)))
+    return selected
+
+
+def _desktop_clarification(phrase):
+    body = _POLITE_REQUEST.sub("", phrase, count=1)
+    commandlike = bool(re.match(r"^(?:откр\w*|запус\w*|включ\w*|выключ\w*|закр\w*|удал\w*|выполн\w*|перезагруз\w*|заблокир\w*|свер\w*|развер\w*|open|launch|start|play|resume|close|delete|run|shutdown|restart|lock|hibernate|mute|unmute|minimize|maximize|/pc\w*)\b", body))
+    commandlike = commandlike or bool(re.match(r"^(?:сделай|увелич\w*|уменьш\w*|прибав\w*|убав\w*|громче|тише|volume|turn)\b", body)
+                                      and re.search(r"громк|громче|тише|звук|volume|sound|computer|laptop|\bpc\b", body))
+    nonrequest = bool(re.match(r"^(?:не\b|не надо\b|don't\b|do not\b|never\b|скажи\b|процитируй\b|цитата\b|в тексте\b|в документе\b|(?:он|она|я|ты) сказал\w*\b|мне сказали\b|the document\b|he said\b|she said\b|say\b|quote\b)", body)
+                      or any(mark in body for mark in ('"', "'", "`", "«", "»", "“", "”")))
+    if nonrequest and _ACTION_WORDS.search(body):
+        return "В этой формулировке есть отрицание, цитата или описание команды. Для выполнения пришли отдельную прямую просьбу, например «открой браузер»."
+    if commandlike or body in _APP_NAMES:
+        if re.search(r"музык|music|yandex|яндекс", body):
+            return "Уточни одно действие: «открой Яндекс Музыку» — открыть плеер; «включи музыку» — попробовать продолжить музыку."
+        if re.search(r"звук|громк|volume|sound", body):
+            return "Уточни управление звуком: «громче», «тише», «без звука» или «включи звук»."
+        if re.match(r"^(?:выключ\w*|перезагруз\w*|заблокир\w*|shut down|turn off|shutdown|restart|lock|hibernate|/pc\w*)\b", body):
+            return "Уточни действие с ноутбуком: например «выключи ноутбук» или «перезагрузи ноутбук». Для выполнения потребуется отдельное подтверждение в приложении."
+        return ("Укажи одно действие и приложение: «открой браузер», «открой Google Chrome» или «открой Яндекс Музыку». "
+                "Чтобы узнать доступные команды, спроси «что ты умеешь?».")
+    if re.match(r"^(?:что ты (?:умеешь|можешь)|расскажи что ты (?:умеешь|можешь)|what can you)\b", body):
+        return "Уточни вопрос о возможностях: например «что ты умеешь?» или «какие команды ты знаешь?»."
+    return None
 
 _UNITS = {
     "секунда": 1, "секунду": 1, "секунды": 1, "секунд": 1, "сек": 1, "second": 1, "seconds": 1,
@@ -373,7 +501,11 @@ class DesktopCore:
         canceled = re.fullmatch(r"(?:отмена|отмени|cancel|/cancel) ([a-f0-9]{32})", value)
         if canceled:
             return self.cancel(canceled[1])
-        action = ALIASES.get(value)
+        intent_phrase = _intent_phrase(text)
+        information = _desktop_information(intent_phrase)
+        if information is not None:
+            return self._answer(Reply(information))
+        action = _desktop_action(intent_phrase)
         if action in RISKY_ACTIONS:
             token = secrets.token_hex(16)
             self.store.create_confirmation(token, action, time.time())
@@ -478,6 +610,9 @@ class DesktopCore:
             notes = self.snapshot()["notes"]
             text = _note_previews(notes) if notes else "Заметок пока нет. Скажи «запомни» и свою мысль."
             return self._answer(Reply(text))
+        clarification = _desktop_clarification(intent_phrase)
+        if clarification is not None:
+            return self._answer(Reply(clarification))
         preferences = self.store.preferences()
         if preferences["local_chat_enabled"]:
             from desktop.chat import LocalChat, LocalChatTruncated, LocalChatUnavailable
@@ -488,7 +623,7 @@ class DesktopCore:
                 # note/task/PC-command/personal-data records or the current row.
                 client = LocalChat(preferences["local_chat_model"])
                 options = {"on_chunk": on_chunk} if on_chunk is not None else {}
-                history = self.store.model_chat_history(before_id=request_id) if preferences["local_chat_history"] else None
+                history = _dialogue_history(self.store.model_chat_history(before_id=request_id)) if preferences["local_chat_history"] else None
                 if preferences["local_chat_plan_context"] and _needs_plan_context(text, history):
                     options["plan_context"] = self._current_plan_context(preferences)
                 if history is not None:
