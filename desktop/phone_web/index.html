@@ -24,6 +24,19 @@
     </section>
     <div id="workspace" hidden>
       <nav class="tabs" aria-label="День плана"><button id="today-tab" class="selected" type="button" aria-pressed="true">Сегодня</button><button id="tomorrow-tab" type="button" aria-pressed="false">Завтра</button><button id="refresh" class="icon-button" type="button" aria-label="Обновить план">↻</button></nav>
+      <section class="card" id="remote-control"><h2>Команды ноутбука</h2>
+        <p id="control-status" class="muted" role="status">Удалённое управление не подключено. Нужны отдельный ключ и разрешение на ноутбуке.</p>
+        <form id="control-connect-form"><label for="control-key">Отдельный ключ управления</label><input id="control-key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" minlength="32" maxlength="256" required><button type="submit">Открыть управление</button></form>
+        <p class="muted">Этот ключ хранится только в текущей сессии вкладки. Команды доступны по списку; свободного запуска программного кода нет.</p>
+        <div id="control-workspace" hidden>
+          <div class="control-heading"><button id="control-refresh" class="secondary" type="button">Проверить доступ</button><button id="control-disconnect" class="secondary" type="button">Закрыть управление</button></div>
+          <h3>Разрешённые действия</h3><div id="control-actions" class="control-grid"></div>
+          <h3>Проекты</h3><div id="control-projects" class="control-grid"></div>
+          <h3>Приложения</h3><div id="control-apps" class="control-grid"></div>
+          <div id="control-confirmation" class="control-confirmation" hidden><p id="control-confirm-text"></p><p id="control-countdown" class="muted"></p><div class="control-heading"><button id="control-confirm" type="button">Подтвердить действие</button><button id="control-cancel" class="secondary" type="button">Отменить</button></div></div>
+        </div>
+        <p id="control-notice" class="notice" role="status" aria-live="polite"></p>
+      </section>
       <section class="card"><div class="section-heading"><h2 id="day-title">Твой план</h2><span class="muted">UTC+5</span></div><div id="items" aria-live="polite"></div><p class="muted">Отметки — с твоих слов. Отсутствие отметки означает «неизвестно».</p></section>
       <section class="card"><h2>Одно следующее дело</h2><form id="plan-form"><label for="plan-date">Когда</label><input id="plan-date" type="date" required><label for="plan-title">Что сделать</label><textarea id="plan-title" rows="2" maxlength="1000" placeholder="Например, разобрать одну тему по алгоритмам" required></textarea><button type="submit">Добавить в план</button></form></section>
       <section class="card"><h2>Недельный план зала</h2><form id="gym-form"><fieldset><legend>Выбери свои дни</legend><div class="weekdays"><label><input type="checkbox" name="weekday" value="0"><span>Пн</span></label><label><input type="checkbox" name="weekday" value="1"><span>Вт</span></label><label><input type="checkbox" name="weekday" value="2"><span>Ср</span></label><label><input type="checkbox" name="weekday" value="3"><span>Чт</span></label><label><input type="checkbox" name="weekday" value="4"><span>Пт</span></label><label><input type="checkbox" name="weekday" value="5"><span>Сб</span></label><label><input type="checkbox" name="weekday" value="6"><span>Вс</span></label></div></fieldset><label for="gym-time">Время, если уже выбрал</label><input id="gym-time" type="time"><p class="muted">Без времени Jarvis сохранит день без выдуманного часа. Если убрать все дни, недельное правило отключится.</p><button type="submit">Сохранить дни зала</button></form></section>

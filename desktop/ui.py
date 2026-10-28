@@ -4,8 +4,8 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QObject, QRunnable, QTime, Qt, QThreadPool, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QKeySequence, QLinearGradient, QPainter, QPen, QPixmap, QRadialGradient, QShortcut
+from PySide6.QtCore import QDate, QObject, QRunnable, QTime, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QKeySequence, QLinearGradient, QPainter, QPen, QPixmap, QRadialGradient, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDateEdit, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMenu, QPlainTextEdit, QPushButton, QScrollArea, QStackedWidget,
@@ -623,6 +623,9 @@ class MainWindow(QMainWindow):
         self._integration_workers = set()
         self._integration_busy = False
         self._phone_server = self._phone_delivery = None
+        self._retired_phone_servers = []
+        self._remote_controller = None
+        self._remote_configuration_pending = False
         self._phone_state, self._delivery_state = {}, {}
         self._phone_notifications = []
         self._phone_stop_complete = not self._integrations_enabled
@@ -751,7 +754,7 @@ class MainWindow(QMainWindow):
         side.addWidget(label("НА ЭТОМ КОМПЬЮТЕРЕ", "eyebrow"))
         side.addWidget(label("Задачи и заметки доступны\nбез интернета.", "muted", True))
         side.addSpacing(15)
-        side.addWidget(label("DESKTOP 4.3", "eyebrow"))
+        side.addWidget(label("DESKTOP 4.4", "eyebrow"))
         shell.addWidget(sidebar)
         content = QWidget()
         main = QVBoxLayout(content)
@@ -774,7 +777,10 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.plan)
         from desktop.control_panel import ControlsPanel
         self.controls = ControlsPanel(self.core, main_window=self, on_reply=self._reply,
-                                      remote_status={"status": "not_configured"})
+                                      remote_status=self._remote_status)
+        from desktop.remote_setup_ui import RemoteSetupPanel
+        self.remote_setup = RemoteSetupPanel(self.core, on_configured=self._apply_remote_setup)
+        self.controls.layout().addWidget(self.remote_setup)
         controls_scroll = QScrollArea()
         controls_scroll.setWidgetResizable(True)
         controls_scroll.setWidget(self.controls)
@@ -1357,20 +1363,99 @@ class MainWindow(QMainWindow):
         def initialize():
             from desktop.phone import OrganizerPhoneAdapter, PhoneServer
             from desktop.phone_delivery import PhoneDelivery
-            server = PhoneServer(api=OrganizerPhoneAdapter(self.core.organizer), state_dir=self.core.store.state_dir)
+            from desktop.remote_control import RemoteController
+            controller = RemoteController(self.core.store.state_dir,
+                action_handler=lambda action, **kwargs: self.core.request_control(action, source="remote", **kwargs),
+                project_catalog=self.core.projects, app_catalog=self.core.apps,
+                approved=self._remote_approved, project_editor=None)
+            server = PhoneServer(api=OrganizerPhoneAdapter(self.core.organizer),
+                                 state_dir=self.core.store.state_dir, remote=controller)
             delivery = PhoneDelivery(self.core.store.state_dir)
             if not self._quitting:
                 server.start()  # An absent/invalid opt-in leaves this disabled.
-            return server, delivery, server.status(), delivery.status()
+            return server, delivery, server.status(), delivery.status(), controller
 
         def ready(result):
-            self._phone_server, self._phone_delivery, self._phone_state, self._delivery_state = result
+            (self._phone_server, self._phone_delivery, self._phone_state,
+             self._delivery_state, self._remote_controller) = result
             if not self._quitting:
                 self._update_phone_status()
+                self.controls.refresh()
                 self._schedule_phone_work()
 
         self.phone_status.setText("Проверяю настройки локального моста…")
         self._run_integration(initialize, ready)
+
+    def _remote_approved(self):
+        # Pairing is a durable, separate permission. A phone away from home
+        # must not depend on the short-lived local Windows Hello grant.
+        try:
+            return (not self._quitting and not self.core._closed.is_set()
+                    and self.core.store.preferences().get("remote_control_approved") is True)
+        except Exception:
+            return False
+
+    def _remote_status(self):
+        controller = self._remote_controller
+        if controller is None:
+            return {"status": "not_configured", "approved": False}
+        state = controller.status()
+        return {"status": ("ready" if self._phone_state.get("running") else "unavailable")
+                if state.get("configured") else "not_configured",
+                "approved": state.get("approved") is True}
+
+    def _remote_setup_authorized(self):
+        try:
+            return (not self._quitting and self.core.owner.enabled is True
+                    and self.core.owner.allowed() is True)
+        except Exception:
+            return False
+
+    def _apply_remote_setup(self, origin):
+        """Commit an explicitly confirmed private route, then restart loopback.
+
+        Called by the setup panel only after a real Serve inspection. All file
+        and server work stays off Qt; neither a model nor imported text calls it.
+        """
+        from desktop.remote_setup_ui import _origin
+        if (not self._integrations_enabled or self._integration_busy or self._remote_configuration_pending
+                or not self._remote_setup_authorized() or _origin(origin) is None or _origin(origin) != origin):
+            return False
+        self._remote_configuration_pending = True
+
+        def configure():
+            try:
+                import os
+                from desktop.runtime_env import load_phone_environment, update_phone_environment
+                result = update_phone_environment(self.core.store.state_dir, origin=origin,
+                    phone_enabled=True, remote_enabled=True, authorization_guard=self._remote_setup_authorized)
+                if result not in {"updated", "preserved"} or not self._remote_setup_authorized():
+                    return False
+                load_phone_environment(self.core.store.state_dir)
+                os.environ.update({"JARVIS_PHONE_ENABLED": "1", "JARVIS_REMOTE_ENABLED": "1",
+                                   "JARVIS_PHONE_ORIGIN": origin})
+                if self._phone_server is not None:
+                    self._retired_phone_servers.append(self._phone_server)
+                    self._phone_server.stop()
+                return True
+            except Exception:
+                return False
+
+        def configured(accepted):
+            self._remote_configuration_pending = False
+            if self._quitting:
+                return
+            if accepted is True:
+                self._start_phone_integrations()
+                self.remote_setup.status_label.setText(
+                    "Частный HTTPS сохранён. Разреши удалённое управление выше, затем подключи iPhone. Получение команд телефоном ещё не проверено.")
+            else:
+                self.remote_setup.status_label.setText(
+                    "Не удалось подтвердить сохранение настройки. Проверь владельца и повтори настройку; готовность iPhone не подтверждена.")
+        started = self._run_integration(configure, configured)
+        if not started:
+            self._remote_configuration_pending = False
+        return started
 
     def _update_phone_status(self):
         # Project fixed labels only. Provider dictionaries can contain URLs;
@@ -1391,9 +1476,8 @@ class MainWindow(QMainWindow):
         self.phone_delivery_status.setText(telegram + "\n" + calls)
 
     def _open_phone_setup(self):
-        path = Path(__file__).resolve().parent.parent / "HANDSFREE.md"
-        if not path.is_file() or not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
-            self.status.setText("Инструкция HANDSFREE.md должна находиться в комплекте приложения.")
+        self.navigate(self.CONTROLS_PAGE)
+        self.remote_setup.refresh()
 
     def _poll_phone_integrations(self):
         if self._quitting or not self._integrations_enabled:
@@ -1977,9 +2061,18 @@ class MainWindow(QMainWindow):
 
     def _finish_close(self):
         if (self.pool.activeThreadCount() == 0 and not self._integration_workers
-                and self._phone_stop_complete and self.controls.shutdown_complete):
+                and self._integration_pool.activeThreadCount() == 0
+                and self._phone_stop_complete and self.controls.shutdown_complete
+                and self.remote_setup.shutdown_complete
+                and self._phone_handlers_drained()):
             self._close_timer.stop()
             self.close()
+
+    def _phone_handlers_drained(self):
+        self._retired_phone_servers = [server for server in self._retired_phone_servers
+                                      if not getattr(server, "shutdown_complete", True)]
+        return (not self._retired_phone_servers
+                and (self._phone_server is None or getattr(self._phone_server, "shutdown_complete", True)))
 
     def closeEvent(self, event):
         if not self._quitting and self.tray and self.preferences.get("close_to_tray", True):
@@ -1991,6 +2084,10 @@ class MainWindow(QMainWindow):
             return
         self._quitting = True
         self.controls.shutdown()
+        self.remote_setup.shutdown()
+        prevent = getattr(self._phone_server, "prevent_requests", None)
+        if callable(prevent):
+            prevent()
         if self._session_notifications_registered:
             from desktop.owner_auth import unregister_session_notifications
             unregister_session_notifications(int(self.winId()))
@@ -2014,8 +2111,10 @@ class MainWindow(QMainWindow):
         # Stop queued work immediately; let an already-running bounded adapter
         # finish without freezing the UI or closing its database under it.
         self.pool.clear()
-        if (self.pool.activeThreadCount() or self._integration_workers or not self._phone_stop_complete
-                or not self.controls.shutdown_complete):
+        if (self.pool.activeThreadCount() or self._integration_workers or self._integration_pool.activeThreadCount()
+                or not self._phone_stop_complete or not self.controls.shutdown_complete
+                or not self.remote_setup.shutdown_complete
+                or not self._phone_handlers_drained()):
             self.setEnabled(False)
             self.status.setText("Завершаю текущее действие. Микрофон выключен.")
             self._close_timer.start()

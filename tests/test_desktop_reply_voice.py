@@ -222,3 +222,13 @@ def test_old_reply_objects_without_cue_metadata_still_work(window):
     reply = SimpleNamespace(text="Совместимый ответ.", action=None, confirmation_id=None, speak=True)
     window._reply(reply)
     assert not window.voice.cues and window.voice.spoken[0][:2] == ("Совместимый ответ.", "clone")
+
+
+def test_expired_owner_confirmation_has_visible_and_selected_voice_feedback(window, monkeypatch):
+    window.core.owner.set_enabled(True)
+    monkeypatch.setattr(window.core.owner, "allowed", lambda: False)
+    reply = window.core.confirm("a" * 32)
+    window._reply(reply)
+    assert reply.speak is True
+    assert window.voice.spoken[0][:2] == (reply.text, "clone")
+    assert "Windows Hello" in reply.text and window.effects == []

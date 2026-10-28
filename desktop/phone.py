@@ -1,8 +1,8 @@
 """Opt-in loopback phone companion; HTTPS transport is configured separately.
 
-This adapter exposes only user-authored plans and explicit self-reports. It
-cannot dispatch PC actions, model tools, calls or push notifications. No server
-starts on import, and missing credentials leave the desktop fully functional.
+Plans and optional finite PC control use separate credentials. This transport
+never calls Core.handle or a model; the explicit remote controller owns action
+policy and one-use confirmations. No server starts on import.
 """
 from __future__ import annotations
 
@@ -15,14 +15,17 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import sqlite3
 import threading
 import time
+import unicodedata
 from urllib.parse import urlsplit
 
 
 MAX_BODY = 8192
 MAX_RESPONSE = 4 * 1024 * 1024
+_CONTROL_POSTS = {"/api/control", "/api/control/confirm", "/api/control/cancel"}
 _REJECT_DRAIN_LIMIT = MAX_BODY + 1
 _REJECT_DRAIN_SECONDS = 0.25
 _STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
@@ -146,22 +149,55 @@ class _LoopbackServer(ThreadingHTTPServer):
 
     def __init__(self, address, handler):
         self._slots = threading.BoundedSemaphore(12)
+        self._requests_lock, self._requests = threading.Lock(), {}
         super().__init__(address, handler)
+
+    @property
+    def drained(self):
+        with self._requests_lock:
+            for key, (_request, thread, done) in list(self._requests.items()):
+                if done and (thread is None or not thread.is_alive()):
+                    self._requests.pop(key)
+            return not self._requests
+
+    def interrupt_connections(self):
+        # Closing owned sockets releases partial-header/body reads. Running
+        # adapters finish under their own live authorization/deadline checks.
+        with self._requests_lock:
+            requests = [value[0] for value in self._requests.values()]
+        for request in requests:
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                request.close()
+            except OSError:
+                pass
 
     def process_request(self, request, address):
         if not self._slots.acquire(blocking=False):
             self.shutdown_request(request)
             return
+        _ = self.drained  # Prune completed thread records during normal use.
+        with self._requests_lock:
+            self._requests[id(request)] = (request, None, False)
         try:
             super().process_request(request, address)
         except Exception:
+            with self._requests_lock:
+                self._requests.pop(id(request), None)
             self._slots.release()
             raise
 
     def process_request_thread(self, request, address):
+        with self._requests_lock:
+            self._requests[id(request)] = (request, threading.current_thread(), False)
         try:
             super().process_request_thread(request, address)
         finally:
+            with self._requests_lock:
+                self._requests[id(request)] = (request, threading.current_thread(), True)
             self._slots.release()
 
     def handle_error(self, request, client_address):
@@ -198,8 +234,9 @@ def _origin(value):
 class PhoneServer:
     """Explicit start/stop; always bind 127.0.0.1, never expose a public socket."""
 
-    def __init__(self, api, state_dir, *, port=8767, environ=None):
+    def __init__(self, api, state_dir, *, port=8767, environ=None, remote=None):
         env = os.environ if environ is None else environ
+        self._environ = env
         token = env.get("JARVIS_PHONE_TOKEN", "")
         enabled = env.get("JARVIS_PHONE_ENABLED") == "1"
         valid_token = (isinstance(token, str) and re.fullmatch(r"[A-Za-z0-9_-]{32,256}", token)
@@ -209,7 +246,9 @@ class PhoneServer:
         self.enabled = bool(enabled and valid_token and (not requested_origin or self.origin))
         self._token_hash = hashlib.sha256(token.encode("utf-8")).digest() if self.enabled else None
         self.api, self.state_dir, self.port = api, Path(state_dir), port
+        self.remote = remote
         self._server = self._thread = self._store = None
+        self._stopping, self._retired = threading.Event(), []
         self._gate, self._lock = _RateGate(), threading.Lock()
         self._reason = "not_started" if self.enabled else "configuration_required"
 
@@ -225,8 +264,13 @@ class PhoneServer:
         with self._lock:
             if not self.enabled or self._server is not None:
                 return self.status()
+            if any(not server.drained for server in self._retired):
+                self._reason = "stopping"
+                return self.status()
+            self._retired.clear()
             server = None
             try:
+                self._stopping.clear()
                 if type(self.port) is not int or not 0 <= self.port <= 65535:
                     raise ValueError("port_invalid")
                 store = PhoneStore(self.state_dir)
@@ -243,15 +287,28 @@ class PhoneServer:
             return self.status()
 
     def stop(self):
+        self.prevent_requests()
         with self._lock:
             server, thread = self._server, self._thread
             self._server = self._thread = None
             if server:
+                self._retired.append(server)
                 server.shutdown()
+                server.interrupt_connections()
                 server.server_close()
             if thread:
                 thread.join(timeout=3)
             self._reason = "stopped" if self.enabled else "configuration_required"
+
+    def prevent_requests(self):
+        """Nonblocking admission revocation, including while provider I/O runs."""
+        self._stopping.set()
+
+    @property
+    def shutdown_complete(self):
+        with self._lock:
+            self._retired = [server for server in self._retired if not server.drained]
+            return self._stopping.is_set() and self._server is None and not self._retired
 
     def _handler(self):
         owner = self
@@ -326,10 +383,13 @@ class PhoneServer:
                         pass
 
             def _guard(self):
+                if owner._stopping.is_set():
+                    self._error(503, "server_stopping")
+                    return False
                 if len(self.path) > 2048 or sum(len(k) + len(v) for k, v in self.headers.items()) > 16384:
                     self._error(431, "request_limit")
                     return False
-                for name in ("Host", "Origin", "Authorization", "Content-Type", "Content-Length", "Idempotency-Key"):
+                for name in ("Host", "Origin", "Authorization", "Content-Type", "Content-Length", "Idempotency-Key", "X-Jarvis-Control"):
                     if len(self.headers.get_all(name, [])) > 1:
                         self._error(400, "duplicate_header")
                         return False
@@ -358,11 +418,40 @@ class PhoneServer:
                 return True
 
             def _authorized(self):
+                try:
+                    live_token = owner._environ.get("JARVIS_PHONE_TOKEN", "")
+                    live_origin = owner._environ.get("JARVIS_PHONE_ORIGIN", "")
+                    current = (owner._environ.get("JARVIS_PHONE_ENABLED") == "1"
+                        and isinstance(live_token, str) and re.fullmatch(r"[A-Za-z0-9_-]{32,256}", live_token)
+                        and owner._token_hash is not None
+                        and hmac.compare_digest(hashlib.sha256(live_token.encode("ascii")).digest(), owner._token_hash)
+                        and (not live_origin or _origin(live_origin) is not None)
+                        and _origin(live_origin) == owner.origin)
+                except Exception:
+                    current = False
+                if not current:
+                    self._error(401, "authorization_required")
+                    return False
                 value = self.headers.get("Authorization", "")
                 presented = value[7:] if value.startswith("Bearer ") and len(value) <= 263 else ""
                 digest = hashlib.sha256(presented.encode("utf-8")).digest()
                 if not presented or not hmac.compare_digest(digest, owner._token_hash):
                     self._error(401 if owner._gate.allow(failed_auth=True) else 429, "authorization_required")
+                    return False
+                return True
+
+            def _control_authorized(self):
+                if owner.remote is None:
+                    self._error(503, "control_unavailable")
+                    return False
+                presented = self.headers.get("X-Jarvis-Control", "")
+                try:
+                    accepted = (bool(re.fullmatch(r"[A-Za-z0-9_-]{32,256}", presented))
+                                and owner.remote.authorize(presented) is True)
+                except Exception:
+                    accepted = False
+                if not accepted:
+                    self._error(403 if owner._gate.allow(failed_auth=True) else 429, "control_authorization_required")
                     return False
                 return True
 
@@ -378,10 +467,21 @@ class PhoneServer:
                         return
                     self._send(200, value, content_type=content_type)
                     return
-                if self.path != "/api/plan":
+                if self.path not in {"/api/plan", "/api/control"}:
                     self._error(404, "not_found")
                     return
                 if not self._authorized():
+                    return
+                if self.path == "/api/control":
+                    if not self._control_authorized():
+                        return
+                    try:
+                        body = _json(_remote_snapshot(owner.remote.snapshot())).encode("utf-8")
+                        if len(body) > MAX_RESPONSE:
+                            raise ValueError("response_limit")
+                        self._send(200, body)
+                    except Exception:
+                        self._error(503, "control_unavailable")
                     return
                 try:
                     body = _json(owner.api.snapshot()).encode("utf-8")
@@ -394,8 +494,11 @@ class PhoneServer:
             def do_POST(self):
                 if not self._guard() or not self._authorized():
                     return
-                if self.path not in {"/api/report", "/api/plan", "/api/gym"}:
+                control = self.path in _CONTROL_POSTS
+                if self.path not in {"/api/report", "/api/plan", "/api/gym"} | _CONTROL_POSTS:
                     self._error(404, "not_found")
+                    return
+                if control and not self._control_authorized():
                     return
                 if self.headers.get("Transfer-Encoding") or self.headers.get("Content-Encoding"):
                     self._error(400, "encoding_refused")
@@ -421,7 +524,9 @@ class PhoneServer:
                         raise ValueError("incomplete_body")
                     payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_object,
                                          parse_constant=lambda _: (_ for _ in ()).throw(ValueError("constant_refused")))
-                    call, arguments = _validate(self.path, payload, owner.api)
+                    call, arguments = (_validate_control(self.path, payload, owner.remote,
+                                                        control_token=self.headers.get("X-Jarvis-Control", "")) if control
+                                       else _validate(self.path, payload, owner.api))
                     canonical = json.dumps(payload, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"))
                     fingerprint = hashlib.sha256((self.path + "\n" + canonical).encode("utf-8")).hexdigest()
                 except (ValueError, TypeError, UnicodeError, RecursionError):
@@ -430,7 +535,10 @@ class PhoneServer:
                 try:
                     outcome, cached = owner._store.claim(key, fingerprint, owner._token_hash.hex())
                     if outcome == "replay":
-                        self._send(cached[0], cached[1].encode("utf-8"), replay=True)
+                        if control:
+                            self._send(409, {"error": "result_uncertain"}, replay=True)
+                        else:
+                            self._send(cached[0], cached[1].encode("utf-8"), replay=True)
                         return
                     if outcome != "new":
                         self._error(507 if outcome == "full" else 409,
@@ -438,13 +546,28 @@ class PhoneServer:
                                      "uncertain": "result_uncertain"}[outcome])
                         return
                     try:
+                        if owner._stopping.is_set():
+                            raise RuntimeError("server_stopping")
+                        if not self._authorized():
+                            return
+                        if control and not self._control_authorized():
+                            return
                         result, status = call(**arguments), 200
+                        if control:
+                            try:
+                                result = _remote_result(result)
+                            except (ValueError, TypeError):
+                                raise RuntimeError("control_result_uncertain") from None
                     except ValueError:
-                        result, status = {"error": "plan_item_invalid"}, 400
+                        result, status = {"error": "control_request_invalid" if control else "plan_item_invalid"}, 400
                     except Exception:
-                        result, status = {"error": "operation_failed_inspect_plan"}, 503
+                        result, status = {"error": "control_result_uncertain" if control else "operation_failed_inspect_plan"}, 503
                     body = _json(result)
-                    owner._store.finish(key, status, body)
+                    # A remote challenge/result lives only in this response.
+                    # Durable replays can never recover a token or repeat an
+                    # action; even an apparently successful POST stays generic.
+                    owner._store.finish(key, 409 if control else status,
+                                        _json({"error": "result_uncertain"}) if control else body)
                     self._send(status, body.encode("utf-8"))
                 except Exception:
                     # The durable claim remains; a retry cannot repeat a possibly
@@ -458,6 +581,74 @@ class PhoneServer:
             do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS
 
         return Handler
+
+
+def _remote_alias(value):
+    return (isinstance(value, str) and 1 <= len(value) <= 80 and value == value.strip()
+            and not value.startswith((".", "-")) and not value.endswith(".")
+            and all(unicodedata.category(char)[0] in {"L", "M", "N"} or char in " ._-+" for char in value))
+
+
+def _remote_snapshot(value):
+    if not isinstance(value, dict):
+        raise ValueError("control_snapshot_invalid")
+    from desktop.actions import ALLOWED_ACTIONS
+    result = {key: value.get(key) is True for key in ("configured", "approved", "available")}
+    reason = value.get("reason")
+    result["reason"] = reason if isinstance(reason, str) and re.fullmatch(r"[a-z_]{1,64}", reason) else "unavailable"
+    result.update(actions=[], projects=[], apps=[])
+    if not result["available"]:
+        return result
+    for item in value.get("actions", [])[:100]:
+        if (isinstance(item, dict) and item.get("name") in ALLOWED_ACTIONS
+                and isinstance(item.get("title"), str) and 1 <= len(item["title"]) <= 200):
+            result["actions"].append({"name": item["name"], "title": item["title"],
+                                      "requires_confirmation": item.get("requires_confirmation") is True})
+    for key, maximum in (("projects", 200), ("apps", 100)):
+        for item in value.get(key, [])[:maximum]:
+            if isinstance(item, dict) and _remote_alias(item.get("name")):
+                aliases = item.get("aliases", [])
+                result[key].append({"name": item["name"], "aliases": [alias for alias in aliases[:10] if _remote_alias(alias)]
+                                    if isinstance(aliases, list) else []})
+    return result
+
+
+def _remote_result(value):
+    if not isinstance(value, dict):
+        raise ValueError("control_result_invalid")
+    from desktop.actions import ALLOWED_ACTIONS
+    status, text = value.get("status"), value.get("text")
+    challenge, expires = value.get("confirmation_id"), value.get("expires_in", 0)
+    if (type(value.get("ok")) is not bool or not isinstance(status, str) or not re.fullmatch(r"[a-z_]{1,64}", status)
+            or not isinstance(text, str) or not 1 <= len(text) <= 2000
+            or any(ord(char) < 32 and char not in "\n\t" for char in text)
+            or re.search(r"[A-Za-z]:[\\/]|\\\\|(?:https?|file)://|/(?:home|Users|tmp|etc)/", text, re.I)
+            or value.get("action") is not None and value["action"] not in ALLOWED_ACTIONS
+            or challenge is not None and (not isinstance(challenge, str) or not re.fullmatch(r"[a-f0-9]{32}", challenge))
+            or type(expires) is not int or not 0 <= expires <= 60 or challenge is not None and expires == 0):
+        raise ValueError("control_result_invalid")
+    return {"ok": value["ok"], "status": status, "text": text, "action": value.get("action"),
+            "confirmation_id": challenge, "expires_in": expires}
+
+
+def _validate_control(path, payload, remote, *, control_token):
+    if not isinstance(payload, dict):
+        raise ValueError("control_object_required")
+    if path == "/api/control":
+        if set(payload) != {"kind", "name"} or payload["kind"] not in ("action", "project", "app"):
+            raise ValueError("control_request_invalid")
+        if payload["kind"] == "action":
+            from desktop.actions import ALLOWED_ACTIONS
+            if not isinstance(payload["name"], str) or payload["name"] not in ALLOWED_ACTIONS:
+                raise ValueError("control_action_invalid")
+        elif not _remote_alias(payload["name"]):
+            raise ValueError("control_alias_invalid")
+        return lambda: remote.request(dict(payload), control_token=control_token), {}
+    if (set(payload) != {"token"} or not isinstance(payload["token"], str)
+            or not re.fullmatch(r"[a-f0-9]{32}", payload["token"])):
+        raise ValueError("control_confirmation_invalid")
+    return remote.confirm if path == "/api/control/confirm" else remote.cancel, {
+        "token": payload["token"], "control_token": control_token}
 
 
 def _validate(path, payload, api):

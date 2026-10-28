@@ -181,6 +181,7 @@ def test_rejected_drip_feed_has_one_absolute_deadline_not_per_byte_timeout(local
 def test_exact_configured_https_proxy_origin_allowed_without_claiming_verified_transport(local_phone):
     server, _ = local_phone
     server.origin = "https://jarvis.private.ts.net"
+    server._environ["JARVIS_PHONE_ORIGIN"] = server.origin
     assert request(server, headers={"Host": "jarvis.private.ts.net", "Origin": server.origin})[0] == 200
     assert request(server, headers={"Host": "jarvis.private.ts.net", "Origin": server.origin + ".evil"})[0] == 403
     assert server.status()["transport"] == "https_proxy_not_verified"

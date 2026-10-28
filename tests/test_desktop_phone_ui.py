@@ -43,8 +43,9 @@ class Server:
     configured = True
     transport = "loopback_only"
 
-    def __init__(self, api, state_dir):
+    def __init__(self, api, state_dir, *, remote=None):
         self.api, self.state_dir = api, Path(state_dir)
+        self.remote = remote
         self.started = self.stopped = False
         self.threads = [threading.get_ident()]
         type(self).instances.append(self)
@@ -160,6 +161,7 @@ def test_explicit_flag_configures_lifecycle_off_gui_thread_without_exposing_urls
     window = make_window(enabled=True)
     server, delivery = Server.instances[0], Delivery.instances[0]
     assert server.api.organizer is window.core.organizer
+    assert server.remote is window._remote_controller
     assert server.state_dir == window.core.store.state_dir
     assert server.started and not server.stopped
     assert all(thread_id != threading.get_ident() for thread_id in server.threads)
@@ -305,3 +307,109 @@ def test_capture_restart_refusal_does_not_leave_starting_status(app, make_window
     wait_for(app, lambda: not window._workers)
     assert not window.listening and not window._capture_requested
     assert "Микрофон не запущен" in window.status.text()
+
+
+def remote_environment(monkeypatch):
+    monkeypatch.setenv("JARVIS_PHONE_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_PHONE_TOKEN", "Synthetic_Phone_Secret_0123456789_AbCdEfGhIjKl")
+    monkeypatch.setenv("JARVIS_REMOTE_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_REMOTE_TOKEN", "Different_Control_Secret_9876543210_ZyXwVuTsRq")
+    monkeypatch.setenv("JARVIS_PHONE_ORIGIN", "https://laptop.example-network.ts.net")
+
+
+def test_paired_remote_access_survives_local_hello_expiry_but_not_revocation_or_exit(app, make_window, monkeypatch):
+    remote_environment(monkeypatch)
+    window = make_window(enabled=True)
+    owner = window.core.owner
+    owner.set_enabled(True)
+    monkeypatch.setattr(owner, "allowed", lambda: True)
+    assert window.core.approve_remote(True)
+    controller = window._remote_controller
+    effects = []
+    monkeypatch.setattr(window.core, "executor", lambda action: effects.append(action) or "Тестовый обработчик завершён.")
+    monkeypatch.setattr(owner, "allowed", lambda: False)
+    assert controller.status()["available"]
+    assert controller.request({"kind": "action", "name": "calculator"})["ok"]
+    assert effects == ["calculator"]
+    assert window.voice.spoken == []
+    assert window.core.approve_remote(False)
+    assert not controller.status()["available"]
+    controller.request({"kind": "action", "name": "calculator"})
+    assert effects == ["calculator"]
+    # Durable pairing remains after a normal exit; its live adapter gate does
+    # not accept any command during shutdown, even with the old key in RAM.
+    monkeypatch.setattr(owner, "allowed", lambda: True)
+    assert window.core.approve_remote(True)
+    path = window.core.store.state_dir
+    window.quit_application()
+    assert not controller.status()["available"]
+    wait_for(app, lambda: window._resources_closed)
+    from desktop.store import LocalStore
+    reopened = LocalStore(path)
+    try:
+        assert reopened.preferences()["remote_control_approved"] is True
+    finally:
+        reopened.close()
+    assert effects == ["calculator"]
+
+
+def test_phone_setup_navigation_uses_explicit_panel_without_opening_document(make_window, monkeypatch):
+    window = make_window()
+    calls = []
+    monkeypatch.setattr(window.remote_setup, "refresh", lambda: calls.append("status"))
+    window._open_phone_setup()
+    assert window._view_index == window.CONTROLS_PAGE and calls == ["status"]
+
+
+def test_private_route_configuration_requires_explicit_owner_and_private_origin(make_window, monkeypatch):
+    window = make_window(enabled=True)
+    monkeypatch.setattr(window.core.owner, "allowed", lambda: True)
+    assert not window._apply_remote_setup("https://laptop.example-network.ts.net")
+    window.core.owner.set_enabled(True)
+    for invalid in ("https://public.example", "https://laptop.example-network.ts.net/path", "http://laptop.example-network.ts.net", None):
+        assert not window._apply_remote_setup(invalid)
+    window._integration_busy = True
+    assert not window._apply_remote_setup("https://laptop.example-network.ts.net")
+    window._integration_busy = False
+    window._integrations_enabled = False
+    assert not window._apply_remote_setup("https://laptop.example-network.ts.net")
+    assert len(Server.instances) == 1
+
+
+def test_private_route_apply_writes_off_qt_and_restarts_only_owned_loopback(app, make_window, monkeypatch):
+    import desktop.runtime_env
+    remote_environment(monkeypatch)
+    window = make_window(enabled=True)
+    window.core.owner.set_enabled(True)
+    monkeypatch.setattr(window.core.owner, "allowed", lambda: True)
+    calls = []
+    def update(state_dir, **kwargs):
+        calls.append((state_dir, kwargs, threading.get_ident()))
+        assert kwargs["authorization_guard"]() is True
+        return "updated"
+    monkeypatch.setattr(desktop.runtime_env, "update_phone_environment", update)
+    previous = Server.instances[0]
+    origin = "https://laptop.another-network.ts.net"
+    assert window._apply_remote_setup(origin)
+    wait_for(app, lambda: len(Server.instances) == 2 and not window._integration_workers)
+    assert calls[0][0] == window.core.store.state_dir
+    assert calls[0][1]["origin"] == origin and calls[0][1]["remote_enabled"] is True
+    assert calls[0][2] != threading.get_ident()
+    assert previous.stopped and window._phone_server is Server.instances[1]
+    assert window._phone_server.started and window._phone_server.remote is window._remote_controller
+    assert os.environ["JARVIS_PHONE_ORIGIN"] == origin
+    assert not window._remote_configuration_pending
+    assert "ещё не проверено" in window.remote_setup.status_label.text()
+
+
+def test_failed_route_write_preserves_running_server_and_releases_retry(app, make_window, monkeypatch):
+    import desktop.runtime_env
+    window = make_window(enabled=True)
+    window.core.owner.set_enabled(True)
+    monkeypatch.setattr(window.core.owner, "allowed", lambda: True)
+    monkeypatch.setattr(desktop.runtime_env, "update_phone_environment", lambda *_args, **_kwargs: "refused")
+    assert window._apply_remote_setup("https://laptop.example-network.ts.net")
+    wait_for(app, lambda: not window._integration_workers)
+    assert len(Server.instances) == 1 and Server.instances[0].started and not Server.instances[0].stopped
+    assert not window._remote_configuration_pending
+    assert "Не удалось" in window.remote_setup.status_label.text()

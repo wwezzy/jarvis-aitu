@@ -780,7 +780,7 @@ def test_delayed_camera_stop_is_reported_honestly_until_completion(panel, app):
     assert panel.gesture_status.text() == "Камера выключена." and panel.gesture_toggle.isEnabled()
 
 
-def test_shutdown_stops_gestures_revokes_remote_and_blocks_future_dispatch(panel, app):
+def test_shutdown_stops_gestures_preserves_phone_pairing_and_blocks_future_dispatch(panel, app):
     enable_owner(panel)
     panel.gesture_toggle.setChecked(True)
     settled(app, panel)
@@ -790,7 +790,7 @@ def test_shutdown_stops_gestures_revokes_remote_and_blocks_future_dispatch(panel
     service.on_intent("volume_up")
     service.on_state("Камера включена.")
     app.processEvents()
-    assert not panel.core.remote and not panel.core.owner.verified
+    assert panel.core.remote and not panel.core.owner.verified
     assert panel.core.controls == [] and not panel.core.store.values["gestures_enabled"]
     assert not service.owner_gate(None)
 

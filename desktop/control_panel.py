@@ -749,10 +749,9 @@ class ControlsPanel(QWidget):
             self.core.owner.revoke()
         except Exception:
             pass
-        try:
-            self.core.approve_remote(False)
-        except Exception:
-            pass
+        # Phone pairing survives a normal application exit. Its separate live
+        # adapter gate blocks requests while quitting; explicit Revoke removes
+        # this durable consent. Hello and camera remain session-only grants.
 
     def closeEvent(self, event):
         self.shutdown()

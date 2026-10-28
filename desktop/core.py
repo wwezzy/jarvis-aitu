@@ -415,7 +415,7 @@ class DesktopCore:
         return True
 
     def approve_remote(self, enabled):
-        if type(enabled) is not bool or enabled and not (self.owner.enabled and self.owner.allowed()):
+        if self._closed.is_set() or type(enabled) is not bool or enabled and not (self.owner.enabled and self.owner.allowed()):
             return False
         self.store.set_preferences({"remote_control_approved": enabled})
         return True
@@ -576,6 +576,8 @@ class DesktopCore:
         return "\n".join(lines)
 
     def _execute(self, action: str) -> Reply:
+        if self._closed.is_set():
+            return Reply("Jarvis завершает работу. Повтори команду после запуска.", speak=False)
         if action not in ALLOWED_ACTIONS:
             return self._answer(Reply("Эта команда не входит в разрешенный список."))
         try:
@@ -771,8 +773,10 @@ class DesktopCore:
         return self._answer(Reply("Не распознал точную команду. " + HELP))
 
     def confirm(self, token: str, source: str = "button") -> Reply:
+        if self._closed.is_set():
+            return Reply("Jarvis завершает работу. Повтори команду после запуска.", speak=False)
         if self.owner.enabled and not self.owner.allowed():
-            return Reply("Подтверди владельца через Windows Hello перед выполнением.", speak=False)
+            return Reply("Подтверди владельца через Windows Hello перед выполнением.")
         if source not in {"button", "typed"}:
             return self._answer(Reply("Для этого действия требуется кнопка подтверждения или исходная текстовая команда. Голос не подтверждает управление питанием."))
         if not isinstance(token, str) or not re.fullmatch(r"[a-f0-9]{32}", token):
