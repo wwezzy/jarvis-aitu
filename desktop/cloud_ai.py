@@ -128,21 +128,36 @@ class _Budget:
                 tables = database.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
                 if identifier == 0 and version == 0 and not tables:
                     database.execute("""CREATE TABLE reservations (
-                        id TEXT PRIMARY KEY, day TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('chat','stt')),
+                        id TEXT PRIMARY KEY, day TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('chat','stt','speech')),
                         model TEXT NOT NULL, reserved INTEGER NOT NULL CHECK(reserved>0),
                         settled INTEGER CHECK(settled>=0), outcome TEXT NOT NULL DEFAULT 'unknown'
                         CHECK(outcome IN ('unknown','completed')),
                         input_tokens INTEGER, output_tokens INTEGER)""")
                     database.execute("CREATE INDEX reservation_day ON reservations(day)")
                     database.execute(f"PRAGMA application_id={_APPLICATION_ID}")
-                    database.execute("PRAGMA user_version=1")
+                    database.execute("PRAGMA user_version=2")
                     # A refused first reservation must not roll back the new
                     # schema and leave an unusable empty file. Publish only
                     # this validated empty ledger, then start its independent
                     # reservation transaction under the same bounded lock.
                     database.commit()
                     database.execute("BEGIN IMMEDIATE")
-                elif identifier != _APPLICATION_ID or version != 1:
+                elif identifier == _APPLICATION_ID and version == 1:
+                    # Retain every historical/unknown reservation while adding
+                    # speech to the same allowance. SQLite cannot alter CHECK.
+                    database.execute("ALTER TABLE reservations RENAME TO old_reservations")
+                    database.execute("""CREATE TABLE reservations (
+                        id TEXT PRIMARY KEY, day TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('chat','stt','speech')),
+                        model TEXT NOT NULL, reserved INTEGER NOT NULL CHECK(reserved>0),
+                        settled INTEGER CHECK(settled>=0), outcome TEXT NOT NULL DEFAULT 'unknown'
+                        CHECK(outcome IN ('unknown','completed')), input_tokens INTEGER, output_tokens INTEGER)""")
+                    database.execute("INSERT INTO reservations SELECT * FROM old_reservations")
+                    database.execute("DROP TABLE old_reservations")
+                    database.execute("CREATE INDEX reservation_day ON reservations(day)")
+                    database.execute("PRAGMA user_version=2")
+                    database.commit()
+                    database.execute("BEGIN IMMEDIATE")
+                elif identifier != _APPLICATION_ID or version != 2:
                     raise CloudBudgetExceeded("budget_unavailable")
                 with database:
                     yield database
@@ -165,7 +180,7 @@ class _Budget:
         try:
             with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=1)) as database:
                 if (database.execute("PRAGMA application_id").fetchone()[0] != _APPLICATION_ID
-                        or database.execute("PRAGMA user_version").fetchone()[0] != 1):
+                        or database.execute("PRAGMA user_version").fetchone()[0] not in {1, 2}):
                     raise CloudBudgetExceeded("budget_unavailable")
                 requests, used = self.totals(database, _day())
             return requests < maximum and used < budget
@@ -199,7 +214,7 @@ class _Budget:
         if path.exists():
             with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=1)) as database:
                 if (database.execute("PRAGMA application_id").fetchone()[0] != _APPLICATION_ID
-                        or database.execute("PRAGMA user_version").fetchone()[0] != 1):
+                        or database.execute("PRAGMA user_version").fetchone()[0] not in {1, 2}):
                     raise CloudBudgetExceeded("budget_unavailable")
                 requests, used = self.totals(database, day)
         return {"date": day, "timezone": "UTC+5", "requests": requests,
