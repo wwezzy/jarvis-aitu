@@ -160,6 +160,12 @@ def _audio_16k(values, sample_rate):
 
 
 def _speech_window(vad, waveform):
+    """Gate non-speech without cropping the already bounded command.
+
+    Low voices can cross the VAD threshold after speech has started. Using
+    that first positive frame as an ASR boundary loses quiet initial words.
+    The input contract already limits the complete waveform to 12 seconds.
+    """
     import numpy as np
 
     padding = (-len(waveform)) % 512
@@ -175,8 +181,7 @@ def _speech_window(vad, waveform):
     indices = np.flatnonzero(voiced)
     if len(indices) < 6 or not np.any(np.convolve(voiced.astype(int), np.ones(3, dtype=int), mode="valid") >= 3):
         raise MultilingualSTTUnavailable("no_speech")
-    start, end = max(0, int(indices[0]) * 512 - 1280), min(len(waveform), (int(indices[-1]) + 1) * 512 + 1280)
-    return waveform[start:end], len(indices) * 512 / 16000
+    return waveform, len(indices) * 512 / 16000
 
 
 def _features(waveform, filters):

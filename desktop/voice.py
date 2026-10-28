@@ -9,12 +9,15 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import itertools
+import math
 from collections import deque
 from contextlib import ExitStack
+from array import array
 import json
 import os
 import queue
 import re
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -25,6 +28,33 @@ from desktop.model_setup import default_model_dir, model_ready
 
 _PREPARE_SPEECH = object()
 SPEECH_ECHO_TAIL = 0.25
+VOSK_ALIAS_CONFIDENCE = 0.90
+CLONE_READY_TIMEOUT = 30.0
+
+
+def pcm_active(data):
+    """An acoustic buffer trigger, never a wake/intent decision.
+
+    Use zero-mean energy so silence and a DC offset do not start an utterance.
+    Only an exact recognized wake can send these bounded samples to Whisper.
+    """
+    if not isinstance(data, bytes) or len(data) < 4 or len(data) % 2:
+        return False
+    values = array("h")
+    values.frombytes(data)
+    if sys.byteorder != "little":
+        values.byteswap()
+    mean = sum(values) / len(values)
+    variance = max(0, sum(value * value for value in values) / len(values) - mean * mean)
+    return math.sqrt(variance) / 32768 >= 0.002
+
+
+def strip_wake_prefix(text):
+    text = text.strip()
+    first = re.search(r"\w+", text, flags=re.UNICODE)
+    if first and first.group().casefold() in WakeGate.WAKE:
+        return text[first.end():].lstrip(" \t\r\n,.!?;:—-«»“”\"'()[]").rstrip(" \t\r\n«»“”\"'()[]")
+    return text
 
 
 def select_windows_voice(speaker, client):
@@ -95,12 +125,14 @@ class UtteranceBuffer:
     """
     def __init__(self, sample_rate):
         self.maximum = sample_rate * 2 * 12
+        self.silence_limit = int(sample_rate * 2 * 0.6)
         self.reset()
 
     def reset(self):
         self._preroll = deque(maxlen=20)
         self._frames = []
         self._bytes = 0
+        self._silence = 0
         self.started = self.overflow = False
 
     def append(self, data, *, active):
@@ -120,6 +152,11 @@ class UtteranceBuffer:
         if self._bytes > self.maximum:
             self._frames.clear()
             self.overflow = True
+        self._silence = 0 if active else self._silence + len(data)
+
+    @property
+    def finished(self):
+        return self.started and self._silence >= self.silence_limit
 
     def pcm(self):
         return b"".join(self._frames) if self.started and not self.overflow else None
@@ -139,17 +176,26 @@ class WakeGate:
         self.deadline = 0.0
 
     def extend(self, now: float):
-        if self.deadline:
+        if self.deadline and now <= self.deadline:
             self.deadline = now + self.timeout
+        elif self.deadline:
+            self.reset()
+
+    @classmethod
+    def is_cancel(cls, text):
+        return text.casefold().replace("ё", "е").strip(" \t\r\n,.!?;:«»“”\"'()[]") in cls.CANCEL
 
     def feed(self, text: str, now: float) -> WakeDecision:
         text = re.sub(r"\s+", " ", text.strip().lower().replace("ё", "е"))
+        if self.deadline and now > self.deadline:
+            self.reset()
         words = re.findall(r"[\w]+", text, flags=re.UNICODE)
         if not words:
             return WakeDecision("ignore")
         # A name buried inside a sentence is not a command invocation.
         if words[0] in self.WAKE:
-            rest = re.sub(r"^[\w]+[\s,:.!?—-]*", "", text).strip()
+            first = re.search(r"\w+", text, flags=re.UNICODE)
+            rest = text[first.end():].lstrip(" \t\r\n,.!?;:—-«»“”\"'()[]").rstrip(" \t\r\n«»“”\"'()[]")
             if not rest:
                 self.deadline = now + self.timeout
                 return WakeDecision("wake")
@@ -159,7 +205,7 @@ class WakeGate:
             self.reset()
             return WakeDecision("ignore")
         self.reset()
-        if text in self.CANCEL:
+        if self.is_cancel(text):
             return WakeDecision("cancel")
         return WakeDecision("command", text)
 
@@ -197,6 +243,7 @@ class VoiceService:
         self._halt_speech = threading.Event()
         self._closed = threading.Event()
         self._speech_generation = 0
+        self._waiting_clone = threading.Event()
         self._last_spoken = 0.0
         self._lock = threading.Lock()
 
@@ -274,23 +321,39 @@ class VoiceService:
             self.gate.reset()
             self._audio_epoch += 1
 
-    def _decode_command(self, text, pcm=None, sample_rate=None):
-        if not self.multilingual_stt_enabled or pcm is None or self._stt is None:
-            return text
-        # Existing exact utilities keep their fast, offline Vosk route. A
-        # recognizer does not create capabilities; DesktopCore still owns the
-        # finite action policy and all power confirmations.
+    @staticmethod
+    def _confident_alias(full_text, command, words):
         from desktop.core import ALIASES, normalize
-        if normalize(text) in ALIASES:
+        if normalize(command) not in ALIASES or not isinstance(words, list) or not words:
+            return False
+        recognized = []
+        for word in words:
+            if not isinstance(word, dict) or not isinstance(word.get("word"), str):
+                return False
+            confidence = word.get("conf")
+            if (type(confidence) not in {int, float} or not math.isfinite(confidence)
+                    or not VOSK_ALIAS_CONFIDENCE <= confidence <= 1):
+                return False
+            recognized.append(word["word"])
+        return normalize(" ".join(recognized)) == normalize(full_text)
+
+    def _decode_command(self, text, pcm=None, sample_rate=None, *, confident=False):
+        if not self.multilingual_stt_enabled or self._stt is None:
             return text
+        # Text equality alone is not acoustic confidence. Only the caller's
+        # validated final Vosk word scores permit the finite utility shortcut.
+        if confident:
+            return text
+        if pcm is None:
+            self._emit(self.on_state, "Недостаточно аудио для уверенного распознавания. Повтори команду.")
+            return None
         self._transcribing.set()
         self._clear_audio()
         try:
             decoded = self._stt.transcribe(pcm, sample_rate)
             if self._stop.is_set() or self._closed.is_set():
                 return None
-            decoded = re.sub(r"^(?:джарвис|джарвиз|jarvis)[,.!?\s:—-]+", "", decoded.strip(), flags=re.I)
-            return decoded or None
+            return strip_wake_prefix(decoded)
         except Exception:
             self._emit(self.on_state, "Не удалось уверенно распознать команду. Повтори её или напиши текстом.")
             return None
@@ -298,18 +361,53 @@ class VoiceService:
             self._clear_audio()
             self._transcribing.clear()
 
-    def _recognized(self, text: str, pcm=None, sample_rate=None):
+    def _recognized(self, text: str, pcm=None, sample_rate=None, *, words=None):
         if (self._stop.is_set() or self._speaking.is_set()
                 or time.monotonic() - self._last_spoken < SPEECH_ECHO_TAIL):
             return
-        result = self.gate.feed(text, time.monotonic())
+        now = time.monotonic()
+        previous_deadline = self.gate.deadline
+        armed = bool(previous_deadline and now <= previous_deadline)
+        result = self.gate.feed(text, now)
+        first = re.search(r"\w+", text, flags=re.UNICODE)
+        verified_wake = bool(first and first.group().casefold() in WakeGate.WAKE)
+        retry_deadline = now + self.gate.timeout if verified_wake else previous_deadline if armed else 0
+        bilingual_audio = self.multilingual_stt_enabled and self._stt is not None and pcm is not None
+        # A Russian decoder can produce an empty string for an English phrase.
+        # Only a still-armed, previously verified wake allows its audio through.
+        if result.kind == "ignore" and armed and bilingual_audio and not text.strip():
+            self.gate.reset()
+            result = WakeDecision("command", "")
+        if result.kind == "command" and WakeGate.is_cancel(result.text):
+            self.gate.reset()
+            result = WakeDecision("cancel")
+        acknowledged = result.kind == "wake"
         if result.kind == "wake":
             self._emit(self.on_state, "Слушаю команду…")
             self.say("Да, сэр")
-        elif result.kind == "command":
+            if not bilingual_audio:
+                return
+            # The same utterance can contain a command that Vosk omitted after
+            # the recognized name. Keep the original fixed ACK immediate.
+        if result.kind in {"wake", "command"}:
             self._emit(self.on_state, "Обрабатываю команду…")
-            decoded = self._decode_command(result.text, pcm, sample_rate)
-            if decoded is not None and not self._stop.is_set() and not self._closed.is_set():
+            confident = result.kind == "command" and self._confident_alias(text, result.text, words)
+            decoded = self._decode_command(result.text if result.kind == "command" else text,
+                                           pcm, sample_rate, confident=confident)
+            if self._stop.is_set() or self._closed.is_set():
+                return
+            if decoded is None or not decoded.strip():
+                # A failed decoder cannot keep extending authorization. Retry
+                # uses the original finite window, never a fresh ten seconds.
+                self.gate.deadline = retry_deadline if time.monotonic() <= retry_deadline else 0
+                if decoded == "" and not acknowledged:
+                    self._emit(self.on_state, "Слушаю команду…")
+                    self.say("Да, сэр")
+                return
+            self.gate.reset()
+            if WakeGate.is_cancel(decoded):
+                self._emit(self.on_state, "Ожидаю слово «Джарвис»")
+            else:
                 self._emit(self.on_text, decoded)
         elif result.kind == "cancel":
             self._emit(self.on_state, "Ожидаю слово «Джарвис»")
@@ -335,6 +433,9 @@ class VoiceService:
             device = sound.query_devices(kind="input")
             sample_rate = int(device["default_samplerate"])
             recognizer = vosk.KaldiRecognizer(model, sample_rate)
+            set_words = getattr(recognizer, "SetWords", None)
+            if callable(set_words):
+                set_words(True)
             if self._stop.is_set():
                 return
             with sound.RawInputStream(samplerate=sample_rate, blocksize=max(400, int(sample_rate * 0.05)),
@@ -363,14 +464,23 @@ class VoiceService:
                     complete = recognizer.AcceptWaveform(data)
                     result = json.loads(recognizer.Result()) if complete else None
                     if self.multilingual_stt_enabled:
-                        text = result.get("text", "") if complete else json.loads(recognizer.PartialResult()).get("partial", "")
-                        utterance.append(data, active=bool(text))
-                    if complete:
+                        utterance.append(data, active=pcm_active(data))
+                        if not complete and utterance.finished:
+                            result = json.loads(recognizer.FinalResult())
+                            complete = True
+                    if complete or utterance.overflow:
+                        result = result or {"text": ""}
                         if utterance.overflow:
+                            first = re.search(r"\w+", result.get("text", ""), flags=re.UNICODE)
+                            invoked = bool(first and first.group().casefold() in WakeGate.WAKE)
+                            was_armed = bool(self.gate.deadline and time.monotonic() <= self.gate.deadline)
                             self.gate.reset()
-                            self._emit(self.on_state, "Фраза слишком длинная. Повтори короткую команду после «Джарвис».")
+                            if invoked or was_armed:
+                                self._emit(self.on_state, "Фраза слишком длинная. Повтори короткую команду после «Джарвис».")
                         else:
-                            self._recognized(result.get("text", ""), utterance.pcm(), sample_rate)
+                            self._recognized(result.get("text", ""), utterance.pcm(), sample_rate,
+                                             words=result.get("result"))
+                        recognizer.Reset()
                         utterance.reset()
         except Exception as error:
             self._emit(self.on_state, f"Голос недоступен ({type(error).__name__}). Текстовый ввод работает.")
@@ -447,6 +557,11 @@ class VoiceService:
     def say(self, text: str):
         """Speak bounded plain text. UI labels/Markdown are not read as dialogue."""
         text = self._speech_text(text)
+        if (self.speech_engine == "clone" and self._waiting_clone.is_set()
+                and text.casefold().rstrip(".!?") in {"да сэр", "да, сэр"}):
+            # A wake acknowledgment must not sit behind an old dynamic reply
+            # waiting for its preferred model. Keep one output worker only.
+            self.interrupt()
         if text:
             self._enqueue_speech(text)
 
@@ -487,6 +602,21 @@ class VoiceService:
         return (generation == self._speech_generation and not self._closed.is_set()
                 and self.speech_enabled and self.speech_engine == engine
                 and self.speech_character == character)
+
+    def _wait_for_clone(self, backend, generation, character, validator):
+        """Wait off-GUI without holding a lifecycle/request lock."""
+        deadline = time.monotonic() + CLONE_READY_TIMEOUT
+        self._waiting_clone.set()
+        try:
+            while self._backend_current(generation, "clone", character) and _event_current(validator):
+                if backend.is_ready:
+                    return True
+                if not getattr(backend, "is_warming", False) or time.monotonic() >= deadline:
+                    return False
+                self._closed.wait(0.05)
+            return False
+        finally:
+            self._waiting_clone.clear()
 
     def _play_pcm_stream(self, chunks, *, is_current=None):
         """Keep one audio stream open while the isolated voice yields PCM."""
@@ -544,7 +674,7 @@ class VoiceService:
     def _speak_loop(self):
         # Neural synthesis and COM remain on this one worker. Fallback COM is
         # lazy: an unavailable Windows voice cannot prevent neural speech.
-        initialized, speaker, pythoncom, neural, neural_key, fallback = False, None, None, None, None, None
+        initialized, speaker, pythoncom, neural, neural_key = False, None, None, None, None
         try:
             while True:
                 item = self._speech.get()
@@ -592,14 +722,11 @@ class VoiceService:
                             if isinstance(text, str) and text.casefold().rstrip(".!?") in {"да сэр", "да, сэр"}:
                                 fixed_audio = neural.fixed_ack("ru")
                             use_neural = fixed_audio is not None or neural.is_ready
-                            if use_neural:
-                                renderer = neural
-                            elif text is not _PREPARE_SPEECH:
-                                if fallback is None:
-                                    from desktop.expressive_speech import ExpressiveSpeech
-                                    fallback = ExpressiveSpeech(voice="eugene", personal_use=True)
-                                use_neural = fallback.prepare(rate=speech_rate)
-                                renderer = fallback
+                            renderer = neural
+                            if not use_neural and text is not _PREPARE_SPEECH:
+                                self.speech_backend = "clone_warming"
+                                self._emit(self.on_state, "Голос по образцу готовится. Ответ доступен текстом.")
+                                use_neural = self._wait_for_clone(neural, generation, character, validator)
                         else:
                             use_neural = neural.prepare(rate=speech_rate)
                             renderer = neural
@@ -607,12 +734,20 @@ class VoiceService:
                         use_neural = False
                 if not _event_current(validator):
                     continue
+                if engine == "clone" and text is not _PREPARE_SPEECH and not use_neural:
+                    if self._backend_current(generation, engine, character):
+                        warming = bool(neural is not None and getattr(neural, "is_warming", False))
+                        self.speech_backend = "clone_warming" if warming else "clone_unavailable"
+                        self._emit(self.on_state, "Голос по образцу ещё готовится. Ответ показан текстом." if warming else
+                                   "Выбранный голос недоступен. Ответ показан текстом.")
+                    continue
                 with self._lock:
                     if generation != self._speech_generation or self._closed.is_set() or not self.speech_enabled:
                         continue
                     if text is _PREPARE_SPEECH:
                         if engine == "clone":
-                            self.speech_backend = "clone" if use_neural else "clone_warming"
+                            self.speech_backend = ("clone" if use_neural else "clone_warming"
+                                                   if neural is not None and getattr(neural, "is_warming", False) else "clone_unavailable")
                         else:
                             self.speech_backend = ("expressive" if engine == "expressive" else "neural") if use_neural else "windows"
                         continue
@@ -648,6 +783,10 @@ class VoiceService:
                                 continue
                             if self._utterance_audio_started:
                                 self._emit(self.on_state, "Озвучивание прервалось. Полный ответ остаётся на экране.")
+                                continue
+                            if engine == "clone":
+                                self.speech_backend = "clone_unavailable"
+                                self._emit(self.on_state, "Выбранный голос недоступен. Ответ показан текстом.")
                                 continue
                             self._emit(self.on_state, "Нейроголос недоступен. Использую голос Windows.")
                     if speaker is None:

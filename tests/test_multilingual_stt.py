@@ -170,6 +170,61 @@ def test_resampler_preserves_speech_tone_and_suppresses_downsample_aliases():
     assert np.sqrt(np.mean(high[100:-100] ** 2)) < np.sqrt(np.mean(low ** 2)) / 20
 
 
+@pytest.mark.parametrize("seconds", [1.2, 12.0], ids=["brief-command", "maximum-command"])
+def test_delayed_positive_vad_preserves_initial_speech_and_entire_bounded_input(monkeypatch, tmp_path, seconds):
+    np = pytest.importorskip("numpy")
+    observed = []
+    pcm = tone(seconds=seconds, frequency=180)
+    expected = stt._audio_16k(stt._pcm_samples(pcm, 16000), 16000)
+
+    class DelayedVAD:
+        def run(self, _, inputs):
+            count = inputs["input"].shape[0]
+            probabilities = np.zeros(count, dtype="float32")
+            # The real low-voice sample crossed 0.55 only after 608ms, even
+            # though its initial words were audible before that boundary.
+            probabilities[19:30] = 0.9
+            return probabilities, None, None
+
+    def features(waveform, _):
+        observed.append(waveform.copy())
+        return "features"
+
+    model = SimpleNamespace(encode=lambda _: "encoded",
+        detect_language=lambda _: [[("<|ru|>", 0.99)]],
+        generate=lambda *_args, **_kwargs: [SimpleNamespace(sequences_ids=[[10, 11]],
+                                                           scores=[-0.2], no_speech_prob=0.01)])
+    tokenizer = SimpleNamespace(token_to_id=lambda _: 1,
+        decode=lambda *_args, **_kwargs: "Сэр, я на связи.")
+    monkeypatch.setitem(sys.modules, "ctranslate2", SimpleNamespace(StorageView=SimpleNamespace(from_array=lambda value: value)))
+    monkeypatch.setattr(stt, "_features", features)
+    instance = stt.MultilingualSTT(tmp_path)
+    instance._backend = stt._Backend(model, tokenizer, DelayedVAD(), None)
+    assert instance.transcribe(pcm, 16000) == "Сэр, я на связи."
+    assert len(observed) == 1
+    np.testing.assert_array_equal(observed[0], expected)
+    assert len(observed[0]) == round(seconds * 16000)
+    assert np.any(observed[0][:8000] != 0)
+
+
+@pytest.mark.parametrize("positive_frames", [0, 1, 3], ids=["noise-only", "one-spike", "brief-spike"])
+def test_vad_rejects_non_silent_noise_and_short_spikes_before_whisper(monkeypatch, positive_frames):
+    np = pytest.importorskip("numpy")
+    noise = np.random.default_rng(2026).normal(0, 1500, 16000).round().astype("<i2").tobytes()
+    values = stt._pcm_samples(noise, 16000)
+
+    class NoiseVAD:
+        def run(self, _, inputs):
+            probabilities = np.zeros(inputs["input"].shape[0], dtype="float32")
+            probabilities[10:10 + positive_frames] = 0.9
+            return probabilities, None, None
+
+    monkeypatch.setitem(sys.modules, "ctranslate2", SimpleNamespace())
+    monkeypatch.setattr(stt, "_features", lambda *_: pytest.fail("Non-speech must not reach Whisper"))
+    with pytest.raises(stt.MultilingualSTTUnavailable, match="^no_speech$"):
+        stt._decode(stt._Backend(None, None, NoiseVAD(), None), values, 16000)
+
+
 @pytest.fixture
 def tiny_assets(monkeypatch):
     assets = {"config.json": b"{}", "model.bin": b"official fixture weights"}

@@ -325,7 +325,7 @@ def test_idle_hours_do_not_overflow_the_next_bilingual_utterance():
     assert not audio.overflow and audio.pcm() is None
 
 
-def test_bilingual_decoder_only_runs_after_explicit_wake_and_never_for_fast_alias(tmp_path, monkeypatch):
+def test_bilingual_decoder_only_runs_after_explicit_wake_and_scored_fast_alias(tmp_path, monkeypatch):
     service = VoiceService(lambda _: None, lambda _: None, tmp_path)
     service.multilingual_stt_enabled = True
     calls, heard = [], []
@@ -334,7 +334,8 @@ def test_bilingual_decoder_only_runs_after_explicit_wake_and_never_for_fast_alia
     monkeypatch.setattr(service, "say", lambda _: None)
     service._recognized("посторонний разговор", b"raw", 16000)
     assert calls == [] and heard == []
-    service._recognized("джарвис открой калькулятор", b"raw", 16000)
+    service._recognized("джарвис открой калькулятор", b"raw", 16000,
+                        words=[{"word": word, "conf": 0.99} for word in "джарвис открой калькулятор".split()])
     assert calls == [] and heard == ["открой калькулятор"]
     service._recognized("джарвис какой план", b"raw", 16000)
     assert calls == [16000] and heard[-1] == "what is my plan for tomorrow?"

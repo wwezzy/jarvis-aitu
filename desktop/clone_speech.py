@@ -240,6 +240,12 @@ class CloneSpeech:
             return bool(self._ready and not self._closed.is_set()
                         and self._process is not None and self._process.poll() is None)
 
+    @property
+    def is_warming(self):
+        """Report preparation without waiting for the synthesis request lock."""
+        with self._state_lock:
+            return bool(self._warming and not self._closed.is_set())
+
     def fixed_ack(self, language="ru"):
         """Small local cue only; never waits on neural preparation/request lock."""
         if not self.personal_use or self._closed.is_set() or not isinstance(language, str) or language not in {"ru", "en"}:

@@ -16,6 +16,16 @@ import pytest
 from desktop import clone_speech as clone
 
 
+def test_public_warming_status_stops_immediately_on_close(tmp_path):
+    speech = clone.CloneSpeech(tmp_path/'absent.json', personal_use=True)
+    assert speech.is_warming is False
+    with speech._state_lock:
+        speech._warming = True
+    assert speech.is_warming is True
+    speech.close()
+    assert speech.is_warming is False
+
+
 def wav(path, *, channels=1, rate=24000, frames=2400):
     with wave.open(str(path), "wb") as target:
         target.setnchannels(channels)
