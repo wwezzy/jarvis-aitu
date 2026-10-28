@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+import threading
+import weakref
 
 from PySide6.QtCore import QDate, QObject, QRunnable, QTime, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QKeySequence, QLinearGradient, QPainter, QPen, QPixmap, QRadialGradient, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDateEdit, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMenu, QPlainTextEdit, QPushButton, QScrollArea, QStackedWidget,
-    QSlider, QSpinBox, QSystemTrayIcon, QTimeEdit, QVBoxLayout, QWidget,
+    QSlider, QSpinBox, QSystemTrayIcon, QTabWidget, QTimeEdit, QVBoxLayout, QWidget,
 )
 
 
@@ -147,6 +149,7 @@ class Events(QObject):
     voice_state = Signal(str)
     progress = Signal(str)
     stream_chunk = Signal(int, str)
+    cue_finished = Signal(int, str, bool)
 
 
 class WorkerSignals(QObject):
@@ -159,8 +162,10 @@ class Worker(QRunnable):
         super().__init__()
         self.function = function
         self.signals = WorkerSignals()
+        self.started = threading.Event()
 
     def run(self):
+        self.started.set()
         try:
             self.signals.done.emit(self.function())
         except Exception as error:
@@ -613,10 +618,19 @@ class MainWindow(QMainWindow):
         self.core = core
         self.model_dir = model_dir
         self.personal_path = personal_path
-        self.events = Events()
+        self.events = Events(self)
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(1)
         self._workers = set()
+        # Only positively classified conversational requests use this lane.
+        # Keep one running request and one latest replacement, never a growing
+        # queue of model calls. OS/confirmation work stays on the original lane.
+        self._chat_pool = QThreadPool(self)
+        self._chat_pool.setMaxThreadCount(1)
+        self._chat_active = self._pending_chat = self._active_request = None
+        self._action_request = None
+        self._foreground_request_id = 0
+        self._morning_followup = None
         self._integrations_enabled = bool(enable_integrations)
         self._integration_pool = QThreadPool(self)
         self._integration_pool.setMaxThreadCount(1)
@@ -671,6 +685,7 @@ class MainWindow(QMainWindow):
         self.events.voice_state.connect(self._voice_state)
         self.events.progress.connect(self._model_progress)
         self.events.stream_chunk.connect(self._receive_stream_chunk)
+        self.events.cue_finished.connect(self._cue_completed, Qt.ConnectionType.QueuedConnection)
         self.voice = self._new_voice()
         if enable_tray and QSystemTrayIcon.isSystemTrayAvailable():
             self.tray = QSystemTrayIcon(self.windowIcon(), self)
@@ -868,10 +883,17 @@ class MainWindow(QMainWindow):
         command_row.addWidget(self.command, 1)
         self.send_button = button("Отправить", self.submit_current, "primary")
         command_row.addWidget(self.send_button)
+        self.stop_response_button = button("Стоп", self.stop_response, "quiet")
+        self.stop_response_button.setObjectName("stopResponseButton")
+        self.stop_response_button.setToolTip("Отменить ответ ИИ и остановить озвучку")
+        command_row.addWidget(self.stop_response_button)
         self.mic_button = button("Микрофон", self.toggle_listening)
         self.mic_button.setObjectName("microphoneButton")
         command_row.addWidget(self.mic_button)
         layout.addLayout(command_row)
+        self.request_hint = label("", "muted", True)
+        self.request_hint.hide()
+        layout.addWidget(self.request_hint)
         return page
 
     def _tasks_page(self):
@@ -906,7 +928,19 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(label("Заметки", "title"))
-        layout.addWidget(label("Сохраните мысль сейчас — найдите, когда понадобится.", "subtitle"))
+        self.note_tabs = QTabWidget()
+        layout.addWidget(self.note_tabs, 1)
+        from desktop.obsidian_ui import ObsidianPanel
+        self.obsidian_panel = ObsidianPanel(self.core)
+        obsidian_scroll = QScrollArea()
+        obsidian_scroll.setWidgetResizable(True)
+        obsidian_scroll.setWidget(self.obsidian_panel)
+        self.note_tabs.addTab(obsidian_scroll, "Obsidian")
+        legacy = QWidget()
+        self.note_tabs.addTab(legacy, "Прежние заметки")
+        layout = QVBoxLayout(legacy)
+        layout.setContentsMargins(0, 12, 0, 0)
+        layout.addWidget(label("Сохранённые здесь заметки остаются доступны. Новые мысли отправляются в Obsidian, если хранилище подключено.", "subtitle", True))
         self.note_input = QPlainTextEdit()
         self.note_input.setObjectName("noteInput")
         self.note_input.setPlaceholderText("Идея, полезный факт или материал…")
@@ -1211,6 +1245,8 @@ class MainWindow(QMainWindow):
             nav.setChecked(target == index)
         if hasattr(self, "voice"):
             self.refresh()
+        if index == 2 and hasattr(self, "obsidian_panel"):
+            self.obsidian_panel.refresh()
 
     @staticmethod
     def _clear_layout(layout):
@@ -1283,7 +1319,7 @@ class MainWindow(QMainWindow):
             row.addWidget(title, 1)
             control = button("Готово" if done else "Отметить", lambda _checked=False, task_id=item["id"]: self.submit(f"готово {task_id}"), "quiet")
             control.setObjectName(f"completeTask_{item['id']}")
-            control.setEnabled(not done and not self.busy)
+            control.setEnabled(not done and (self._action_request is None or self._action_request.get("morning") is True))
             row.addWidget(control)
             self.task_layout.addWidget(card)
         self.task_layout.addStretch()
@@ -1551,6 +1587,9 @@ class MainWindow(QMainWindow):
             self.start_listening()
 
     def save_preference(self, key, value):
+        if key == "speech_enabled" and value is False:
+            self._cancel_morning_followup()
+            self._interrupt_voice()
         try:
             self.preferences = self.core.store.set_preferences({key: value})
         except ValueError:
@@ -1719,7 +1758,7 @@ class MainWindow(QMainWindow):
         # confirmation metadata or command dispatch can originate here.
         self.stream_text.setText(self._stream_buffer)
         self.stream_preview.show()
-        self.status.setText("Формирую ответ…")
+        self.request_hint.setText("Формирую ответ. Можно дать новую команду или нажать «Стоп».")
 
     def _poll_reminders(self):
         if self._quitting:
@@ -1803,130 +1842,326 @@ class MainWindow(QMainWindow):
             if on_error is not None:
                 on_error(_error_class)
                 return
-            from desktop.core import Reply
-            self._clear_stream_preview()
-            self.busy = False
-            self.send_button.setEnabled(True)
-            self.command.setEnabled(True)
-            self._confirmation = None
-            self.confirmation.hide()
-            failure = Reply("Не удалось выполнить действие. Повтори команду или напиши её иначе.")
-            # A database failure must not call refresh()/record again from its
-            # error handler. The fixed feedback uses only the cached UI state.
-            self.history_layout.addWidget(self._message("assistant", failure.text))
-            self._speak_reply(failure)
-            self.mic_button.setEnabled(True)
-            self.model_button.setEnabled(True)
-            self.status.setText("Не удалось выполнить действие")
+            self._show_request_failure()
         worker.signals.done.connect(finished)
         worker.signals.failed.connect(failed)
         self.pool.start(worker)
 
-    def submit_current(self):
-        text = self.command.text().strip()
-        if text:
-            self.command.clear()
-            self.submit(text)
+    def _show_request_failure(self):
+        from desktop.core import Reply
+        self._sync_request_controls()
+        failure = Reply("Не удалось выполнить действие. Повтори команду или напиши её иначе.")
+        # A storage failure must not retry snapshot()/record from its handler.
+        self.history_layout.addWidget(self._message("assistant", failure.text))
+        self._speak_reply(failure)
+        self.mic_button.setEnabled(True)
+        self.model_button.setEnabled(True)
+        self.status.setText("Не удалось выполнить действие")
 
-    def submit(self, text, source="typed"):
-        if self.busy or not text.strip():
-            return
+    def _sync_request_controls(self):
+        self.busy = self._action_request is not None or self._active_request is not None
+        # Typed STOP must remain possible even during an action. Other actions
+        # are explicitly refused while one is in flight; their text is retained.
+        self.command.setEnabled(not self._quitting)
+        self.send_button.setEnabled(not self._quitting)
+        self.stop_response_button.setEnabled(not self._quitting)
+        self.request_hint.setVisible(self.busy and not self._quitting)
+        if self._action_request is not None:
+            self.request_hint.setText("Выполняю действие. «Стоп» остановит ответ; уже отправленная команда могла выполниться.")
+        elif self._pending_chat is not None:
+            self.request_hint.setText("Отменяю предыдущий ответ. Новый вопрос ожидает обработки; можно дать обычную команду или нажать «Стоп».")
+        elif self._active_request is not None:
+            self.request_hint.setText("Готовлю ответ. Можно задать новый вопрос, дать команду или нажать «Стоп».")
+
+    def _interrupt_voice(self):
         interrupt = getattr(self.voice, "interrupt", None)
         if callable(interrupt):
             interrupt()
-        self.busy = True
-        self.command.setEnabled(False)
-        self.send_button.setEnabled(False)
-        self.status.setText("Выполняю…")
+
+    def _cancel_chat_requests(self):
+        for record in (self._chat_active, self._pending_chat):
+            if record is not None:
+                record["cancel"].set()
+        self._pending_chat = None
+        if self._active_request is not None and self._active_request["kind"] == "chat":
+            self._active_request = None
         self._clear_stream_preview()
+
+    def _new_request(self, kind, function):
         self._request_serial += 1
-        request_id = self._request_serial
-        self._active_stream_id = request_id
+        record = {"id": self._request_serial, "kind": kind, "cancel": threading.Event(), "function": function}
+        self._foreground_request_id = record["id"]
+        self._active_request = record
+        return record
+
+    def _start_request(self, record):
+        if self._quitting or record["cancel"].is_set():
+            return
+        if record["kind"] == "chat":
+            self._chat_active = record
+        else:
+            self._action_request = record
+        function, cancelled = record["function"], record["cancel"]
+        revocation = record.get("revocation") is True
+        worker = Worker(lambda: None if cancelled.is_set() and not revocation else function(cancelled))
+        self._workers.add(worker)
+        record["worker"] = worker
+        def finished(value):
+            self._finish_request(record, value)
+        def failed(_error_class):
+            self._finish_request(record, None, failed=True)
+        worker.signals.done.connect(finished, Qt.ConnectionType.QueuedConnection)
+        worker.signals.failed.connect(failed, Qt.ConnectionType.QueuedConnection)
+        self._sync_request_controls()
+        (self._chat_pool if record["kind"] == "chat" else self.pool).start(worker)
+
+    def _finish_request(self, record, reply, *, failed=False):
+        self._workers.discard(record["worker"])
+        if self._chat_active is record:
+            self._chat_active = None
+        if self._action_request is record:
+            self._action_request = None
+        if self._morning_followup is record:
+            self._morning_followup = None
+        trusted = (not self._quitting and record["id"] == self._foreground_request_id
+                   and not record["cancel"].is_set())
+        if self._active_request is record:
+            self._active_request = None
+        if not self._quitting:
+            self._sync_request_controls()
+        if trusted:
+            self._clear_stream_preview()
+            if failed:
+                self._show_request_failure()
+            elif reply is not None:
+                self._reply(reply, request_id=record["id"])
+        if self._pending_chat is not None and self._chat_active is None and not self._quitting:
+            pending, self._pending_chat = self._pending_chat, None
+            if pending["id"] == self._foreground_request_id and not pending["cancel"].is_set():
+                self._start_request(pending)
+
+    def submit_current(self):
+        text = self.command.text().strip()
+        if text and self.submit(text):
+            self.command.clear()
+
+    def submit(self, text, source="typed"):
+        if self._quitting or not isinstance(text, str) or not text.strip():
+            return False
+        try:
+            kind = self.core.request_kind(text, source=source)
+        except Exception:
+            self.status.setText("Не удалось определить запрос. Повтори команду.")
+            return False
+        if kind == "stop":
+            self.stop_response()
+            return True
+        if kind not in {"command", "chat"}:
+            self.status.setText("Запрос не принят. Повтори команду.")
+            return False
+        if self._action_request is not None and not self._action_request.get("morning"):
+            self.status.setText("Действие ещё выполняется. Можно нажать «Стоп»; следующая команда не отправлена.")
+            return False
+        self._cancel_morning_followup()
+        self._cancel_chat_requests()
+        self._interrupt_voice()
+        core, signals = self.core, weakref.ref(self.events)
+        record = self._new_request(kind, None)
+        request_id = record["id"]
+        cancelled = record["cancel"]
+        self._active_stream_id = request_id if kind == "chat" else None
         # Echo the original request immediately. The next persisted refresh
         # replaces this temporary card without duplicating database records.
         self.history_layout.addWidget(self._message("user", text))
         QTimer.singleShot(0, lambda: self.history_scroll.verticalScrollBar().setValue(self.history_scroll.verticalScrollBar().maximum()))
         def on_chunk(delta):
-            if self._quitting:
+            if cancelled.is_set():
                 return False
-            if isinstance(delta, str) and delta:
-                self.events.stream_chunk.emit(request_id, delta[:self.MAX_PREVIEW_CHARS])
-        self._run(lambda: self.core.handle(text, source=source, on_chunk=on_chunk), self._reply)
+            bridge = signals()
+            if bridge is not None and isinstance(delta, str) and delta:
+                try:
+                    bridge.stream_chunk.emit(request_id, delta[:MainWindow.MAX_PREVIEW_CHARS])
+                except RuntimeError:
+                    return False
+            return not cancelled.is_set()
+        record["function"] = lambda event: core.handle(text, source=source, on_chunk=on_chunk, cancel_event=event)
+        if kind == "chat" and self._chat_active is not None:
+            self._pending_chat = record
+            self._sync_request_controls()
+        else:
+            self._start_request(record)
+        self.status.setText("Готовлю ответ…" if kind == "chat" else "Выполняю…")
+        return True
 
-    def _reply(self, reply):
+    def _reply(self, reply, *, request_id=None):
         if self._quitting:
             return
+        if request_id is not None and request_id != self._foreground_request_id:
+            return
+        if request_id is None:
+            # Replies from the separate controls panel supersede a model
+            # request too. They cannot make a running action appear finished.
+            self._cancel_chat_requests()
+            self._cancel_morning_followup()
+            self._request_serial += 1
+            self._foreground_request_id = self._request_serial
         self._clear_stream_preview()
-        self.busy = False
-        self.command.setEnabled(True)
-        self.send_button.setEnabled(True)
-        self._confirmation = reply.confirmation_id
-        if self._confirmation:
+        self._sync_request_controls()
+        if reply.confirmation_id:
+            old_token, self._confirmation = self._confirmation, reply.confirmation_id
+            if old_token and old_token != self._confirmation:
+                self._cancel_confirmation_token(old_token)
             self.confirm_text.setText(reply.text)
             self.confirmation.show()
             self.navigate(0)
-        else:
-            self.confirmation.hide()
         self.refresh()
         if ("assistant", reply.text) not in self._rendered_messages:
             # Consent/validation feedback deliberately need not persist any
             # user request. It must still be visible when speech is disabled.
             self.history_layout.addWidget(self._message("assistant", reply.text))
         self.status.setText("Ожидаю «Джарвис»" if self.listening else self._capture_error or "Микрофон выключен")
-        self._speak_reply(reply)
+        self._speak_reply(reply, trusted_request_id=request_id)
         self.command.setFocus()
         self._poll_organizer_events("interaction")
 
-    def _speak_reply(self, reply):
-        if not self._quitting and reply.speak and self.preferences.get("speech_enabled", True):
+    def _speak_reply(self, reply, *, trusted_request_id=None):
+        followup = getattr(reply, "followup_id", None)
+        permitted = (not self._quitting and reply.speak and self.preferences.get("speech_enabled", True)
+                     and self.speech_toggle.isChecked())
+        if not permitted:
+            if followup is not None:
+                self._cancel_morning_followup()
+            return
+        if permitted:
             play_cue = getattr(self.voice, "play_cue", None)
             queued = False
             if getattr(reply, "media_cue", None) == "welcome_home" and callable(play_cue):
                 try:
-                    queued = play_cue("welcome_home") is True
+                    if (isinstance(followup, str) and len(followup) == 32
+                            and all(char in "0123456789abcdef" for char in followup)
+                            and trusted_request_id is not None and trusted_request_id == self._foreground_request_id):
+                        bridge = weakref.ref(self.events)
+                        request_id = trusted_request_id
+                        self._morning_followup = {"id": request_id, "token": followup, "cancel": threading.Event(), "queued": False}
+                        def completed(played):
+                            receiver = bridge()
+                            if receiver is not None:
+                                try:
+                                    receiver.cue_finished.emit(request_id, followup, played is True)
+                                except RuntimeError:
+                                    pass
+                        queued = play_cue("welcome_home", on_complete=completed) is True
+                    else:
+                        queued = play_cue("welcome_home") is True
                 except Exception:
                     pass
+            if followup is not None and not queued:
+                self._cancel_morning_followup()
             if not queued:
-                self.voice.say(reply.text)
+                spoken = getattr(reply, "speech_text", None)
+                self.voice.say(spoken if isinstance(spoken, str) and 0 < len(spoken) <= 1000 else reply.text)
+
+    def _cancel_morning_followup(self):
+        record, self._morning_followup = self._morning_followup, None
+        if record is not None:
+            record["cancel"].set()
+        cancel = getattr(self.core, "cancel_morning", None)
+        if callable(cancel) and not self._quitting:
+            # Revocation itself never authorizes an action. Queue it before
+            # the next command, including when begin_morning is still in flight.
+            self._run(lambda: cancel(), lambda _value: None, on_error=lambda _error: None)
+
+    def _cue_completed(self, request_id, token, played):
+        record = self._morning_followup
+        if (record is None or record.get("queued") is True or record["id"] != request_id or record["token"] != token):
+            return
+        if (played is not True or self._quitting or request_id != self._foreground_request_id
+                or record["cancel"].is_set() or not self.preferences.get("speech_enabled", True)
+                or not self.speech_toggle.isChecked()):
+            self._cancel_morning_followup()
+            return
+        # A speech worker reports only a fact about playback. The opaque Core
+        # nonce is consumed on the serialized action lane, with its own cancel
+        # event checked again before any native continuation.
+        core = self.core
+        record.update(kind="command", morning=True, queued=True,
+                      function=lambda event: core.complete_morning(token, cancel_event=event))
+        self._active_request = record
+        self._start_request(record)
+
+    def _cancel_confirmation_token(self, token, *, request_id=None):
+        core = self.core
+        def complete(reply):
+            if request_id is not None and request_id == self._foreground_request_id and not self._quitting:
+                self._reply(reply, request_id=request_id)
+        def failed(_error):
+            if request_id is not None and request_id == self._foreground_request_id and not self._quitting:
+                self.status.setText("Не удалось подтвердить отмену действия. Не подтверждай прежний запрос.")
+        self._run(lambda: core.cancel(token), complete, on_error=failed)
+
+    def stop_response(self):
+        if self._quitting:
+            return
+        self._cancel_morning_followup()
+        self._cancel_chat_requests()
+        self._interrupt_voice()
+        if self._action_request is not None:
+            self._action_request["cancel"].set()
+        self._request_serial += 1
+        self._foreground_request_id = self._request_serial
+        if self._active_request is not None:
+            self._active_request["cancel"].set()
+            self._active_request = None
+        self._sync_request_controls()
+        token, self._confirmation = self._confirmation, None
+        if token:
+            self.confirmation.hide()
+            self._cancel_confirmation_token(token, request_id=self._foreground_request_id)
+        self.status.setText("Остановлено. Уже отправленная команда могла выполниться." if self._action_request is not None else
+                            "Ответ и озвучка остановлены.")
 
     def confirm_action(self):
-        if not self._confirmation or self.busy:
+        if (not self._confirmation or self._quitting
+                or self._action_request is not None and not self._action_request.get("morning")):
             return
         token, self._confirmation = self._confirmation, None
         self.confirmation.hide()
-        self.busy = True
-        self.command.setEnabled(False)
-        self.send_button.setEnabled(False)
-        self._run(lambda: self.core.confirm(token, source="button"), self._reply)
+        self._cancel_morning_followup()
+        self._cancel_chat_requests()
+        self._interrupt_voice()
+        core = self.core
+        self._start_request(self._new_request("command", lambda _event: core.confirm(token, source="button")))
 
     def cancel_action(self):
-        if not self._confirmation or self.busy:
+        if (not self._confirmation or self._quitting
+                or self._action_request is not None and not self._action_request.get("morning")):
             return
         token, self._confirmation = self._confirmation, None
         self.confirmation.hide()
-        self.busy = True
-        self._run(lambda: self.core.cancel(token), self._reply)
+        self._cancel_morning_followup()
+        self._cancel_chat_requests()
+        self._interrupt_voice()
+        core = self.core
+        record = self._new_request("command", lambda _event: core.cancel(token))
+        record["revocation"] = True
+        self._start_request(record)
 
     def add_task(self):
         text = self.task_input.text().strip()
-        if text and not self.busy:
+        if text and self.submit("добавь задачу " + text):
             self.task_input.clear()
-            self.submit("добавь задачу " + text)
 
     def add_note(self):
         text = self.note_input.toPlainText().strip()
-        if text and not self.busy:
+        if text:
             if len(text) > 5000:
                 self.status.setText("Заметка слишком длинная: максимум 5000 символов")
                 return
-            self.note_input.clear()
-            self.submit("запомни " + text)
+            if self.submit("запомни " + text):
+                self.note_input.clear()
 
     def _voice_command(self, text):
         if self._quitting or not self.listening:
-            return
-        if self.busy:
-            self.status.setText("Дождитесь завершения текущего действия")
             return
         self.navigate(0)
         self.submit(text, source="voice")
@@ -2000,6 +2235,7 @@ class MainWindow(QMainWindow):
             self.status.setText("Микрофон не запущен. Повторите включение, когда прежний сеанс завершится.")
 
     def stop_listening(self):
+        self._cancel_morning_followup()
         self._capture_requested = False
         self._capture_session += 1
         self.listening = False
@@ -2060,10 +2296,11 @@ class MainWindow(QMainWindow):
         return super().nativeEvent(event_type, message)
 
     def _finish_close(self):
-        if (self.pool.activeThreadCount() == 0 and not self._integration_workers
+        if (self.pool.activeThreadCount() == 0 and self._chat_pool.activeThreadCount() == 0 and not self._integration_workers
                 and self._integration_pool.activeThreadCount() == 0
                 and self._phone_stop_complete and self.controls.shutdown_complete
                 and self.remote_setup.shutdown_complete
+                and self.obsidian_panel.shutdown_complete
                 and self._phone_handlers_drained()):
             self._close_timer.stop()
             self.close()
@@ -2085,6 +2322,7 @@ class MainWindow(QMainWindow):
         self._quitting = True
         self.controls.shutdown()
         self.remote_setup.shutdown()
+        self.obsidian_panel.shutdown()
         prevent = getattr(self._phone_server, "prevent_requests", None)
         if callable(prevent):
             prevent()
@@ -2096,7 +2334,9 @@ class MainWindow(QMainWindow):
         self._integration_timer.stop()
         self._phone_notifications.clear()
         self._stop_phone_integrations()
-        self._clear_stream_preview()
+        self._cancel_chat_requests()
+        if self._action_request is not None:
+            self._action_request["cancel"].set()
         self.stop_listening()
         if self._voice_rate_timer.isActive():
             self._voice_rate_timer.stop()
@@ -2111,9 +2351,17 @@ class MainWindow(QMainWindow):
         # Stop queued work immediately; let an already-running bounded adapter
         # finish without freezing the UI or closing its database under it.
         self.pool.clear()
-        if (self.pool.activeThreadCount() or self._integration_workers or self._integration_pool.activeThreadCount()
+        self._chat_pool.clear()
+        discarded = {worker for worker in self._workers if not worker.started.is_set()}
+        self._workers.difference_update(discarded)
+        if self._action_request is not None and self._action_request.get("worker") in discarded:
+            self._action_request = None
+        if self._active_request is not None and self._active_request.get("worker") in discarded:
+            self._active_request = None
+        if (self.pool.activeThreadCount() or self._chat_pool.activeThreadCount() or self._integration_workers or self._integration_pool.activeThreadCount()
                 or not self._phone_stop_complete or not self.controls.shutdown_complete
                 or not self.remote_setup.shutdown_complete
+                or not self.obsidian_panel.shutdown_complete
                 or not self._phone_handlers_drained()):
             self.setEnabled(False)
             self.status.setText("Завершаю текущее действие. Микрофон выключен.")

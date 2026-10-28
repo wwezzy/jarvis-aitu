@@ -174,7 +174,9 @@ def _maximize_window(user32, *, youtube_only=False) -> str:
     return result
 
 
-def execute_windows_action(action: str) -> str:
+def execute_windows_action(action: str, *, authorization_guard=None) -> str:
+    if authorization_guard is not None and (not callable(authorization_guard) or authorization_guard() is not True):
+        raise PermissionError("Desktop request canceled")
     if action not in ALLOWED_ACTIONS:
         raise ValueError("Unsupported desktop action")
     if os.name != "nt":
@@ -189,7 +191,7 @@ def execute_windows_action(action: str) -> str:
         return open_chrome(system)
     if action in {"music_open", "music_play", "music_morning"}:
         from desktop.media import execute_music_action
-        return execute_music_action(action, system)
+        return execute_music_action(action, system, authorization_guard=authorization_guard)
     if action in {"calculator", "notepad", "explorer"}:
         executable = system.parent / "explorer.exe" if action == "explorer" else system / {"calculator": "calc.exe", "notepad": "notepad.exe"}[action]
         subprocess.Popen([str(executable)], shell=False, close_fds=True)

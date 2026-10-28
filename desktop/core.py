@@ -27,6 +27,8 @@ class Reply:
     speak: bool = True
     organizer_event: dict | None = None
     media_cue: str | None = None
+    followup_id: str | None = None
+    speech_text: str | None = None
 
 
 MAX_REPLY_CHARS = 22000
@@ -112,6 +114,9 @@ HELP = ("Могу открыть YouTube, браузер по умолчанию
         "«план на завтра», «добавь цель на завтра закончить проект», «я хожу в зал во вт чт вс», "
         "«фокус 25 минут», «напоминания», «отмени таймер 1», «расписание», «дедлайны» или «моя память». Управление питанием — только с отдельным подтверждением. "
         "Задачи и заметки сохраняются на этом компьютере; Render и ИИ для этих команд не нужны.")
+HELP_SPOKEN = ("К вашим услугам, сэр. Открываю приложения и проекты, управляю окнами и музыкой. "
+               "Сохраняю задачи и заметки, помогаю с планом и напоминаниями. "
+               "Например: открой проект Джарвис, запомни мою мысль или покажи план на завтра. Подробности — на экране.")
 
 _APP_NAMES = {
     "браузер": "browser", "мой браузер": "browser", "browser": "browser", "the browser": "browser", "my browser": "browser",
@@ -300,8 +305,10 @@ def _duration(count: str, unit: str) -> int:
 
 
 class DesktopCore:
-    def __init__(self, state_dir: Path, executor=None, *, personal_path: Path | None = None):
+    def __init__(self, state_dir: Path, executor=None, *, personal_path: Path | None = None, computer_controls=None):
         self._closed = threading.Event()
+        self._request_context = threading.local()
+        self._morning_lock, self._morning_pending = threading.RLock(), {}
         self.store = LocalStore(state_dir)
         self.organizer = LocalOrganizer(self.store)
         from desktop.observations import ObservationMonitor
@@ -314,6 +321,13 @@ class DesktopCore:
         self.owner = OwnerSession(enabled=self.store.preferences()["voice_owner_required"])
         self.projects = ProjectCatalog(state_dir)
         self.apps = AppCatalog(state_dir)
+        if computer_controls is None and executor is None:
+            from desktop.computer_controls import ComputerControls
+            computer_controls = ComputerControls(self.apps)
+        self.computer = computer_controls
+        from desktop.obsidian import ObsidianVault
+        self.obsidian = ObsidianVault(state_dir)
+        self._native_executor = executor is None
         self.executor = executor if executor is not None else execute_windows_action
         # A core used in tests/smoke mode never discovers global personal files.
         # Only the actual entry point may opt in with an identified local copy.
@@ -387,13 +401,18 @@ class DesktopCore:
         if self._closed.is_set():
             return
         self._closed.set()
+        self.cancel_morning()
+        if self.computer is not None:
+            self.computer.close()
+        self.obsidian.close()
         self.owner.revoke()
         self.observations.reset()
         self.store.close()
 
     def _catalog_authorized(self):
         try:
-            return not self._closed.is_set() and (not self.owner.enabled or self.owner.allowed() is True)
+            return (not self._request_cancelled() and not getattr(self._request_context, "chat_only", False)
+                    and (not self.owner.enabled or self.owner.allowed() is True))
         except Exception:
             return False
 
@@ -492,12 +511,110 @@ class DesktopCore:
         return replies
 
     def _answer(self, reply: Reply) -> Reply:
+        if self._request_cancelled():
+            return Reply("Запрос отменён.", speak=False)
         if len(reply.text) > MAX_REPLY_CHARS:
             label = "\n\n[Краткий фрагмент ответа: достигнут лимит чата. Исходные заметки сохранены полностью в разделе «Заметки».]"
             reply = replace(reply, text=reply.text[:MAX_REPLY_CHARS - len(label)] + label)
         if not self._closed.is_set():
             self.store.record("assistant", reply.text)
         return reply
+
+    def _request_cancelled(self):
+        event = getattr(self._request_context, "cancel_event", None)
+        return self._closed.is_set() or event is not None and event.is_set()
+
+    def request_kind(self, text, source="typed"):
+        """Pure admission classification; it never dispatches an action.
+
+        Only positively free-form requests enter the separate chat lane. All
+        action-looking input remains on the serialized command lane, including
+        invalid/quoted/negated requests that require a clarification.
+        """
+        if (not isinstance(source, str) or source not in {"typed", "voice"}
+                or not isinstance(text, str) or not text.strip() or len(text) > 20000 or "\x00" in text):
+            return "command"
+        value, intent = normalize(text), _intent_phrase(text)
+        if value in {"стоп", "замолчи", "хватит", "отмена", "stop", "cancel", "отмени ответ"} or intent in {"стоп", "замолчи", "хватит", "отмена", "stop", "cancel", "отмени ответ"}:
+            return "stop"
+        known = {"доброе утро", "good morning", "помощь", "команды", "что ты умеешь", "help", "/help",
+                 "джарвис", "jarvis", "да", "привет", "как дела", "как твои дела", "как у тебя дела",
+                 "ты здесь", "ты тут", "how are you", "hello", "are you there", "статус", "статус компьютера", "status", "/pcstatus",
+                 "ты меня слышишь", "слышишь меня", "меня слышно", "can you hear me", "do you hear me",
+                 "проекты", "мои проекты", "projects", "приложения", "мои приложения", "apps",
+                 "моя активность", "активность", "наблюдения", "что видно по компьютеру", "учусь ли я", "играю ли я",
+                 "задачи", "мои задачи", "список задач", "tasks", "/tasks", "заметки", "мои заметки", "notes", "/notes",
+                 "следующий шаг", "что дальше", "что мне делать", "мне скучно", "next", "/next",
+                 "мой план", "план", "планы", "план на сегодня", "план сегодня", "что у меня сегодня", "сегодня",
+                 "план на завтра", "план завтра", "что у меня завтра", "завтра", "напоминания", "таймеры", "reminders", "timers"}
+        known.update(PERSONAL_COMMANDS)
+        from desktop.computer_controls import parse_command
+        if parse_command(text) is not None:
+            return "command"
+        known.update({"пауза планировщика", "возобнови планировщик", "тихий режим", "отключи тихий режим",
+                      "выключи утренний план", "включи утренний план", "выключи вечерний план", "включи вечерний план",
+                      "obsidian", "обсидиан", "заметки обсидиан", "заметки obsidian"})
+        if value in known or intent in known or _WELCOME_HOME.fullmatch(intent) or _desktop_information(intent) is not None or _desktop_action(intent) is not None:
+            return "command"
+        if (_ACTION_WORDS.search(intent) or value.startswith("/") or re.match(
+            r"^(?:напомни|таймер|фокус|timer|focus|подтверждаю|подтверди|confirm|отмени|отмена|cancel|"
+            r"добавь|добавить|запомни|запиши|сохрани|заметка|note|add task|task|capture|remember|готово|выполнено|done|complete task|"
+            r"архивируй|archive task|заверши задачу|удали|найди|find|search|запланируй|перенеси|отметь|пропусти|убери|поставь|начни|останови|"
+            r"план(?: на)? \d|цель\s+(?:на|#?\d)|(?:я )?(?:качаюсь|хожу в зал|тренируюсь|сходил в зал|потренировался|пропустил зал|учился)\b)", value)):
+            return "command"
+        return "chat"
+
+    def cancel_morning(self, token=None):
+        with self._morning_lock:
+            if token is None:
+                self._morning_pending.clear()
+            elif isinstance(token, str):
+                self._morning_pending.pop(token, None)
+
+    def complete_morning(self, token, *, cancel_event=None):
+        """One local original request permits music only after its full cue.
+
+        This opaque in-memory token is never generated by a model or persisted
+        in chat. A new request, cancellation, expiry, close or revoked owner
+        invalidates the continuation. Playback callbacks themselves execute no
+        PC commands; the UI submits this method on its serialized action lane.
+        """
+        if (not isinstance(token, str) or not re.fullmatch(r"[a-f0-9]{32}", token)
+                or cancel_event is not None and not isinstance(cancel_event, type(threading.Event()))):
+            return Reply("Утренний сценарий уже не действует.", speak=False)
+        with self._morning_lock:
+            expires = self._morning_pending.pop(token, None)
+        if expires is None or time.monotonic() >= expires or not self._catalog_authorized():
+            return Reply("Утренний сценарий отменён или устарел.", speak=False)
+        previous = getattr(self._request_context, "cancel_event", None)
+        self._request_context.cancel_event = cancel_event
+        try:
+            result = self._execute("music_morning", authorization_guard=self._catalog_authorized)
+            return replace(result, speak=False)
+        finally:
+            self._request_context.cancel_event = previous
+
+    def _vault_notes_reply(self, query=None):
+        """Bound literal local previews; note contents never become authority."""
+        status = self.obsidian.status()
+        if status.get("configured") is not True:
+            return status["message"]
+        if query is not None and (not isinstance(query, str) or not query.strip() or len(query) > 500):
+            return "Для поиска достаточно запроса до 500 символов."
+        notes = self.obsidian.list_notes(limit=11) if query is None else self.obsidian.search(query, limit=11)
+        if not notes:
+            return "В хранилище Obsidian подходящих заметок нет." if query else "В хранилище Obsidian пока нет заметок."
+        lines = ["Заметки Obsidian. Полный текст — в разделе «Заметки»."]
+        for item in notes[:10]:
+            lines.append(item["title"][:100])
+            if query is not None and item.get("preview"):
+                preview = item["preview"][:NOTE_PREVIEW_CHARS]
+                if item.get("truncated") or len(item["preview"]) > NOTE_PREVIEW_CHARS:
+                    preview += "… [краткий фрагмент]"
+                lines.append(preview)
+        if len(notes) > 10:
+            lines.append("Показаны первые 10 результатов; уточни поиск в разделе «Заметки».")
+        return "\n\n".join(lines)
 
     def _personal_snapshot(self):
         if self.personal_path is None:
@@ -578,13 +695,21 @@ class DesktopCore:
         lines.append("Выбери одну актуальную и добавь её в новый локальный список. Остальные старые записи — в разделе «Мои данные».")
         return "\n".join(lines)
 
-    def _execute(self, action: str) -> Reply:
-        if self._closed.is_set():
+    def _execute(self, action: str, *, authorization_guard=None) -> Reply:
+        if self._request_cancelled() or getattr(self._request_context, "chat_only", False):
             return Reply("Jarvis завершает работу. Повтори команду после запуска.", speak=False)
         if action not in ALLOWED_ACTIONS:
             return self._answer(Reply("Эта команда не входит в разрешенный список."))
         try:
-            result = self.executor(action)
+            if authorization_guard is not None and authorization_guard() is not True:
+                return Reply("Доступ отозван. Действие отменено.", speak=False)
+            if self._native_executor:
+                canceled = getattr(self._request_context, "cancel_event", None)
+                result = self.executor(action, authorization_guard=lambda:
+                    not self._closed.is_set() and (canceled is None or not canceled.is_set())
+                    and (authorization_guard is None or authorization_guard() is True))
+            else:
+                result = self.executor(action)
         except Exception as error:
             # Fixed error class, never stdout/stderr/paths or personal content.
             return self._answer(Reply(f"Не удалось выполнить действие ({type(error).__name__}). Успех не подтвержден.", action=action))
@@ -592,7 +717,23 @@ class DesktopCore:
             result = "Обработчик завершился без подтверждения результата. Проверь действие на компьютере."
         return self._answer(Reply(result, action=action))
 
-    def handle(self, text: str, source: str = "typed", *, on_chunk=None) -> Reply:
+    def handle(self, text: str, source: str = "typed", *, on_chunk=None, cancel_event=None) -> Reply:
+        if cancel_event is not None and not isinstance(cancel_event, type(threading.Event())):
+            raise ValueError("A cancellation event is required")
+        previous = getattr(self._request_context, "cancel_event", None)
+        previous_chat = getattr(self._request_context, "chat_only", False)
+        self._request_context.cancel_event = cancel_event
+        self._request_context.chat_only = self.request_kind(text, source) == "chat"
+        try:
+            if self._request_cancelled():
+                return Reply("Запрос отменён.", speak=False)
+            self.cancel_morning()
+            return self._handle_request(text, source=source, on_chunk=on_chunk)
+        finally:
+            self._request_context.cancel_event = previous
+            self._request_context.chat_only = previous_chat
+
+    def _handle_request(self, text: str, source: str = "typed", *, on_chunk=None) -> Reply:
         if self._closed.is_set():
             return Reply("Jarvis завершает работу. Повтори команду после запуска.", speak=False)
         if not isinstance(source, str) or source not in {"typed", "voice"}:
@@ -614,19 +755,50 @@ class DesktopCore:
         if canceled:
             return self.cancel(canceled[1])
         intent_phrase = _intent_phrase(text)
+        if self.request_kind(text, source) == "stop":
+            return self._answer(Reply("Остановлено.", speak=False))
+        if intent_phrase in {"доброе утро", "good morning"}:
+            token = secrets.token_hex(16)
+            with self._morning_lock:
+                self._morning_pending[token] = time.monotonic() + 60
+            return self._answer(Reply("Доброе утро, сэр.", media_cue="welcome_home", followup_id=token))
         # This is an explicit playback cue, never a system-readiness claim or
         # an inferred PC action. The user's recording stays outside the repo.
         if _WELCOME_HOME.fullmatch(intent_phrase):
             return self._answer(Reply("Добро пожаловать домой, сэр.", media_cue="welcome_home"))
+        if intent_phrase in {"заметки обсидиан", "заметки obsidian"}:
+            return self._answer(Reply(self._vault_notes_reply()))
+        vault_open = re.fullmatch(r"(?:(?:открой|покажи|open)\s+)?(?:обсидиан|obsidian)(?:\s+заметки)?", intent_phrase)
+        if vault_open:
+            result = self.obsidian.open_vault(authorization_guard=self._catalog_authorized)
+            return self._answer(Reply(result["message"]))
+        vault_note = re.fullmatch(r"(?:запиши|сохрани|создай|save)(?:\s+заметку)?\s+(?:в\s+)?(?:обсидиан|obsidian)\s+(.+)", original, re.I | re.S)
+        if vault_note:
+            try:
+                result = self.obsidian.create_note("Быстрая заметка", vault_note[1], authorization_guard=self._catalog_authorized)
+                return self._answer(Reply(result["message"]))
+            except (ValueError, OSError):
+                return self._answer(Reply("Не удалось сохранить заметку в Obsidian. Проверь выбранное хранилище и доступ владельца."))
+        vault_search = re.fullmatch(r"найди (?:в\s+)?(?:обсидиан|obsidian)\s+(.+)", original, re.I | re.S)
+        if vault_search:
+            try:
+                return self._answer(Reply(self._vault_notes_reply(vault_search[1])))
+            except (ValueError, OSError):
+                return self._answer(Reply("Поиск в Obsidian недоступен. Проверь выбранное хранилище."))
         information = _desktop_information(intent_phrase)
         if information is not None:
-            return self._answer(Reply(information))
+            return self._answer(Reply(information, speech_text=HELP_SPOKEN if information == HELP else None))
         if intent_phrase in {"проекты", "мои проекты", "projects"}:
             items = self.projects.projects()
             return self._answer(Reply("\n".join(item["name"] for item in items[:30]) if items else "Добавь проект или разрешённую папку в настройках Jarvis."))
         if intent_phrase in {"приложения", "мои приложения", "apps"}:
             items = self.apps.apps()
             return self._answer(Reply("\n".join(item["name"] for item in items[:30]) if items else "Добавь свои приложения в настройках. Браузер, Chrome, Яндекс Музыка и системные утилиты уже поддерживаются."))
+        from desktop.computer_controls import parse_command
+        window_command = parse_command(text)
+        if window_command is not None and self.computer is not None:
+            result = self.computer.request(*window_command, authorization_guard=self._catalog_authorized)
+            return self._answer(Reply(result.text, confirmation_id=result.confirmation_id))
         catalog_frame = _catalog_request_frame(text)
         project = re.fullmatch(r"(?:открой|открыть|запусти|запустить|open|launch)\s+(?:проект|project)\s+(.+)", catalog_frame)
         if project:
@@ -649,8 +821,11 @@ class DesktopCore:
         if intent_phrase in {"джарвис", "jarvis", "да", "привет", "как дела", "как твои дела", "как у тебя дела",
                              "ты здесь", "ты тут", "how are you", "hello", "are you there"}:
             return self._answer(Reply("На связи, сэр. Скажи команду или выбери следующий шаг."))
+        if intent_phrase in {"ты меня слышишь", "слышишь меня", "меня слышно", "can you hear me", "do you hear me"}:
+            return self._answer(Reply("Твой голосовой запрос распознан, сэр. Слушаю команду." if source == "voice"
+                                      else "Сообщение получил, сэр. Я на связи."))
         if value in {"помощь", "команды", "что ты умеешь", "help", "/help"}:
-            return self._answer(Reply(HELP))
+            return self._answer(Reply(HELP, speech_text=HELP_SPOKEN))
         if value in {"статус", "статус компьютера", "status", "/pcstatus"}:
             return self._answer(Reply("Локальный помощник работает. Задачи и заметки доступны без сети. "
                                       "Доступность микрофона и голоса показана в настройках приложения."))
@@ -702,6 +877,9 @@ class DesktopCore:
                 task_id = self.store.add_task(task[1])
                 return self._answer(Reply(f"Добавил задачу #{task_id}: {task[1].strip()}"))
             if note:
+                if self.obsidian.status().get("configured") is True:
+                    result = self.obsidian.create_note("Быстрая заметка", note[1], authorization_guard=self._catalog_authorized)
+                    return self._answer(Reply(result["message"]))
                 note_id = self.store.capture_note(note[1])
                 return self._answer(Reply(f"Сохранил заметку #{note_id} на этом компьютере."))
         except ValueError:
@@ -736,18 +914,26 @@ class DesktopCore:
             if len(search[1]) > 500:
                 return self._answer(Reply("Для поиска достаточно запроса до 500 символов."))
             notes = self.store.search_notes(search[1])
-            text = _note_previews(notes) if notes else "Подходящих заметок нет."
+            parts = [_note_previews(notes)] if notes else []
+            if self.obsidian.status().get("configured") is True:
+                parts.append(self._vault_notes_reply(search[1]))
+            text = "\n\n".join(parts) if parts else "Подходящих заметок нет."
             return self._answer(Reply(text))
         if value in {"заметки", "мои заметки", "notes", "/notes"}:
             notes = self.snapshot()["notes"]
-            text = _note_previews(notes) if notes else "Заметок пока нет. Скажи «запомни» и свою мысль."
+            parts = [_note_previews(notes)] if notes else []
+            if self.obsidian.status().get("configured") is True:
+                parts.append(self._vault_notes_reply())
+            text = "\n\n".join(parts) if parts else "Заметок пока нет. Скажи «запомни» и свою мысль."
             return self._answer(Reply(text))
         clarification = _desktop_clarification(intent_phrase)
         if clarification is not None:
             return self._answer(Reply(clarification))
+        if self.request_kind(text, source) != "chat":
+            return self._answer(Reply("Уточни команду: что открыть, сохранить или изменить. Свободный вопрос можно задать отдельно."))
         preferences = self.store.preferences()
         if preferences["local_chat_enabled"]:
-            from desktop.chat import LocalChat, LocalChatTruncated, LocalChatUnavailable
+            from desktop.chat import LocalChat, LocalChatCancelled, LocalChatTruncated, LocalChatUnavailable
             client = None
             try:
                 # A model's result stays display-only. Optional context is
@@ -755,6 +941,9 @@ class DesktopCore:
                 # note/task/PC-command/personal-data records or the current row.
                 client = LocalChat(preferences["local_chat_model"])
                 options = {"on_chunk": on_chunk} if on_chunk is not None else {}
+                cancel_event = getattr(self._request_context, "cancel_event", None)
+                if cancel_event is not None:
+                    options["cancel_event"] = cancel_event
                 history = _dialogue_history(self.store.model_chat_history(before_id=request_id)) if preferences["local_chat_history"] else None
                 if preferences["local_chat_plan_context"] and _needs_plan_context(text, history):
                     options["plan_context"] = self._current_plan_context(preferences)
@@ -762,6 +951,10 @@ class DesktopCore:
                     answer = client.answer(text, history=history, **options)
                 else:
                     answer = client.answer(text, **options)
+            except LocalChatCancelled:
+                if client is not None:
+                    self._record_chat_usage(preferences["local_chat_model"], client, success=False)
+                return Reply("Запрос отменён.", speak=False)
             except ValueError:
                 return self._answer(Reply("Для локальной модели сократи вопрос до 8000 символов и проверь имя модели в настройках."))
             except LocalChatTruncated:
@@ -780,10 +973,14 @@ class DesktopCore:
             return Reply("Jarvis завершает работу. Повтори команду после запуска.", speak=False)
         if self.owner.enabled and not self.owner.allowed():
             return Reply("Подтверди владельца через Windows Hello перед выполнением.")
-        if source not in {"button", "typed"}:
+        if not isinstance(source, str) or source not in {"button", "typed"}:
             return self._answer(Reply("Для этого действия требуется кнопка подтверждения или исходная текстовая команда. Голос не подтверждает управление питанием."))
         if not isinstance(token, str) or not re.fullmatch(r"[a-f0-9]{32}", token):
             return self._answer(Reply("Неверное подтверждение. Запроси действие заново."))
+        if self.computer is not None:
+            result = self.computer.confirm(token, authorization_guard=self._catalog_authorized)
+            if result is not None:
+                return self._answer(Reply(result.text))
         action = self.store.claim_confirmation(token, time.time())
         if action not in RISKY_ACTIONS:
             return self._answer(Reply("Подтверждение истекло, отменено или уже использовано. Запроси действие заново."))
@@ -792,6 +989,10 @@ class DesktopCore:
     def cancel(self, token: str) -> Reply:
         if not isinstance(token, str) or not re.fullmatch(r"[a-f0-9]{32}", token):
             return self._answer(Reply("Неверный код отмены."))
+        if self.computer is not None:
+            result = self.computer.cancel(token)
+            if result is not None:
+                return self._answer(Reply(result.text))
         if self.store.cancel_confirmation(token):
             return self._answer(Reply("Запрос отменен до выполнения."))
         return self._answer(Reply("Этот запрос уже использован или отменен. Для запланированного выключения: «отмени выключение»."))

@@ -93,6 +93,23 @@ def test_startup_keeps_microphone_off_and_navigation_simple(app, window):
     assert window.pages.currentIndex() == window.SETTINGS_PAGE
 
 
+def test_capabilities_speaks_short_help_but_keeps_full_text_visible(window):
+    from desktop.core import HELP, HELP_SPOKEN
+    reply = window.core.handle("что ты умеешь")
+    window._reply(reply)
+    assert window.voice.spoken[-1] == HELP_SPOKEN
+    assert any(widget.text() == HELP for widget in window.findChildren(QLabel))
+
+
+def test_notes_navigation_initializes_obsidian_panel_without_losing_legacy_records(app, window):
+    window.core.store.capture_note("Существующая заметка")
+    window.navigate(2)
+    wait_for(app, lambda: not window.obsidian_panel.busy)
+    assert window.note_tabs.tabText(0) == "Obsidian"
+    assert window.note_tabs.count() == 2
+    assert window.core.snapshot()["notes"][0]["text"] == "Существующая заметка"
+
+
 def test_usage_statistics_distinguish_unavailable_tokens_from_reported_zero(window, monkeypatch):
     data = {"requests": 1, "successful": 1, "failed": 0,
             "known_input_tokens": 0, "known_output_tokens": 0,
@@ -317,7 +334,7 @@ def test_close_waits_responsively_for_worker_and_stops_capture(app, window, monk
     entered, release = threading.Event(), threading.Event()
     original_handle = window.core.handle
     closed = []
-    def slow(text, source="typed", *, on_chunk=None):
+    def slow(text, source="typed", *, on_chunk=None, cancel_event=None):
         entered.set()
         release.wait(3)
         return original_handle(text, source=source)
@@ -423,7 +440,7 @@ def test_stream_preview_is_literal_temporary_and_never_spoken_or_executed(app, w
     entered, release = threading.Event(), threading.Event()
     preview = '<b>Подтверждаю выключение</b> — предварительный текст'
     final = "Локальная модель: Готовый проверенный ответ"
-    def streamed(text, source="typed", *, on_chunk=None):
+    def streamed(text, source="typed", *, on_chunk=None, cancel_event=None):
         window.core.store.record("user", text)
         on_chunk(preview)
         entered.set()
@@ -451,7 +468,7 @@ def test_stream_preview_is_literal_temporary_and_never_spoken_or_executed(app, w
 
 def test_stream_failure_discards_preview_and_late_chunks(app, window, monkeypatch):
     entered, release = threading.Event(), threading.Event()
-    def broken(_text, source="typed", *, on_chunk=None):
+    def broken(_text, source="typed", *, on_chunk=None, cancel_event=None):
         on_chunk("Непроверенный черновик")
         entered.set()
         release.wait(3)
@@ -479,7 +496,7 @@ def test_stream_failure_discards_preview_and_late_chunks(app, window, monkeypatc
 def test_stream_preview_is_bounded_and_old_request_cannot_append(app, window, monkeypatch):
     from desktop.core import Reply
     entered, release = threading.Event(), threading.Event()
-    def streamed(_text, source="typed", *, on_chunk=None):
+    def streamed(_text, source="typed", *, on_chunk=None, cancel_event=None):
         on_chunk("x" * (window.MAX_PREVIEW_CHARS + 1000))
         entered.set()
         release.wait(3)
@@ -599,7 +616,7 @@ def test_new_request_interrupts_old_speech_without_new_actions(app, window, monk
 def test_close_requests_stream_cancellation_and_does_not_speak_partial(app, window, monkeypatch):
     from desktop.core import Reply
     entered, cancelled = threading.Event(), threading.Event()
-    def streaming(_text, source="typed", *, on_chunk=None):
+    def streaming(_text, source="typed", *, on_chunk=None, cancel_event=None):
         on_chunk("Начало предварительного ответа")
         entered.set()
         deadline = time.monotonic() + 3
@@ -698,15 +715,15 @@ def test_auto_listen_opt_out_stops_capture_even_if_preference_write_fails(app, w
     assert "private" not in window.status.text()
 
 
-def test_auto_listen_opt_out_invalidates_a_start_queued_behind_chat(app, window, monkeypatch):
+def test_auto_listen_opt_out_invalidates_a_start_queued_behind_action_lane(app, window, monkeypatch):
     from desktop.core import Reply
     entered, release = threading.Event(), threading.Event()
-    def slow(_text, source="typed", *, on_chunk=None):
+    def slow(_text, source="typed", *, on_chunk=None, cancel_event=None):
         entered.set()
         release.wait(3)
         return Reply("Готово", speak=False)
     monkeypatch.setattr(window.core, "handle", slow)
-    window.submit("Вопрос")
+    window.submit("как дела")
     assert entered.wait(1)
     window.auto_listen_toggle.setChecked(True)
     assert window._capture_requested

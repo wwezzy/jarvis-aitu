@@ -13,6 +13,18 @@ from desktop.core import DesktopCore
 from desktop import media
 
 
+def test_revocation_during_native_player_verification_prevents_launch_and_browser_fallback(monkeypatch):
+    authorized = [True]
+    def verify():
+        authorized[0] = False  # For example, owner revocation during EXE hashing.
+        return Path("C:/Approved/YandexMusic.exe")
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Revoked music request reached an OS action")
+    monkeypatch.setattr(media, "_native_music_executable", verify)
+    with pytest.raises(PermissionError):
+        media._open_player(forbidden, forbidden, lambda: authorized[0])
+
+
 @pytest.mark.parametrize("command,action", [
     ("Джарвис, открой яндекс музыку", "music_open"),
     ("включи музыку", "music_play"), ("возобнови музыку", "music_play"),
@@ -39,7 +51,7 @@ def test_source_and_mixed_music_text_cannot_authorize_actions(tmp_path):
 
 
 @pytest.mark.parametrize("action", ["music_open", "music_morning"])
-def test_open_and_morning_do_not_control_media_or_invent_playlist_playback(action):
+def test_browser_fallback_does_not_control_media_or_invent_playlist_playback(action):
     opened = []
     def denied(*_a, **_k):
         pytest.fail("Opening command attempted to control a player")
@@ -47,8 +59,6 @@ def test_open_and_morning_do_not_control_media_or_invent_playlist_playback(actio
     assert opened == [media.MUSIC_URL]
     assert "Открываю сайт" in text and "нажми Play" in text
     assert "Включил" not in text and "воспроизводит" not in text
-    if action == "music_morning":
-        assert "сам её пока не выбираю" in text
 
 
 @pytest.mark.parametrize("state", ["no_session", "not_music", "unknown_source", "not_playable", "rejected", "not_confirmed", "unavailable", "timeout"])
@@ -215,6 +225,47 @@ def test_new_eligible_yandex_session_after_prior_video_can_play_but_ambiguous_re
         assert "не могу подтвердить" in result and len(calls) == 1
 
 
+def test_morning_launches_verified_native_yandex_before_retrying_only_yandex_music(tmp_path, monkeypatch):
+    executable, _ = installed_manifest(tmp_path, monkeypatch)
+    order, clock = [], [1000.0]
+    states = iter(["unknown_source", "not_music", "playing"])
+    monkeypatch.setattr(media.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(media.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    def request(_system, **options):
+        assert options["yandex_only"] is True and 0 < options["timeout"] <= 2.5
+        order.append("request")
+        return next(states)
+    monkeypatch.setattr(media, "_request_music_play", request)
+    text = media.execute_music_action("music_morning", Path("C:/Windows/System32"),
+        launcher=lambda arguments, **_options: order.append(arguments),
+        opener=lambda *_: pytest.fail("Verified native app should be preferred"))
+    assert order == [[str(executable)], "request", "request", "request"]
+    assert "Яндекс Музыке" in text and "Продолжил" in text
+    assert "случайн" not in text and "подборк" not in text
+
+
+@pytest.mark.parametrize("state", ["rejected", "not_confirmed", "timeout", "unavailable"])
+def test_morning_never_retries_an_ambiguous_play_or_claims_playback(tmp_path, monkeypatch, state):
+    installed_manifest(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(media, "_request_music_play", lambda *_a, **_k: calls.append(True) or state)
+    text = media.execute_music_action("music_morning", Path("C:/Windows/System32"), launcher=lambda *_a, **_k: None)
+    assert calls == [True] and "не могу подтвердить" in text and "Продолжил" not in text
+
+
+def test_morning_yandex_filter_uses_fixed_script_not_user_text():
+    calls = []
+    def runner(arguments, **_options):
+        calls.append(arguments)
+        return SimpleNamespace(returncode=0, stdout=b'{"protocol":1,"state":"playing"}')
+    assert media._request_music_play(Path("C:/Windows/System32"), runner, yandex_only=True) == "playing"
+    script = base64.b64decode(calls[0][-1]).decode("utf-16-le")
+    assert script == media._SMTC_SCRIPT_YANDEX and script != media._SMTC_SCRIPT
+    assert "} -YandexOnly" in script
+    with pytest.raises(ValueError):
+        media._request_music_play(Path("C:/Windows/System32"), runner, yandex_only="other.exe")
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell projection policy test")
 def test_actual_smtc_policy_with_fake_sessions_rejects_video_unknown_and_never_toggles(tmp_path):
     """Execute only the pure policy using synthetic session methods, no WinRT."""
@@ -265,6 +316,12 @@ $s=[FakeSession]::new();$s.Kind='Music';$s.SourceAppUserModelId='Spotify.exe';$s
 Invoke-TestMusicCase 'Rejected' $s
 $s=[FakeSession]::new();$s.Kind='Music';$s.SourceAppUserModelId='Spotify.exe';$s.Status='Paused';$s.SwitchTypeAfterPlay=$true
 Invoke-TestMusicCase 'ChangedType' $s
+$s=[FakeSession]::new();$s.Kind='Music';$s.SourceAppUserModelId='Spotify.exe';$s.Status='Paused'
+$state=Invoke-CurrentMusicPlay $s {param($op,$type) return $op} -YandexOnly
+[Console]::Out.WriteLine('YandexOnlySpotify|' + [string]$state + '|' + [string]$s.Calls)
+$s=[FakeSession]::new();$s.Kind='Music';$s.SourceAppUserModelId='ru.yandex.desktop.music';$s.Status='Paused'
+$state=Invoke-CurrentMusicPlay $s {param($op,$type) return $op} -YandexOnly
+[Console]::Out.WriteLine('YandexOnlyYandex|' + [string]$state + '|' + [string]$s.Calls)
 [Console]::Error.WriteLine('policy:done')
 exit 0
 """
@@ -292,8 +349,9 @@ exit 0
         "case:Already", "case:Unconfirmed", "case:Disabled", "case:Rejected", "case:ChangedType", "policy:done"]
     assert stdout_path.stat().st_size <= 4096
     rows = [line.split("|") for line in stdout_path.read_text(encoding="ascii").splitlines()]
-    assert len(rows) == 9 and all(len(row) == 3 for row in rows)
+    assert len(rows) == 11 and all(len(row) == 3 for row in rows)
     states = {kind: (state, int(calls)) for kind, state, calls in rows}
     assert states == {"Video": ("not_music", 0), "Unknown": ("not_music", 0), "Music": ("playing", 1),
                       "Browser": ("unknown_source", 0), "Already": ("already_playing", 0), "Unconfirmed": ("not_confirmed", 1),
-                      "Disabled": ("not_playable", 0), "Rejected": ("rejected", 1), "ChangedType": ("not_music", 1)}
+                      "Disabled": ("not_playable", 0), "Rejected": ("rejected", 1), "ChangedType": ("not_music", 1),
+                      "YandexOnlySpotify": ("unknown_source", 0), "YandexOnlyYandex": ("playing", 1)}

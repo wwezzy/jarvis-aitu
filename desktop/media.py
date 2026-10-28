@@ -27,13 +27,16 @@ MEDIA_STATES = frozenset({"playing", "already_playing", "no_session", "not_music
 # tests; neither GetCurrentSession nor any live player is invoked by those tests.
 _SMTC_POLICY = r"""
 function Invoke-CurrentMusicPlay {
-    param($Session, [ScriptBlock]$Await)
+    param($Session, [ScriptBlock]$Await, [switch]$YandexOnly)
     if ($null -eq $Session) { return 'no_session' }
     $info = $Session.GetPlaybackInfo()
     if ([string]$info.PlaybackType -ne 'Music') { return 'not_music' }
     $allowed = @('Spotify.exe', 'SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify',
                  'YandexMusic.exe', 'Yandex.Music.exe', 'Яндекс Музыка.exe', 'ru.yandex.desktop.music',
                  'Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic')
+    if ($YandexOnly) {
+        $allowed = @('YandexMusic.exe', 'Yandex.Music.exe', 'Яндекс Музыка.exe', 'ru.yandex.desktop.music')
+    }
     if ([string]$Session.SourceAppUserModelId -notin $allowed) { return 'unknown_source' }
     if ([string]$info.PlaybackStatus -eq 'Playing') { return 'already_playing' }
     if (-not $info.Controls.IsPlayEnabled) { return 'not_playable' }
@@ -86,8 +89,12 @@ try {
 }
 """
 
+_SMTC_SCRIPT_YANDEX = _SMTC_SCRIPT.replace(
+    "$state = Invoke-CurrentMusicPlay $current { param($operation, $resultType) Wait-WinRT $operation $resultType }",
+    "$state = Invoke-CurrentMusicPlay $current { param($operation, $resultType) Wait-WinRT $operation $resultType } -YandexOnly")
 
-def _request_music_play(system_dir: Path, runner=None, *, timeout=6) -> str:
+
+def _request_music_play(system_dir: Path, runner=None, *, timeout=6, yandex_only=False) -> str:
     """At most six seconds; outputs fixed state only, never media metadata.
 
     Windows API: https://learn.microsoft.com/uwp/api/windows.media.control.globalsystemmediatransportcontrolssession.tryplayasync
@@ -96,7 +103,10 @@ def _request_music_play(system_dir: Path, runner=None, *, timeout=6) -> str:
     """
     run = subprocess.run if runner is None else runner
     executable = Path(system_dir) / "WindowsPowerShell" / "v1.0" / "powershell.exe"
-    encoded = base64.b64encode(_SMTC_SCRIPT.encode("utf-16-le")).decode("ascii")
+    if type(yandex_only) is not bool:
+        raise ValueError("Player selection must be an explicit boolean")
+    script = _SMTC_SCRIPT_YANDEX if yandex_only else _SMTC_SCRIPT
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
     try:
         result = run([str(executable), "-NoLogo", "-NoProfile", "-NonInteractive", "-Mta", "-EncodedCommand", encoded],
                      shell=False, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,
@@ -160,8 +170,15 @@ def _native_music_executable() -> Path | None:
         return None
 
 
-def _open_player(opener, launcher):
+def _require_current(guard):
+    if guard is not None and (not callable(guard) or guard() is not True):
+        raise PermissionError("Music request canceled")
+
+
+def _open_player(opener, launcher, authorization_guard=None):
+    _require_current(authorization_guard)
     executable = _native_music_executable()
+    _require_current(authorization_guard)
     if executable is not None:
         launch = subprocess.Popen if launcher is None else launcher
         try:
@@ -182,11 +199,45 @@ def _confirmed_result(state):
     return None
 
 
-def execute_music_action(action: str, system_dir: Path, *, runner=None, opener=None, launcher=None) -> str:
+def _start_morning_music(system_dir, *, runner, opener, launcher, authorization_guard=None):
+    """Start the installed Yandex player, then try its music session only.
+
+    This does not invent a random track or morning playlist. If no authorized
+    music queue/session exists, opening the app/site remains an honest fallback.
+    No blind keyboard shortcut or undocumented URL can toggle a different app.
+    """
+    opened = (_open_player(opener, launcher) if authorization_guard is None else
+              _open_player(opener, launcher, authorization_guard))
+    if opened == "native":
+        deadline = time.monotonic() + 2.5
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            _require_current(authorization_guard)
+            state = _request_music_play(system_dir, runner=runner, timeout=remaining, yandex_only=True)
+            if state in {"playing", "already_playing"}:
+                return "Продолжил музыку в Яндекс Музыке." if state == "playing" else "Музыка в Яндекс Музыке уже играет."
+            if state not in {"no_session", "not_music", "unknown_source", "not_playable"}:
+                # A missing acknowledgement might follow a successful Play.
+                # Never send another Play automatically after that ambiguity.
+                break
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.25, remaining))
+    return ("Яндекс Музыка открывается. " if opened == "native" else "Открываю сайт Яндекс Музыки. ") + (
+        "Пока не могу подтвердить воспроизведение. Если потребуется, войди и нажми Play в плеере.")
+
+
+def execute_music_action(action: str, system_dir: Path, *, runner=None, opener=None, launcher=None, authorization_guard=None) -> str:
     """Original typed/voice authorization is enforced by DesktopCore upstream."""
     if action not in MUSIC_ACTIONS:
         raise ValueError("Unsupported music action")
+    _require_current(authorization_guard)
     open_site = _open_music_site if opener is None else opener
+    if action == "music_morning":
+        return _start_morning_music(system_dir, runner=runner, opener=open_site, launcher=launcher,
+                                    authorization_guard=authorization_guard)
     if action == "music_play":
         state = _request_music_play(system_dir, runner=runner)
         confirmed = _confirmed_result(state)
@@ -194,7 +245,8 @@ def execute_music_action(action: str, system_dir: Path, *, runner=None, opener=N
             return confirmed
         # A video/unknown player is never controlled to satisfy a music request.
         # Opening a site cannot prove login, browser autoplay or audible output.
-        opened = _open_player(open_site, launcher)
+        opened = (_open_player(open_site, launcher) if authorization_guard is None else
+                  _open_player(open_site, launcher, authorization_guard))
         safe_discovery_states = {"no_session", "not_music", "unknown_source", "not_playable"}
         if state in safe_discovery_states and opened == "native":
             # Cold native launch may register its session shortly afterward.
@@ -205,6 +257,7 @@ def execute_music_action(action: str, system_dir: Path, *, runner=None, opener=N
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
+                _require_current(authorization_guard)
                 state = _request_music_play(system_dir, runner=runner, timeout=remaining)
                 confirmed = _confirmed_result(state)
                 if confirmed:
@@ -215,9 +268,7 @@ def execute_music_action(action: str, system_dir: Path, *, runner=None, opener=N
         opening = "Яндекс Музыка открывается." if opened == "native" else "Открываю сайт Яндекс Музыки."
         return (opening + " Пока не могу подтвердить воспроизведение. "
                 "Если потребуется, войди и нажми Play в плеере.")
-    opened = _open_player(open_site, launcher)
+    opened = (_open_player(open_site, launcher) if authorization_guard is None else
+              _open_player(open_site, launcher, authorization_guard))
     opening = "Яндекс Музыка открывается." if opened == "native" else "Открываю сайт Яндекс Музыки."
-    if action == "music_morning":
-        return (opening + " Утреннюю подборку нужно выбрать в плеере; сам её пока не выбираю. "
-                "Если потребуется, войди и нажми Play.")
     return opening + " Если потребуется, войди и нажми Play в плеере."
