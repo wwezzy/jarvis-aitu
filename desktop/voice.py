@@ -30,11 +30,12 @@ _PREPARE_SPEECH = object()
 SPEECH_ECHO_TAIL = 0.25
 VOSK_ALIAS_CONFIDENCE = 0.90
 CLONE_READY_TIMEOUT = 120.0
+UTTERANCE_SILENCE_SECONDS = 0.8
 _CONFIDENT_READ_ONLY = frozenset({"как дела", "что ты умеешь", "помощь", "команды", "привет", "ты здесь",
                                 "how are you", "what can you do", "help", "hello", "are you there"})
 
 
-def pcm_active(data):
+def _pcm_rms(data):
     """An acoustic buffer trigger, never a wake/intent decision.
 
     Use zero-mean energy so silence and a DC offset do not start an utterance.
@@ -42,14 +43,18 @@ def pcm_active(data):
     Candidates still require an exact leading wake before any command window.
     """
     if not isinstance(data, bytes) or len(data) < 4 or len(data) % 2:
-        return False
+        return 0.0
     values = array("h")
     values.frombytes(data)
     if sys.byteorder != "little":
         values.byteswap()
     mean = sum(values) / len(values)
     variance = max(0, sum(value * value for value in values) / len(values) - mean * mean)
-    return math.sqrt(variance) / 32768 >= 0.002
+    return math.sqrt(variance) / 32768
+
+
+def pcm_active(data):
+    return _pcm_rms(data) >= 0.002
 
 
 def strip_wake_prefix(text, *, verified=False):
@@ -120,6 +125,25 @@ class _CueSpeech:
     pcm: bytes
     sample_rate: int
     channels: int
+    completion: object = None
+
+
+class _CueCompletion:
+    """Trusted callback receives one result, never a media path or command.
+
+    A UI caller must only bridge this worker notification onto its Qt thread.
+    """
+    def __init__(self, callback):
+        self._callback, self._lock = callback, threading.Lock()
+
+    def finish(self, played):
+        with self._lock:
+            callback, self._callback = self._callback, None
+        if callback is not None:
+            try:
+                callback(played is True)
+            except Exception:
+                pass
 
 
 def _event_current(validator=None) -> bool:
@@ -139,7 +163,7 @@ class UtteranceBuffer:
     """
     def __init__(self, sample_rate):
         self.maximum = sample_rate * 2 * 12
-        self.silence_limit = int(sample_rate * 2 * 0.6)
+        self.silence_limit = int(sample_rate * 2 * UTTERANCE_SILENCE_SECONDS)
         self.reset()
 
     def reset(self):
@@ -176,11 +200,40 @@ class UtteranceBuffer:
         return b"".join(self._frames) if self.started and not self.overflow else None
 
 
+class _RecognitionSegments:
+    """Keep early Vosk endpoints until the bounded acoustic phrase finishes."""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.parts, self.words = [], []
+
+    def add(self, result):
+        text = result.get("text", "")
+        if not isinstance(text, str) or len(text) > 2000 or len(self.parts) >= 32:
+            raise ValueError("Invalid final speech segment")
+        if not text.strip():
+            return
+        self.parts.append(text.strip())
+        words = result.get("result")
+        if self.words is not None:
+            if not isinstance(words, list) or len(words) != len(text.split()) or len(self.words) + len(words) > 256:
+                self.words = None
+            else:
+                self.words.extend(words)
+
+    def result(self):
+        text = " ".join(self.parts)
+        if len(text) > 2000:
+            raise ValueError("Final speech result too large")
+        return {"text": text, "result": self.words}
+
+
 class WakeGate:
     """Whole-token wake word, one command, bounded follow-up; no fuzzy match."""
 
     WAKE = {"джарвис", "джарвиз", "jarvis"}
-    CANCEL = {"отмена", "не надо", "хватит", "cancel", "stop listening"}
+    CANCEL = {"отмена", "не надо", "хватит", "стоп", "stop", "cancel", "stop listening"}
 
     def __init__(self, timeout: float = 10.0):
         self.timeout = timeout
@@ -264,6 +317,24 @@ class VoiceService:
         self._wake_serial, self._retry_serial = 0, None
         self._last_spoken = 0.0
         self._lock = threading.Lock()
+        self._stats_lock = threading.Lock()
+        self._reset_diagnostics()
+
+    def _reset_diagnostics(self):
+        with self._stats_lock:
+            self._stats = {key: 0 for key in ("audio_callbacks", "suppressed_speech", "suppressed_decoder", "suppressed_echo",
+                "queue_overflows", "capture_overflows", "maximum_queue", "utterances", "commands", "wake_shortcuts",
+                "decoder_requests", "decoder_failures", "capture_sample_rate")}
+            self._stats.update(last_decoder_ms=None, last_level_dbfs=None)
+
+    def _count(self, key):
+        with self._stats_lock:
+            self._stats[key] += 1
+
+    def diagnostics(self):
+        """Session-only numeric counters: no audio, transcripts, files or IDs."""
+        with self._stats_lock:
+            return dict(self._stats)
 
     def _emit(self, callback, value):
         try:
@@ -294,7 +365,8 @@ class VoiceService:
         return {"ready": dependencies and model and microphone, "model": model,
                 "dependencies": dependencies, "microphone": microphone, "reason": reason,
                 "running": bool(self._thread and self._thread.is_alive()),
-                "speaking": self._speaking.is_set(), "speech_backend": self.speech_backend}
+                "speaking": self._speaking.is_set(), "speech_backend": self.speech_backend,
+                "diagnostics": self.diagnostics()}
 
     def start(self) -> bool:
         with self._lock:
@@ -310,6 +382,7 @@ class VoiceService:
                 self._emit(self.on_state, labels[report["reason"]])
                 return False
             self._stop.clear()
+            self._reset_diagnostics()
             self.gate.reset()
             self._clear_audio()
             self._thread = threading.Thread(target=self._listen, name="JarvisMicrophone", daemon=True)
@@ -334,16 +407,83 @@ class VoiceService:
                 break
 
     def _audio_callback(self, data, frames, timing, status):
-        if (self._stop.is_set() or self._speaking.is_set() or self._transcribing.is_set()
-                or time.monotonic() - self._last_spoken < SPEECH_ECHO_TAIL):
+        self._count("audio_callbacks")
+        if self._stop.is_set():
+            return
+        if self._speaking.is_set():
+            self._count("suppressed_speech")
+            return
+        if self._transcribing.is_set():
+            self._count("suppressed_decoder")
+            return
+        if time.monotonic() - self._last_spoken < SPEECH_ECHO_TAIL:
+            self._count("suppressed_echo")
+            return
+        if getattr(status, "input_overflow", False):
+            self._count("capture_overflows")
+            self._clear_audio()
+            self.gate.reset()
+            self._audio_epoch += 1
             return
         try:
             self._audio.put_nowait(bytes(data))
+            with self._stats_lock:
+                self._stats["maximum_queue"] = max(self._stats["maximum_queue"], self._audio.qsize())
         except queue.Full:
             # Drop old audio rather than execute a stale delayed utterance.
             self._clear_audio()
             self.gate.reset()
             self._audio_epoch += 1
+            self._count("queue_overflows")
+
+    @staticmethod
+    def _complete_name_only(text, words, pcm, sample_rate, pcm_start):
+        """A high-confidence final wake plus silent aligned tail needs no ASR.
+
+        Vosk 0.3.45 word times are cumulative across Reset(), so the listener
+        supplies the accepted-sample offset of this bounded original buffer.
+        Missing timing or additional audible speech cannot take the shortcut.
+        """
+        if (not isinstance(words, list) or len(words) != 1 or not isinstance(words[0], dict)
+                or not isinstance(pcm, bytes) or len(pcm) % 2 or type(sample_rate) is not int or not 8000 <= sample_rate <= 48000
+                or type(pcm_start) not in {int, float} or not math.isfinite(pcm_start) or pcm_start < 0):
+            return False
+        word = words[0]
+        if (not isinstance(word.get("word"), str) or word["word"] not in WakeGate.WAKE
+                or re.findall(r"\w+", text.casefold()) != [word["word"]]
+                or any(type(word.get(key)) not in {int, float} or not math.isfinite(word[key]) for key in ("start", "end", "conf"))
+                or not 0.95 <= word["conf"] <= 1 or not 0 <= word["start"] < word["end"]
+                or not pcm_start - 0.1 <= word["start"] < word["end"] <= pcm_start + len(pcm) / (2 * sample_rate)):
+            return False
+        start = max(0, round((word["end"] - pcm_start + 0.12) * sample_rate)) * 2
+        tail, frame, consecutive = pcm[start:], max(2, sample_rate // 50 * 2), 0
+        if len(tail) < sample_rate // 4 * 2:
+            return False
+        for offset in range(0, len(tail) - frame + 1, frame):
+            consecutive = consecutive + 1 if pcm_active(tail[offset:offset + frame]) else 0
+            if consecutive >= 3:
+                return False
+        return True
+
+    @staticmethod
+    def _capture_configuration(sound):
+        """Pin the same default input; use 16k only when its SDK probe accepts."""
+        info = sound.query_devices(kind="input")
+        rate, device = int(info["default_samplerate"]), None
+        try:
+            candidate = sound.default.device[0]
+            if type(candidate) is int and candidate >= 0:
+                device = candidate
+        except (AttributeError, IndexError, TypeError):
+            pass
+        check = getattr(sound, "check_input_settings", None)
+        if device is not None and callable(check):
+            try:
+                if check(device=device, channels=1, dtype="int16", samplerate=16000) is None:
+                    rate = 16000
+            except Exception:
+                pass  # Preserve the original rate and device; no OS setting changes.
+        return rate, device
 
     @staticmethod
     def _confident_alias(full_text, command, words):
@@ -374,15 +514,20 @@ class VoiceService:
             return None
         self._transcribing.set()
         self._clear_audio()
+        started = time.monotonic()
+        self._count("decoder_requests")
         try:
             decoded = self._stt.transcribe(pcm, sample_rate)
             if self._stop.is_set() or self._closed.is_set():
                 return None
             return strip_wake_prefix(decoded, verified=True)
         except Exception:
+            self._count("decoder_failures")
             self._emit(self.on_state, "Не удалось уверенно распознать команду. Повтори её или напиши текстом.")
             return None
         finally:
+            with self._stats_lock:
+                self._stats["last_decoder_ms"] = round(max(0, time.monotonic() - started) * 1000)
             self._clear_audio()
             self._transcribing.clear()
 
@@ -404,6 +549,8 @@ class VoiceService:
         last_spoken = self._last_spoken
         self._transcribing.set()
         self._clear_audio()
+        decoding_started = time.monotonic()
+        self._count("decoder_requests")
         try:
             decoded = decoder.transcribe(pcm, sample_rate)
             if (self._stop.is_set() or self._closed.is_set() or self._speaking.is_set()
@@ -418,13 +565,16 @@ class VoiceService:
             first = re.search(r"\w+", decoded, flags=re.UNICODE)
             return decoded if first and first.group().casefold() in WakeGate.WAKE else None
         except Exception:
+            self._count("decoder_failures")
             # A false/uncertain idle candidate must stay silent and unarmed.
             return None
         finally:
+            with self._stats_lock:
+                self._stats["last_decoder_ms"] = round(max(0, time.monotonic() - decoding_started) * 1000)
             self._clear_audio()
             self._transcribing.clear()
 
-    def _recognized(self, text: str, pcm=None, sample_rate=None, *, words=None, english_candidate=False):
+    def _recognized(self, text: str, pcm=None, sample_rate=None, *, words=None, english_candidate=False, pcm_start=None):
         if (self._stop.is_set() or self._closed.is_set() or self._speaking.is_set()
                 or time.monotonic() - self._last_spoken < SPEECH_ECHO_TAIL):
             return
@@ -452,14 +602,15 @@ class VoiceService:
         if result.kind == "command" and WakeGate.is_cancel(result.text):
             self.gate.reset()
             result = WakeDecision("cancel")
-        acknowledged = result.kind == "wake"
         if result.kind == "wake":
-            self._emit(self.on_state, "Слушаю команду…")
-            self.say("Да, сэр")
-            if not bilingual_audio:
+            if not bilingual_audio or self._complete_name_only(text, words, pcm, sample_rate, pcm_start):
+                self._count("wake_shortcuts")
+                self._emit(self.on_state, "Слушаю команду…")
+                self.say("Да, сэр")
                 return
-            # The same utterance can contain a command that Vosk omitted after
-            # the recognized name. Keep the original fixed ACK immediate.
+            # Vosk may omit an English tail in this same utterance. Decode it
+            # before inviting a follow-up: saying ACK during synchronous ASR
+            # otherwise causes the user's next command to be discarded.
         if result.kind in {"wake", "command"}:
             self._emit(self.on_state, "Обрабатываю команду…")
             confident = result.kind == "command" and self._confident_alias(text, result.text, words)
@@ -472,19 +623,22 @@ class VoiceService:
                 # A failed decoder cannot keep extending authorization. Retry
                 # uses the original finite window, never a fresh ten seconds.
                 self.gate.deadline = retry_deadline if time.monotonic() <= retry_deadline else 0
-                if decoded is None and not acknowledged:
+                if decoded is None:
                     self._recognition_retry(retry_deadline)
-                if decoded == "" and not acknowledged:
+                if decoded == "" and self.gate.deadline:
                     self._emit(self.on_state, "Слушаю команду…")
                     self.say("Да, сэр")
                 return
             self.gate.reset()
             if WakeGate.is_cancel(decoded):
                 self._emit(self.on_state, "Ожидаю слово «Джарвис»")
+                self._emit(self.on_text, "стоп")
             else:
+                self._count("commands")
                 self._emit(self.on_text, decoded)
         elif result.kind == "cancel":
             self._emit(self.on_state, "Ожидаю слово «Джарвис»")
+            self._emit(self.on_text, "стоп")
 
     def _recognition_retry(self, deadline):
         """One audible clarification per real wake; it never renews permission."""
@@ -538,8 +692,9 @@ class VoiceService:
                 except Exception:
                     self._stt = None
                     self._emit(self.on_state, "Два языка пока недоступны. Русское распознавание продолжает работать.")
-            device = sound.query_devices(kind="input")
-            sample_rate = int(device["default_samplerate"])
+            sample_rate, device = self._capture_configuration(sound)
+            with self._stats_lock:
+                self._stats["capture_sample_rate"] = sample_rate
             recognizer = vosk.KaldiRecognizer(model, sample_rate)
             set_words = getattr(recognizer, "SetWords", None)
             if callable(set_words):
@@ -556,20 +711,23 @@ class VoiceService:
                     close_english()
             if self._stop.is_set():
                 return
-            with sound.RawInputStream(samplerate=sample_rate, blocksize=max(400, int(sample_rate * 0.05)),
+            with sound.RawInputStream(device=device, samplerate=sample_rate, blocksize=max(400, int(sample_rate * 0.05)),
                                       dtype="int16", channels=1, callback=self._audio_callback):
                 self._emit(self.on_state, "Ожидаю слово «Джарвис»")
                 reset_after_speech = self._last_spoken
                 audio_epoch, utterance = self._audio_epoch, UtteranceBuffer(sample_rate)
                 generation, bilingual = self._speech_generation, self.multilingual_stt_enabled
+                segments, accepted_samples = _RecognitionSegments(), 0
                 while not self._stop.is_set():
                     if english is not None and not self.multilingual_stt_enabled:
                         close_english()
                         recognizer.Reset()
                         utterance.reset()
+                        segments.reset()
                     if self._speaking.is_set():
                         reset_english()
                         utterance.reset()
+                        segments.reset()
                         self._clear_audio()
                         self._stop.wait(0.05)
                         continue
@@ -577,6 +735,7 @@ class VoiceService:
                     if echo_remaining > 0:
                         reset_english()
                         utterance.reset()
+                        segments.reset()
                         self._clear_audio()
                         self._stop.wait(min(0.05, echo_remaining))
                         continue
@@ -589,6 +748,7 @@ class VoiceService:
                         generation, bilingual = self._speech_generation, self.multilingual_stt_enabled
                         utterance.reset()
                         reset_english()
+                        segments.reset()
                         self._emit(self.on_state, "Слушаю команду…" if self._followup_armed() else "Ожидаю слово «Джарвис»")
                     try:
                         data = self._audio.get(timeout=0.2)
@@ -607,10 +767,14 @@ class VoiceService:
                         # This frame cannot finish an utterance from that epoch.
                         continue
                     complete = recognizer.AcceptWaveform(data)
+                    accepted_samples += len(data) // 2
                     result = json.loads(recognizer.Result()) if complete else None
                     if self.multilingual_stt_enabled:
                         was_started = utterance.started
-                        utterance.append(data, active=pcm_active(data))
+                        level = _pcm_rms(data)
+                        with self._stats_lock:
+                            self._stats["last_level_dbfs"] = round(20 * math.log10(max(level, 0.000001)))
+                        utterance.append(data, active=level >= 0.002)
                         if english is not None and utterance.started and not utterance.overflow:
                             try:
                                 # First active frame is already in pcm(), together
@@ -619,10 +783,18 @@ class VoiceService:
                                 english.accept(data if was_started else utterance.pcm())
                             except Exception:
                                 close_english()
-                        if not complete and utterance.finished:
-                            result = json.loads(recognizer.FinalResult())
-                            complete = True
+                        if complete:
+                            segments.add(result)
+                        # Vosk may end a segment at a short mid-sentence pause.
+                        # Keep that literal result and the whole original PCM
+                        # until the longer acoustic endpoint is reached.
+                        if utterance.finished:
+                            segments.add(json.loads(recognizer.FinalResult()))
+                            result, complete = segments.result(), True
+                        elif utterance.started:
+                            complete = False
                     if complete or utterance.overflow:
+                        self._count("utterances")
                         result = result or {"text": ""}
                         if utterance.overflow:
                             first = re.search(r"\w+", result.get("text", ""), flags=re.UNICODE)
@@ -641,11 +813,14 @@ class VoiceService:
                             if (audio_epoch == self._audio_epoch and generation == self._speech_generation
                                     and bilingual == self.multilingual_stt_enabled
                                     and reset_after_speech == self._last_spoken):
-                                self._recognized(result.get("text", ""), utterance.pcm(), sample_rate,
-                                                 words=result.get("result"), english_candidate=candidate)
+                                pcm = utterance.pcm()
+                                pcm_start = max(0, (accepted_samples - len(pcm) // 2) / sample_rate) if pcm is not None else None
+                                self._recognized(result.get("text", ""), pcm, sample_rate,
+                                                 words=result.get("result"), english_candidate=candidate, pcm_start=pcm_start)
                         recognizer.Reset()
                         utterance.reset()
                         reset_english()
+                        segments.reset()
         except Exception as error:
             self._emit(self.on_state, f"Голос недоступен ({type(error).__name__}). Текстовый ввод работает.")
         finally:
@@ -685,15 +860,21 @@ class VoiceService:
 
     def interrupt(self):
         """Stop old speech without stopping the microphone or authorizing actions."""
+        canceled = []
         with self._lock:
             self._speech_generation += 1
             self._halt_speech.set()
             self._urgent_ack = None
             while True:
                 try:
-                    self._speech.get_nowait()
+                    item = self._speech.get_nowait()
+                    item = item[1] if isinstance(item, tuple) else item
+                    if isinstance(item, _CueSpeech) and item.completion is not None:
+                        canceled.append(item.completion)
                 except queue.Empty:
                     break
+        for completion in canceled:
+            completion.finish(False)
 
     def _enqueue_speech(self, item):
         if not self.speech_enabled or self._closed.is_set() or os.name != "nt":
@@ -742,10 +923,21 @@ class VoiceService:
         if text:
             self._enqueue_speech(text)
 
-    def play_cue(self, name):
-        """Queue one verified private cue; arbitrary names/paths are refused."""
-        if name != "welcome_home" or not self.speech_enabled or self._closed.is_set():
+    def play_cue(self, name, *, on_complete=None):
+        """Queue a verified cue; notify exactly once after drain or cancellation.
+
+        The trusted UI callback must only emit its own thread-safe signal. This
+        worker never follows the notification with a Core/OS action itself.
+        """
+        completion = _CueCompletion(on_complete) if callable(on_complete) else None
+        def refused():
+            if completion is not None:
+                completion.finish(False)
             return False
+        if on_complete is not None and not callable(on_complete):
+            return refused()
+        if name != "welcome_home" or not self.speech_enabled or self._closed.is_set():
+            return refused()
         try:
             from desktop.audio_cues import CueLibrary
             cue = CueLibrary().read(name)
@@ -753,11 +945,13 @@ class VoiceService:
                     or type(cue.channels) is not int or cue.channels not in {1, 2}
                     or type(cue.sample_rate) is not int or not 16000 <= cue.sample_rate <= 48000
                     or len(cue.pcm) % (2 * cue.channels) or len(cue.pcm) > cue.sample_rate * 2 * cue.channels * 20):
-                return False
+                return refused()
             self.interrupt()
-            return self._enqueue_speech(_CueSpeech(cue.pcm, cue.sample_rate, cue.channels)) is True
+            if self._enqueue_speech(_CueSpeech(cue.pcm, cue.sample_rate, cue.channels, completion)) is True:
+                return True
+            return refused()
         except Exception:
-            return False
+            return refused()
 
     def say_event(self, text: str, *, is_current):
         """Recheck a versioned plan event in the audio worker, never dispatch it."""
@@ -905,7 +1099,7 @@ class VoiceService:
                 or len(pcm) > sample_rate * 2 * channels * 120):
             raise ValueError("Invalid synthesized audio")
         if self._halt_speech.is_set() or not self.speech_enabled or self._closed.is_set() or not _event_current(is_current):
-            return
+            return False
         sound = importlib.import_module("sounddevice")
         with sound.RawOutputStream(samplerate=sample_rate, dtype="int16", channels=channels,
                                    blocksize=0, latency="low") as stream:
@@ -913,9 +1107,12 @@ class VoiceService:
                 if (self._halt_speech.is_set() or not self.speech_enabled or self._closed.is_set()
                         or not _event_current(is_current)):
                     stream.abort()
-                    break
+                    return False
                 stream.write(pcm[offset:offset + 2048])
                 self._utterance_audio_started = True
+        # RawOutputStream.__exit__ stops and drains the device before this point.
+        return (not self._halt_speech.is_set() and self.speech_enabled and not self._closed.is_set()
+                and _event_current(is_current))
 
     def _speak_loop(self):
         # Neural synthesis and COM remain on this one worker. Fallback COM is
@@ -929,14 +1126,21 @@ class VoiceService:
                 generation, text = item if isinstance(item, tuple) else (self._speech_generation, item)
                 if isinstance(text, _CueSpeech):
                     if not self._begin_audio(generation):
+                        if text.completion is not None:
+                            text.completion.finish(False)
                         continue
+                    played = False
                     try:
                         self.speech_backend = "personal_cue"
-                        self._play_pcm(text.pcm, text.sample_rate, channels=text.channels)
+                        played = self._play_pcm(text.pcm, text.sample_rate, channels=text.channels,
+                            is_current=lambda: generation == self._speech_generation) is True
                     except Exception:
                         self._emit(self.on_state, "Личный аудиосигнал недоступен. Ответ остаётся на экране.")
                     finally:
                         self._end_audio()
+                        if text.completion is not None:
+                            text.completion.finish(played and generation == self._speech_generation
+                                and self.speech_enabled and not self._closed.is_set())
                     continue
                 validator = text.is_current if isinstance(text, _EventSpeech) else None
                 preserve_wake_deadline = isinstance(text, _EventSpeech) and text.preserve_wake_deadline

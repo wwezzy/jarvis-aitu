@@ -7,7 +7,12 @@ context contains only bounded completed local-model exchanges.
 from __future__ import annotations
 
 import json
+import http.client
+import io
 import re
+import select
+import socket
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -51,6 +56,105 @@ SYSTEM = (
 
 class LocalChatUnavailable(RuntimeError):
     pass
+
+
+class LocalChatCancelled(LocalChatUnavailable):
+    """An explicitly canceled generation has no final answer to persist."""
+
+
+class _CancelableReader(io.RawIOBase):
+    """Poll owned HTTP input without poisoning a buffered reader on timeout.
+
+    Windows timed recv can remain asleep after another thread shuts its socket
+    down. Waiting for readiness in small bounded intervals keeps header parsing
+    and partial lines cancelable, while retaining one request and its deadline.
+    The real SocketIO owns the makefile reference and closes it normally.
+    """
+    def __init__(self, raw, client, deadline):
+        super().__init__()
+        self._raw, self._sock = raw, raw._sock
+        self._client, self._deadline = client, deadline
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        self._checkClosed()
+        while True:
+            self._client._check_cancel()
+            remaining = self._deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Local response exceeded its time limit")
+            try:
+                ready, _, _ = select.select([self._sock], [], [], min(0.05, remaining))
+                self._client._check_cancel()
+                if ready:
+                    self._sock.settimeout(min(0.1, remaining))
+                    return self._sock.recv_into(buffer)
+            except TimeoutError:
+                continue
+            except (OSError, ValueError):
+                self._client._check_cancel()
+                raise
+
+    def close(self):
+        try:
+            self._raw.close()
+        finally:
+            super().close()
+
+
+class _CancelableSocketFile:
+    def __init__(self, transport, client, deadline):
+        self.transport, self.client, self.deadline = transport, client, deadline
+
+    def makefile(self, mode):
+        if mode != "rb":
+            raise ValueError("Read-only HTTP input required")
+        return io.BufferedReader(_CancelableReader(self.transport.makefile("rb", buffering=0), self.client, self.deadline))
+
+
+class _ControlledHTTPHandler(urllib.request.HTTPHandler):
+    """Keep only our loopback sockets interruptible while headers/body wait."""
+    def __init__(self, client):
+        super().__init__()
+        self.client, self.lock, self.sockets = client, threading.Lock(), []
+
+    def http_open(self, request):
+        owner = self
+        deadline = time.monotonic() + request.timeout
+        class Response(http.client.HTTPResponse):
+            def __init__(self, transport, *args, **kwargs):
+                super().__init__(_CancelableSocketFile(transport, owner.client, deadline), *args, **kwargs)
+        class Connection(http.client.HTTPConnection):
+            response_class = Response
+
+            def connect(self):
+                owner.client._check_cancel()
+                super().connect()
+                with owner.lock:
+                    owner.sockets.append(self.sock)
+                if owner.client._canceled():
+                    owner.interrupt()
+                    owner.client._check_cancel()
+        return self.do_open(Connection, request)
+
+    def interrupt(self):
+        with self.lock:
+            owned = list(self.sockets)
+        for transport in owned:
+            try:
+                transport.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                transport.close()
+            except OSError:
+                pass
+
+    def reset(self):
+        with self.lock:
+            self.sockets.clear()
 
 
 class LocalChatTruncated(LocalChatUnavailable):
@@ -225,7 +329,9 @@ class LocalChat:
             raise ValueError("A local model name is required")
         self.model = model
         self.timeout = min(90, max(1, timeout))
-        self.opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        self._cancel_event = None
+        self._transport = _ControlledHTTPHandler(self) if opener is None else None
+        self.opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect(), self._transport)
         self.last_usage = None
         self.last_budget = None
 
@@ -237,8 +343,15 @@ class LocalChat:
         return {"input_tokens": counter("prompt_eval_count"), "output_tokens": counter("eval_count"),
                 "elapsed_ms": max(0, round((time.monotonic() - started) * 1000))}
 
-    @staticmethod
-    def _remaining(response, deadline):
+    def _canceled(self):
+        return self._cancel_event is not None and self._cancel_event.is_set()
+
+    def _check_cancel(self):
+        if self._canceled():
+            raise LocalChatCancelled("Local generation canceled")
+
+    def _remaining(self, response, deadline):
+        self._check_cancel()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise LocalChatUnavailable("Local response exceeded its time limit")
@@ -325,11 +438,13 @@ class LocalChat:
         wrappers = self.model.casefold().startswith("qwen3:") and "instruct" not in self.model.casefold()
 
         def emit(delta):
+            self._check_cancel()
             if not delta:
                 return
             try:
                 if on_chunk(delta) is False:
                     raise LocalChatUnavailable("Local response cancelled")
+                self._check_cancel()
             except LocalChatUnavailable:
                 raise
             except Exception as error:
@@ -339,6 +454,7 @@ class LocalChat:
 
         def consume(line):
             nonlocal events, content, preview, wrappers, finished, final_event
+            self._check_cancel()
             events += 1
             if events > MAX_STREAM_EVENTS:
                 raise LocalChatUnavailable("Local stream exceeded the event limit")
@@ -416,6 +532,7 @@ class LocalChat:
         Ollama documents empty /api/chat requests for preload and keep_alive
         retention: https://docs.ollama.com/faq#how-can-i-preload-a-model-into-ollama-to-get-faster-response-times
         """
+        self._cancel_event = None
         self.last_usage = self.last_budget = None
         payload = {"model": self.model, "messages": [], "stream": False, "think": False,
                    "keep_alive": KEEP_ALIVE, "options": {"num_ctx": 4096}}
@@ -432,8 +549,12 @@ class LocalChat:
         except (LocalChatUnavailable, urllib.error.URLError, OSError, ValueError, TypeError, RecursionError):
             return False
 
-    def answer(self, text: str, history=None, on_chunk=None, *, plan_context=None) -> str:
+    def answer(self, text: str, history=None, on_chunk=None, *, plan_context=None, cancel_event=None) -> str:
         self.last_usage = self.last_budget = None
+        if cancel_event is not None and not isinstance(cancel_event, type(threading.Event())):
+            raise ValueError("A cancellation event is required")
+        self._cancel_event = cancel_event
+        self._check_cancel()
         if not isinstance(text, str) or not text.strip() or len(text) > 8000 or "\x00" in text:
             raise ValueError("Local question must contain 1..8000 characters")
         if on_chunk is not None and not callable(on_chunk):
@@ -448,8 +569,20 @@ class LocalChat:
         request = self._request(payload)
         started = time.monotonic()
         deadline = started + self.timeout
+        finished = threading.Event()
+        watcher = None
+        if cancel_event is not None and self._transport is not None:
+            def cancel_transport():
+                while not finished.wait(0.025):
+                    if cancel_event.is_set():
+                        self._transport.interrupt()
+                        return
+            watcher = threading.Thread(target=cancel_transport, name="JarvisChatCancel", daemon=True)
+            watcher.start()
         try:
+            self._check_cancel()
             with self.opener.open(request, timeout=self.timeout) as response:
+                self._check_cancel()
                 self._response_origin(response)
                 if on_chunk is not None:
                     final, data = self._stream(response, deadline, on_chunk)
@@ -463,7 +596,15 @@ class LocalChat:
                         raise LocalChatUnavailable("Local model did not complete its answer")
                     final = _final_answer(self._message(data))
             self.last_usage = self._usage(data, started)
+            self._check_cancel()
             return final
         except (urllib.error.URLError, OSError, ValueError, TypeError, RecursionError) as error:
+            self._check_cancel()
             # No response body, request content or secret-bearing local errors.
             raise LocalChatUnavailable("Local model unavailable") from error
+        finally:
+            finished.set()
+            if watcher is not None:
+                watcher.join(0.3)
+            if self._transport is not None:
+                self._transport.reset()

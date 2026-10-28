@@ -79,6 +79,7 @@ class ModelEngine:
         with torch.inference_mode():
             chunks = self.model.inference_stream(text, language, self.conditioning, self.embedding,
                                                   stream_chunk_size=20, speed=rate / 185,
+                                                  repetition_penalty=float(self.model.config.repetition_penalty),
                                                   enable_text_splitting=True)
             for chunk in chunks:
                 if cancelled():

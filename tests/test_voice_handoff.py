@@ -48,7 +48,7 @@ def test_name_only_russian_result_recovers_name_and_english_command_in_same_pcm(
     pcm = tone()
     service._recognized("джарвис", pcm, 16000)
     assert heard == ["Open YouTube"] and calls == [(pcm, 16000)]
-    assert spoken == ["Да, сэр"]
+    assert spoken == []  # Never invite a follow-up while decoding this same utterance.
 
 
 def test_empty_russian_followup_uses_original_pcm_only_after_verified_wake(recognition):
@@ -127,7 +127,7 @@ def test_cancel_does_not_become_an_action_or_model_question(recognition, text):
     service, heard, _states, _spoken, calls, _clock, _result = recognition
     service.gate.feed("джарвис", 100)
     service._recognized(text, tone(), 16000)
-    assert not heard and not calls and service.gate.deadline == 0
+    assert heard == ["стоп"] and not calls and service.gate.deadline == 0
 
 
 def test_background_speech_cannot_revive_an_expired_or_empty_followup_window():
@@ -139,11 +139,11 @@ def test_background_speech_cannot_revive_an_expired_or_empty_followup_window():
     assert gate.feed("", 220).kind == "ignore" and gate.deadline == 0
 
 
-def test_punctuated_whisper_cancellation_does_not_reach_core(recognition):
+def test_punctuated_whisper_cancellation_reaches_only_fixed_ui_stop(recognition):
     service, heard, _states, _spoken, calls, _clock, result = recognition
     result["text"] = "Отмена."
     service._recognized("джарвис какой план", tone(), 16000)
-    assert not heard and len(calls) == 1 and service.gate.deadline == 0
+    assert heard == ["стоп"] and len(calls) == 1 and service.gate.deadline == 0
 
 
 def test_quoted_first_wake_strips_name_and_keeps_whole_token_boundary():
@@ -161,7 +161,7 @@ def test_acoustic_buffer_onset_and_silence_endpoint_do_not_require_russian_parti
     for start in range(0, len(pcm), 1600):
         frame = pcm[start:start + 1600]
         value.append(frame, active=pcm_active(frame))
-    for _ in range(12):
+    for _ in range(16):
         value.append(quiet, active=pcm_active(quiet))
     assert value.started and value.finished and not value.overflow
     assert pcm in value.pcm() and len(value.pcm()) <= 16000 * 2 * 12
@@ -199,11 +199,11 @@ class EnglishWake:
 
 
 def listen_with_fake_devices(service, monkeypatch, final_text, pcm, *, frames=None,
-                             english=None, words=None, on_get=None, on_capture=None):
+                             english=None, words=None, on_get=None, on_capture=None, endpoints=None):
     """Exercise the actual listener loop with final/partial text always absent."""
     calls = []
     if frames is None:
-        frames = [pcm[i:i + 1600] for i in range(0, len(pcm), 1600)] + [b"\0\0" * 800] * 12
+        frames = [pcm[i:i + 1600] for i in range(0, len(pcm), 1600)] + [b"\0\0" * 800] * 16
     english = EnglishWake(ready=False) if english is None else english
     class InputQueue:
         def __init__(self):
@@ -222,10 +222,16 @@ def listen_with_fake_devices(service, monkeypatch, final_text, pcm, *, frames=No
                 service._stop.set()
                 raise queue.Empty from None
     class Recognizer:
+        def __init__(self):
+            self.frame, self.segment = 0, None
         def SetWords(self, value):
             calls.append(("word_scores", value))
         def AcceptWaveform(self, data):
-            return False
+            self.frame += 1
+            self.segment = (endpoints or {}).get(self.frame)
+            return self.segment is not None
+        def Result(self):
+            return json.dumps(self.segment)
         def FinalResult(self):
             calls.append("final")
             return json.dumps({"text": final_text, "result": words})
@@ -389,7 +395,7 @@ def test_english_cancel_consumes_its_own_verified_utterance_without_dispatch(rec
     service, heard, _states, spoken, calls, _clock, result = recognition
     result["text"] = "Jarvis, cancel."
     service._recognized("", tone(), 16000, english_candidate=True)
-    assert len(calls) == 1 and not heard and not spoken and not service.gate.deadline
+    assert len(calls) == 1 and heard == ["стоп"] and not spoken and not service.gate.deadline
 
 
 def test_optional_english_listener_uses_preroll_once_and_ignores_long_idle_time(recognition, monkeypatch):
@@ -397,15 +403,15 @@ def test_optional_english_listener_uses_preroll_once_and_ignores_long_idle_time(
     english, quiet, pcm = EnglishWake(), b"\0\0" * 800, tone()
     active = [pcm[i:i + 1600] for i in range(0, len(pcm), 1600)]
     result["text"] = "Jarvis, open YouTube."
-    frames = [quiet] * 400 + active + [quiet] * 12
+    frames = [quiet] * 400 + active + [quiet] * 16
     def before_capture():
         assert len(english.events) == 1 and english.events[0][:2] == ("prepare", 16000)
     calls = listen_with_fake_devices(service, monkeypatch, "", pcm, frames=frames,
                                     english=english, on_capture=before_capture)
-    expected = quiet * 19 + pcm + quiet * 12
+    expected = quiet * 19 + pcm + quiet * 16
     assert heard == ["open YouTube."] and decode_calls == [(expected, 16000)]
     assert english.utterances == [expected]
-    assert english.events.count("accept") == len(active) + 12
+    assert english.events.count("accept") == len(active) + 16
     assert english.events.count("finish") == 1 and english.events[-1] == "close"
     assert english.events.index("finish") < english.events.index("reset")
     assert "capture_closed" in calls and service._english_wake is None
@@ -507,7 +513,7 @@ def test_english_candidate_authority_is_not_replayed_into_next_idle_utterance(re
         return next(candidates)
     english.finish = finish_once
     result["text"] = "Jarvis open YouTube"
-    frames = [pcm[i:i + 1600] for i in range(0, len(pcm), 1600)] + [b"\0\0" * 800] * 12
+    frames = [pcm[i:i + 1600] for i in range(0, len(pcm), 1600)] + [b"\0\0" * 800] * 16
     listen_with_fake_devices(service, monkeypatch, "", pcm, english=english, frames=frames * 2)
     assert heard == ["open YouTube"] and len(decode_calls) == 1
     assert len(english.utterances) == 2 and english.events.count("finish") == 2
@@ -545,6 +551,144 @@ def test_capture_failure_closes_optional_english_model_without_frame_or_audio_le
     assert english.events[-1] == "close" and not english.utterances
     assert service._english_wake is None and not heard and not decode_calls
     assert states[-1] == "Голос недоступен (RuntimeError). Текстовый ввод работает."
+
+
+def test_proven_final_name_only_invites_followup_without_blocking_decoder(recognition):
+    service, heard, _states, spoken, calls, clock, _result = recognition
+    pcm = tone(seconds=0.4) + b"\0\0" * 12800
+    word = {"word": "джарвис", "conf": 0.99, "start": 20, "end": 20.4}
+    service._recognized("джарвис", pcm, 16000, words=[word], pcm_start=20)
+    assert spoken == ["Да, сэр"] and not calls and not heard and service.gate.deadline == 110
+    assert service.diagnostics()["wake_shortcuts"] == 1 and not service._transcribing.is_set()
+    clock[0] += 1
+    service._audio_callback(tone(seconds=0.05), 800, None, None)
+    assert service._audio.qsize() == 1 and service.diagnostics()["suppressed_decoder"] == 0
+
+
+def test_name_plus_unrecognized_audible_tail_is_decoded_before_ack_not_blindly_shortcut(recognition):
+    service, heard, _states, spoken, calls, _clock, _result = recognition
+    pcm = tone(seconds=0.4) + b"\0\0" * 1600 + tone(seconds=0.5) + b"\0\0" * 12800
+    word = {"word": "джарвис", "conf": 1, "start": 0, "end": 0.4}
+    def decode(data, rate):
+        assert not spoken and service._transcribing.is_set()
+        calls.append((data, rate))
+        return "Jarvis open YouTube"
+    service._stt.transcribe = decode
+    service._recognized("джарвис", pcm, 16000, words=[word], pcm_start=0)
+    assert heard == ["open YouTube"] and calls == [(pcm, 16000)] and not spoken
+    assert not service.diagnostics()["wake_shortcuts"]
+
+
+@pytest.mark.parametrize("change", ["uncertain", "missing-time", "stale-time", "extra-word", "wrong-word", "bad-time"])
+def test_name_shortcut_requires_complete_current_word_and_acoustic_evidence(recognition, change):
+    service, _heard, _states, spoken, calls, _clock, result = recognition
+    pcm = tone(seconds=0.4) + b"\0\0" * 12800
+    word = {"word": "джарвис", "conf": 1, "start": 20, "end": 20.4}
+    words = [word]
+    if change == "uncertain":
+        word["conf"] = 0.94
+    elif change == "missing-time":
+        del word["end"]
+    elif change == "stale-time":
+        word.update(start=0, end=0.4)
+    elif change == "extra-word":
+        words.append(dict(word))
+    elif change == "wrong-word":
+        word["word"] = "Jarvislike"
+    else:
+        word["end"] = float("nan")
+    result["text"] = "Jarvis"
+    service._recognized("джарвис", pcm, 16000, words=words, pcm_start=20)
+    assert len(calls) == 1 and spoken == ["Да, сэр"] and not service.diagnostics()["wake_shortcuts"]
+
+
+def test_listener_name_shortcut_uses_cumulative_vosk_clock_after_long_idle(recognition, monkeypatch):
+    service, heard, _states, spoken, calls, _clock, _result = recognition
+    pcm, quiet = tone(seconds=0.4), b"\0\0" * 800
+    words = [{"word": "джарвис", "conf": 1, "start": 20, "end": 20.4}]
+    frames = [quiet] * 400 + [pcm[i:i + 1600] for i in range(0, len(pcm), 1600)] + [quiet] * 16
+    listen_with_fake_devices(service, monkeypatch, "джарвис", pcm, frames=frames, words=words)
+    assert spoken == ["Да, сэр"] and not heard and not calls and service.diagnostics()["wake_shortcuts"] == 1
+
+
+def test_early_vosk_endpoint_keeps_paused_command_and_original_audio_together(recognition, monkeypatch):
+    service, heard, _states, spoken, calls, _clock, _result = recognition
+    first, second, quiet = tone(seconds=0.4), tone(seconds=0.5), b"\0\0" * 800
+    frames = ([first[i:i + 1600] for i in range(0, len(first), 1600)] + [quiet] * 12
+              + [second[i:i + 1600] for i in range(0, len(second), 1600)] + [quiet] * 16)
+    early = {16: {"text": "джарвис", "result": [{"word": "джарвис", "conf": 1, "start": 0, "end": 0.4}]}}
+    english = EnglishWake()
+    listen_with_fake_devices(service, monkeypatch, "что ты умеешь", first, frames=frames, english=english,
+        words=[{"word": word, "conf": 1} for word in "что ты умеешь".split()], endpoints=early)
+    assert heard == ["что ты умеешь"] and not calls and not spoken
+    assert english.utterances == [b"".join(frames)] and english.events.count("finish") == 1
+    assert service.diagnostics()["utterances"] == 1
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_capture_rate_probe_pins_same_physical_default_device_and_has_honest_fallback(supported):
+    checks = []
+    def check(**options):
+        checks.append(options)
+        if not supported:
+            raise ValueError("synthetic unsupported rate")
+    sound = SimpleNamespace(default=SimpleNamespace(device=(7, 3)),
+        query_devices=lambda **_kwargs: {"default_samplerate": 44100}, check_input_settings=check)
+    assert VoiceService._capture_configuration(sound) == (16000 if supported else 44100, 7)
+    assert checks == [{"device": 7, "channels": 1, "dtype": "int16", "samplerate": 16000}]
+
+
+def test_unknown_input_identity_never_guesses_another_device_or_changes_rate():
+    sound = SimpleNamespace(query_devices=lambda **_kwargs: {"default_samplerate": 44100},
+                            check_input_settings=lambda **_kwargs: pytest.fail("Physical device is not pinned"))
+    assert VoiceService._capture_configuration(sound) == (44100, None)
+
+
+def test_ram_diagnostics_count_suppression_and_overflow_without_content(recognition):
+    service, _heard, _states, _spoken, _calls, clock, _result = recognition
+    pcm = tone(seconds=0.05)
+    service._speaking.set()
+    service._audio_callback(pcm, 800, None, None)
+    service._speaking.clear()
+    service._transcribing.set()
+    service._audio_callback(pcm, 800, None, None)
+    service._transcribing.clear()
+    service._last_spoken = clock[0]
+    service._audio_callback(pcm, 800, None, None)
+    clock[0] += 1
+    service.gate.feed("джарвис", clock[0])
+    for _ in range(25):
+        service._audio_callback(pcm, 800, None, None)
+    report = service.diagnostics()
+    assert report["audio_callbacks"] == 28 and report["queue_overflows"] == 1
+    assert all(report[key] == 1 for key in ("suppressed_speech", "suppressed_decoder", "suppressed_echo"))
+    assert service.gate.deadline == 0 and service._audio_epoch == 1
+    assert all(type(value) in {int, float, type(None)} for value in report.values())
+    report["audio_callbacks"] = 999
+    assert service.diagnostics()["audio_callbacks"] == 28
+
+
+def test_input_driver_overflow_invalidates_partial_command_instead_of_fusing_audio(recognition):
+    service, _heard, _states, _spoken, _calls, _clock, _result = recognition
+    service.gate.feed("джарвис", 100)
+    service._audio_callback(tone(seconds=0.05), 800, None, SimpleNamespace(input_overflow=True))
+    assert not service.gate.deadline and service._audio_epoch == 1 and service._audio.empty()
+    assert service.diagnostics()["capture_overflows"] == 1
+
+
+@pytest.mark.parametrize("phrase", ["стоп", "stop", "отмена", "cancel"])
+def test_only_verified_or_live_armed_cancel_emits_single_local_ui_stop(recognition, phrase):
+    service, heard, _states, _spoken, calls, clock, _result = recognition
+    service._recognized(phrase, tone(), 16000)
+    assert not heard and not calls
+    service._recognized("джарвис " + phrase, tone(), 16000)
+    assert heard == ["стоп"] and not calls
+    service.gate.feed("джарвис", clock[0])
+    service._recognized(phrase, tone(), 16000)
+    assert heard == ["стоп", "стоп"] and not calls
+    clock[0] += 11
+    service._recognized(phrase, tone(), 16000)
+    assert heard == ["стоп", "стоп"] and not calls
 
 
 class Clone:
@@ -762,13 +906,14 @@ def test_recognition_failure_queues_one_selected_voice_retry_per_original_wake(r
     assert len(queued) == 2 and queued[-1].is_current() and not queued[0].is_current()
 
 
-def test_failed_name_only_whisper_waits_for_followup_without_spamming_retry(recognition, monkeypatch):
+def test_uncertain_name_recovery_does_not_invite_followup_during_decoder(recognition, monkeypatch):
     service, heard, _states, spoken, _calls, _clock, result = recognition
     queued = []
     monkeypatch.setattr(service, "_enqueue_speech", lambda item: queued.append(item) or True)
     result["error"] = True
     service._recognized("джарвис", tone(), 16000)
-    assert spoken == ["Да, сэр"] and not queued and not heard and service.gate.deadline == 110
+    assert not spoken and len(queued) == 1 and not heard and service.gate.deadline == 110
+    assert queued[0].preserve_wake_deadline and queued[0].is_current()
 
 
 def test_cold_selected_voice_remains_pending_beyond_old_thirty_second_boundary(clone_service, monkeypatch):
