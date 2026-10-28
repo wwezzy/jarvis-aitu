@@ -472,7 +472,8 @@ def test_stream_failure_discards_preview_and_late_chunks(app, window, monkeypatc
     assert window.stream_text.text() == ""
     assert window.status.text() == "Не удалось выполнить действие"
     assert not window.core.snapshot()["recent"]
-    assert window.voice.spoken == [] and window._test_executed == []
+    assert window.voice.spoken == ["Не удалось выполнить действие. Повтори команду или напиши её иначе."]
+    assert window._test_executed == []
 
 
 def test_stream_preview_is_bounded_and_old_request_cannot_append(app, window, monkeypatch):

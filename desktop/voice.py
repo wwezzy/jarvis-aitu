@@ -29,7 +29,9 @@ from desktop.model_setup import default_model_dir, model_ready
 _PREPARE_SPEECH = object()
 SPEECH_ECHO_TAIL = 0.25
 VOSK_ALIAS_CONFIDENCE = 0.90
-CLONE_READY_TIMEOUT = 30.0
+CLONE_READY_TIMEOUT = 120.0
+_CONFIDENT_READ_ONLY = frozenset({"как дела", "что ты умеешь", "помощь", "команды", "привет", "ты здесь",
+                                "how are you", "what can you do", "help", "hello", "are you there"})
 
 
 def pcm_active(data):
@@ -49,10 +51,13 @@ def pcm_active(data):
     return math.sqrt(variance) / 32768 >= 0.002
 
 
-def strip_wake_prefix(text):
+def strip_wake_prefix(text, *, verified=False):
     text = text.strip()
     first = re.search(r"\w+", text, flags=re.UNICODE)
-    if first and first.group().casefold() in WakeGate.WAKE:
+    # The CPU decoder can spell an already-verified Russian wake "Джорвис".
+    # This normalization must never itself open a new invocation window.
+    names = WakeGate.WAKE | ({"джорвис"} if verified is True else set())
+    if first and first.group().casefold() in names:
         return text[first.end():].lstrip(" \t\r\n,.!?;:—-«»“”\"'()[]").rstrip(" \t\r\n«»“”\"'()[]")
     return text
 
@@ -106,6 +111,14 @@ class WakeDecision:
 class _EventSpeech:
     text: str
     is_current: Callable[[], bool]
+    preserve_wake_deadline: bool = False
+
+
+@dataclass(frozen=True)
+class _CueSpeech:
+    pcm: bytes
+    sample_rate: int
+    channels: int
 
 
 def _event_current(validator=None) -> bool:
@@ -244,6 +257,9 @@ class VoiceService:
         self._closed = threading.Event()
         self._speech_generation = 0
         self._waiting_clone = threading.Event()
+        self._waiting_generation = None
+        self._urgent_ack = None
+        self._wake_serial, self._retry_serial = 0, None
         self._last_spoken = 0.0
         self._lock = threading.Lock()
 
@@ -267,6 +283,12 @@ class VoiceService:
                 pass
         reason = ("dependencies_missing" if not dependencies else "model_missing" if not model
                   else "microphone_missing" if not microphone else "ready")
+        if self.speech_engine == "clone" and self.speech_backend in {"not_prepared", "clone_warming", "clone_unavailable"}:
+            try:
+                if self._active_backend is not None and self._active_backend.is_ready:
+                    self.speech_backend = "clone"
+            except Exception:
+                pass
         return {"ready": dependencies and model and microphone, "model": model,
                 "dependencies": dependencies, "microphone": microphone, "reason": reason,
                 "running": bool(self._thread and self._thread.is_alive()),
@@ -324,11 +346,12 @@ class VoiceService:
     @staticmethod
     def _confident_alias(full_text, command, words):
         from desktop.core import ALIASES, normalize
-        if normalize(command) not in ALIASES or not isinstance(words, list) or not words:
+        if normalize(command) not in {*ALIASES, *_CONFIDENT_READ_ONLY} or not isinstance(words, list) or not words:
             return False
         recognized = []
         for word in words:
-            if not isinstance(word, dict) or not isinstance(word.get("word"), str):
+            if (not isinstance(word, dict) or not isinstance(word.get("word"), str)
+                    or not re.fullmatch(r"\w{1,80}", word["word"], re.UNICODE)):
                 return False
             confidence = word.get("conf")
             if (type(confidence) not in {int, float} or not math.isfinite(confidence)
@@ -353,7 +376,7 @@ class VoiceService:
             decoded = self._stt.transcribe(pcm, sample_rate)
             if self._stop.is_set() or self._closed.is_set():
                 return None
-            return strip_wake_prefix(decoded)
+            return strip_wake_prefix(decoded, verified=True)
         except Exception:
             self._emit(self.on_state, "Не удалось уверенно распознать команду. Повтори её или напиши текстом.")
             return None
@@ -371,6 +394,8 @@ class VoiceService:
         result = self.gate.feed(text, now)
         first = re.search(r"\w+", text, flags=re.UNICODE)
         verified_wake = bool(first and first.group().casefold() in WakeGate.WAKE)
+        if verified_wake:
+            self._wake_serial += 1
         retry_deadline = now + self.gate.timeout if verified_wake else previous_deadline if armed else 0
         bilingual_audio = self.multilingual_stt_enabled and self._stt is not None and pcm is not None
         # A Russian decoder can produce an empty string for an English phrase.
@@ -400,6 +425,8 @@ class VoiceService:
                 # A failed decoder cannot keep extending authorization. Retry
                 # uses the original finite window, never a fresh ten seconds.
                 self.gate.deadline = retry_deadline if time.monotonic() <= retry_deadline else 0
+                if decoded is None and not acknowledged:
+                    self._recognition_retry(retry_deadline)
                 if decoded == "" and not acknowledged:
                     self._emit(self.on_state, "Слушаю команду…")
                     self.say("Да, сэр")
@@ -411,6 +438,22 @@ class VoiceService:
                 self._emit(self.on_text, decoded)
         elif result.kind == "cancel":
             self._emit(self.on_state, "Ожидаю слово «Джарвис»")
+
+    def _recognition_retry(self, deadline):
+        """One audible clarification per real wake; it never renews permission."""
+        serial = self._wake_serial
+        if (not deadline or time.monotonic() > deadline or self._retry_serial == serial
+                or self._stop.is_set() or self._closed.is_set()):
+            return
+        self._retry_serial = serial
+
+        def current():
+            return (self._wake_serial == serial and bool(self.gate.deadline)
+                    and time.monotonic() <= min(deadline, self.gate.deadline)
+                    and not self._stop.is_set() and not self._closed.is_set())
+
+        self._enqueue_speech(_EventSpeech("Не расслышал команду. Повтори её, пожалуйста, или напиши текстом.",
+                                         current, preserve_wake_deadline=True))
 
     def _listen(self):
         try:
@@ -448,12 +491,18 @@ class VoiceService:
                         self._clear_audio()
                         self._stop.wait(0.05)
                         continue
+                    echo_remaining = SPEECH_ECHO_TAIL - (time.monotonic() - self._last_spoken)
+                    if echo_remaining > 0:
+                        self._clear_audio()
+                        self._stop.wait(min(0.05, echo_remaining))
+                        continue
                     if reset_after_speech != self._last_spoken or audio_epoch != self._audio_epoch:
                         recognizer.Reset()
                         self._clear_audio()
                         reset_after_speech = self._last_spoken
                         audio_epoch = self._audio_epoch
                         utterance.reset()
+                        self._emit(self.on_state, "Слушаю команду…" if self._followup_armed() else "Ожидаю слово «Джарвис»")
                     try:
                         data = self._audio.get(timeout=0.2)
                     except queue.Empty:
@@ -519,6 +568,7 @@ class VoiceService:
         with self._lock:
             self._speech_generation += 1
             self._halt_speech.set()
+            self._urgent_ack = None
             while True:
                 try:
                     self._speech.get_nowait()
@@ -527,7 +577,7 @@ class VoiceService:
 
     def _enqueue_speech(self, item):
         if not self.speech_enabled or self._closed.is_set() or os.name != "nt":
-            return
+            return False
         with self._lock:
             if not self._speaker or not self._speaker.is_alive():
                 self._speaker = threading.Thread(target=self._speak_loop, name="JarvisSpeech", daemon=True)
@@ -535,7 +585,10 @@ class VoiceService:
             try:
                 self._speech.put_nowait((self._speech_generation, item))
             except queue.Full:
-                pass
+                if item is not _PREPARE_SPEECH:
+                    self._emit(self.on_state, "Очередь озвучивания заполнена. Ответ остаётся на экране.")
+                return False
+            return True
 
     def prepare(self):
         """Warm CPU speech and cache the wake reply, asynchronously and silently."""
@@ -557,13 +610,34 @@ class VoiceService:
     def say(self, text: str):
         """Speak bounded plain text. UI labels/Markdown are not read as dialogue."""
         text = self._speech_text(text)
-        if (self.speech_engine == "clone" and self._waiting_clone.is_set()
-                and text.casefold().rstrip(".!?") in {"да сэр", "да, сэр"}):
-            # A wake acknowledgment must not sit behind an old dynamic reply
-            # waiting for its preferred model. Keep one output worker only.
-            self.interrupt()
+        if text.casefold().rstrip(".!?") in {"да сэр", "да, сэр"}:
+            with self._lock:
+                if (self.speech_engine == "clone" and self._waiting_clone.is_set()
+                        and self._waiting_generation == self._speech_generation
+                        and self.speech_enabled and not self._closed.is_set()):
+                    # One output worker plays the cached ACK without deleting
+                    # the reply that is still waiting for the selected voice.
+                    self._urgent_ack = self._speech_generation
+                    return
         if text:
             self._enqueue_speech(text)
+
+    def play_cue(self, name):
+        """Queue one verified private cue; arbitrary names/paths are refused."""
+        if name != "welcome_home" or not self.speech_enabled or self._closed.is_set():
+            return False
+        try:
+            from desktop.audio_cues import CueLibrary
+            cue = CueLibrary().read(name)
+            if (cue is None or not isinstance(cue.pcm, bytes) or not cue.pcm
+                    or type(cue.channels) is not int or cue.channels not in {1, 2}
+                    or type(cue.sample_rate) is not int or not 16000 <= cue.sample_rate <= 48000
+                    or len(cue.pcm) % (2 * cue.channels) or len(cue.pcm) > cue.sample_rate * 2 * cue.channels * 20):
+                return False
+            self.interrupt()
+            return self._enqueue_speech(_CueSpeech(cue.pcm, cue.sample_rate, cue.channels)) is True
+        except Exception:
+            return False
 
     def say_event(self, text: str, *, is_current):
         """Recheck a versioned plan event in the audio worker, never dispatch it."""
@@ -603,20 +677,71 @@ class VoiceService:
                 and self.speech_enabled and self.speech_engine == engine
                 and self.speech_character == character)
 
-    def _wait_for_clone(self, backend, generation, character, validator):
-        """Wait off-GUI without holding a lifecycle/request lock."""
-        deadline = time.monotonic() + CLONE_READY_TIMEOUT
-        self._waiting_clone.set()
+    def _wait_for_clone(self, backend, generation, character, validator, *, deadline=None, hold_followup=True):
+        """Keep the answer bounded in RAM while warmup/verified follow-up runs."""
+        deadline = time.monotonic() + CLONE_READY_TIMEOUT if deadline is None else deadline
+        with self._lock:
+            self._waiting_generation = generation
+            self._waiting_clone.set()
         try:
             while self._backend_current(generation, "clone", character) and _event_current(validator):
+                self._play_urgent_ack(backend, generation, character)
                 if backend.is_ready:
-                    return True
+                    # Do not speak an old answer over the command the owner is
+                    # about to give after the cached wake acknowledgment.
+                    if not hold_followup or not self._followup_armed():
+                        return True
                 if not getattr(backend, "is_warming", False) or time.monotonic() >= deadline:
-                    return False
+                    if not backend.is_ready or time.monotonic() >= deadline:
+                        return False
                 self._closed.wait(0.05)
             return False
         finally:
-            self._waiting_clone.clear()
+            with self._lock:
+                if self._waiting_generation == generation:
+                    self._waiting_clone.clear()
+                    self._waiting_generation = None
+
+    def _followup_armed(self):
+        return bool(self.gate.deadline and time.monotonic() <= self.gate.deadline)
+
+    def _begin_audio(self, generation):
+        with self._lock:
+            if generation != self._speech_generation or self._closed.is_set() or not self.speech_enabled:
+                return False
+            self._halt_speech.clear()
+            self._speaking.set()
+            self._utterance_audio_started = False
+        self._clear_audio()
+        self._emit(self.on_state, "Говорю…")
+        return True
+
+    def _end_audio(self, *, preserve_wake_deadline=False):
+        self._last_spoken = time.monotonic()
+        if not preserve_wake_deadline:
+            self.gate.extend(self._last_spoken)
+        self._clear_audio()
+        self._speaking.clear()
+        self._emit(self.on_state, "Закончил говорить. Готовлю микрофон…" if self._thread and self._thread.is_alive()
+                   and not self._stop.is_set() else "Микрофон выключен")
+
+    def _play_urgent_ack(self, backend, generation, character):
+        with self._lock:
+            urgent = self._urgent_ack
+            if urgent == generation:
+                self._urgent_ack = None
+        if urgent != generation or not self._backend_current(generation, "clone", character):
+            return
+        try:
+            fixed = backend.fixed_ack("ru")
+        except Exception:
+            fixed = None
+        if fixed is None or not self._begin_audio(generation):
+            return
+        try:
+            self._play_pcm(*fixed, is_current=lambda: self._backend_current(generation, "clone", character))
+        finally:
+            self._end_audio()
 
     def _play_pcm_stream(self, chunks, *, is_current=None):
         """Keep one audio stream open while the isolated voice yields PCM."""
@@ -652,16 +777,17 @@ class VoiceService:
             if callable(close):
                 close()
 
-    def _play_pcm(self, pcm: bytes, sample_rate: int, *, is_current=None):
+    def _play_pcm(self, pcm: bytes, sample_rate: int, *, is_current=None, channels=1):
         """Use short output blocks for prompt stop/mute; never store audio."""
-        if (not isinstance(pcm, bytes) or not pcm or len(pcm) % 2
+        if (type(channels) is not int or channels not in {1, 2}
+                or not isinstance(pcm, bytes) or not pcm or len(pcm) % (2 * channels)
                 or type(sample_rate) is not int or not 8000 <= sample_rate <= 48000
-                or len(pcm) > sample_rate * 2 * 120):
+                or len(pcm) > sample_rate * 2 * channels * 120):
             raise ValueError("Invalid synthesized audio")
         if self._halt_speech.is_set() or not self.speech_enabled or self._closed.is_set() or not _event_current(is_current):
             return
         sound = importlib.import_module("sounddevice")
-        with sound.RawOutputStream(samplerate=sample_rate, dtype="int16", channels=1,
+        with sound.RawOutputStream(samplerate=sample_rate, dtype="int16", channels=channels,
                                    blocksize=0, latency="low") as stream:
             for offset in range(0, len(pcm), 2048):
                 if (self._halt_speech.is_set() or not self.speech_enabled or self._closed.is_set()
@@ -681,7 +807,20 @@ class VoiceService:
                 if item is None:
                     break
                 generation, text = item if isinstance(item, tuple) else (self._speech_generation, item)
+                if isinstance(text, _CueSpeech):
+                    if not self._begin_audio(generation):
+                        continue
+                    try:
+                        self.speech_backend = "personal_cue"
+                        self._play_pcm(text.pcm, text.sample_rate, channels=text.channels)
+                    except Exception:
+                        self._emit(self.on_state, "Личный аудиосигнал недоступен. Ответ остаётся на экране.")
+                    finally:
+                        self._end_audio()
+                    continue
                 validator = text.is_current if isinstance(text, _EventSpeech) else None
+                preserve_wake_deadline = isinstance(text, _EventSpeech) and text.preserve_wake_deadline
+                voice_deadline = time.monotonic() + CLONE_READY_TIMEOUT
                 if validator is not None:
                     text = text.text
                 if not _event_current(validator):
@@ -723,10 +862,17 @@ class VoiceService:
                                 fixed_audio = neural.fixed_ack("ru")
                             use_neural = fixed_audio is not None or neural.is_ready
                             renderer = neural
-                            if not use_neural and text is not _PREPARE_SPEECH:
-                                self.speech_backend = "clone_warming"
-                                self._emit(self.on_state, "Голос по образцу готовится. Ответ доступен текстом.")
-                                use_neural = self._wait_for_clone(neural, generation, character, validator)
+                            if fixed_audio is None and text is not _PREPARE_SPEECH and not use_neural:
+                                if not use_neural:
+                                    self.speech_backend = "clone_warming"
+                                    self._emit(self.on_state, "Голос по образцу готовится. Озвучу ответ, когда он будет готов.")
+                            while (fixed_audio is None and text is not _PREPARE_SPEECH
+                                   and (not use_neural or self._followup_armed() and not preserve_wake_deadline)):
+                                use_neural = self._wait_for_clone(neural, generation, character, validator,
+                                    deadline=voice_deadline, hold_followup=not preserve_wake_deadline)
+                                self._play_urgent_ack(neural, generation, character)
+                                if not use_neural:
+                                    break
                         else:
                             use_neural = neural.prepare(rate=speech_rate)
                             renderer = neural
@@ -751,11 +897,8 @@ class VoiceService:
                         else:
                             self.speech_backend = ("expressive" if engine == "expressive" else "neural") if use_neural else "windows"
                         continue
-                    self._halt_speech.clear()
-                    self._speaking.set()
-                    self._utterance_audio_started = False
-                self._clear_audio()
-                self._emit(self.on_state, "Говорю…")
+                if not self._begin_audio(generation):
+                    continue
                 try:
                     if use_neural:
                         try:
@@ -809,12 +952,7 @@ class VoiceService:
                             speaker.Speak("", 18)
                             break
                 finally:
-                    self._last_spoken = time.monotonic()
-                    self.gate.extend(self._last_spoken)
-                    self._clear_audio()
-                    self._speaking.clear()
-                    self._emit(self.on_state, "Ожидаю слово «Джарвис»" if self._thread and self._thread.is_alive()
-                               and not self._stop.is_set() else "Микрофон выключен")
+                    self._end_audio(preserve_wake_deadline=preserve_wake_deadline)
         except Exception:
             self.speech_backend = "unavailable"
             self._speaking.clear()

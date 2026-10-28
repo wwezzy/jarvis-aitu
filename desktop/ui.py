@@ -1240,6 +1240,7 @@ class MainWindow(QMainWindow):
         recent = snapshot.get("recent", [])[-12:]
         if not recent:
             recent = [{"role": "assistant", "text": "Я готов помочь. Сохраню задачу или заметку, открою нужное приложение и подскажу следующий шаг. Напишите команду — или включите микрофон."}]
+        self._rendered_messages = {(item.get("role"), item.get("text")) for item in recent}
         for item in recent:
             self.history_layout.addWidget(self._message(item.get("role", "assistant"), item.get("text", "")))
         QTimer.singleShot(0, lambda: self.history_scroll.verticalScrollBar().setValue(self.history_scroll.verticalScrollBar().maximum()))
@@ -1595,8 +1596,9 @@ class MainWindow(QMainWindow):
             "windows": "Используется установленный голос Windows.",
             "expressive": "Используется выразительный голос для личного использования.",
             "clone": "Используется голос по личному образцу (личное использование).",
-            "clone_warming": "Голос по образцу готовится. Пока ответы доступны текстом.",
+            "clone_warming": "Голос по образцу готовится. Ответ ожидает озвучки.",
             "clone_unavailable": "Голос по образцу недоступен. Ответы доступны текстом; другой тембр не подставляется.",
+            "personal_cue": "Личное приветствие из записи.",
             "unavailable": "Озвучивание недоступно; ответ доступен текстом.",
         }
         self.voice_backend_status.setText(labels.get(state.get("speech_backend"), "Источник голоса определяется при подготовке."))
@@ -1717,10 +1719,18 @@ class MainWindow(QMainWindow):
             if on_error is not None:
                 on_error(_error_class)
                 return
+            from desktop.core import Reply
             self._clear_stream_preview()
             self.busy = False
             self.send_button.setEnabled(True)
             self.command.setEnabled(True)
+            self._confirmation = None
+            self.confirmation.hide()
+            failure = Reply("Не удалось выполнить действие. Повтори команду или напиши её иначе.")
+            # A database failure must not call refresh()/record again from its
+            # error handler. The fixed feedback uses only the cached UI state.
+            self.history_layout.addWidget(self._message("assistant", failure.text))
+            self._speak_reply(failure)
             self.mic_button.setEnabled(True)
             self.model_button.setEnabled(True)
             self.status.setText("Не удалось выполнить действие")
@@ -1774,11 +1784,26 @@ class MainWindow(QMainWindow):
         else:
             self.confirmation.hide()
         self.refresh()
+        if ("assistant", reply.text) not in self._rendered_messages:
+            # Consent/validation feedback deliberately need not persist any
+            # user request. It must still be visible when speech is disabled.
+            self.history_layout.addWidget(self._message("assistant", reply.text))
         self.status.setText("Ожидаю «Джарвис»" if self.listening else self._capture_error or "Микрофон выключен")
-        if reply.speak and self.preferences.get("speech_enabled", True):
-            self.voice.say(reply.text)
+        self._speak_reply(reply)
         self.command.setFocus()
         self._poll_organizer_events("interaction")
+
+    def _speak_reply(self, reply):
+        if not self._quitting and reply.speak and self.preferences.get("speech_enabled", True):
+            play_cue = getattr(self.voice, "play_cue", None)
+            queued = False
+            if getattr(reply, "media_cue", None) == "welcome_home" and callable(play_cue):
+                try:
+                    queued = play_cue("welcome_home") is True
+                except Exception:
+                    pass
+            if not queued:
+                self.voice.say(reply.text)
 
     def confirm_action(self):
         if not self._confirmation or self.busy:

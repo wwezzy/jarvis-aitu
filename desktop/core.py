@@ -25,6 +25,7 @@ class Reply:
     confirmation_id: str | None = None
     speak: bool = True
     organizer_event: dict | None = None
+    media_cue: str | None = None
 
 
 MAX_REPLY_CHARS = 22000
@@ -548,7 +549,7 @@ class DesktopCore:
         if source not in {"typed", "voice"}:
             return Reply("Импортированный текст и ответы ИИ не могут запускать команды компьютера.")
         if self.owner.enabled and not self.owner.allowed():
-            return Reply("Сначала подтверди владельца кнопкой Windows Hello в разделе «Управление».", speak=False)
+            return Reply("Сначала подтверди владельца кнопкой Windows Hello в разделе «Управление».")
         if not isinstance(text, str) or not text.strip() or len(text) > 20000 or "\x00" in text:
             return Reply("Нужна непустая команда длиной до 20 000 символов.")
         request_id = self.store.record("user", text.strip())
@@ -564,6 +565,10 @@ class DesktopCore:
         if canceled:
             return self.cancel(canceled[1])
         intent_phrase = _intent_phrase(text)
+        # This is an explicit playback cue, never a system-readiness claim or
+        # an inferred PC action. The user's recording stays outside the repo.
+        if re.fullmatch(r"wake up dadd(?:y['’]?s|ys) home", intent_phrase):
+            return self._answer(Reply("Добро пожаловать домой, сэр.", media_cue="welcome_home"))
         information = _desktop_information(intent_phrase)
         if information is not None:
             return self._answer(Reply(information))
@@ -591,7 +596,8 @@ class DesktopCore:
                     return self._answer(Reply(self.apps.open_app(application[1])["message"]))
             except ValueError:
                 return self._answer(Reply("Укажи одно имя приложения из каталога, без пути, ссылки или дополнительных команд."))
-        if value in {"джарвис", "jarvis", "да", "привет", "как дела", "ты здесь", "how are you", "hello", "are you there"}:
+        if intent_phrase in {"джарвис", "jarvis", "да", "привет", "как дела", "как твои дела", "как у тебя дела",
+                             "ты здесь", "ты тут", "how are you", "hello", "are you there"}:
             return self._answer(Reply("На связи, сэр. Скажи команду или выбери следующий шаг."))
         if value in {"помощь", "команды", "что ты умеешь", "help", "/help"}:
             return self._answer(Reply(HELP))
