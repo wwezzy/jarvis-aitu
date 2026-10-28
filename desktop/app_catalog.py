@@ -127,7 +127,9 @@ def _original_filename(path):
     for language, page in translations:
         query = f"\\StringFileInfo\\{language:04x}{page:04x}\\OriginalFilename"
         if version.VerQueryValueW(buffer, query, ctypes.byref(pointer), ctypes.byref(length)) and pointer.value and 1 <= length.value <= 512:
-            return ctypes.wstring_at(pointer, length.value).rstrip("\x00")
+            original = ctypes.wstring_at(pointer, length.value).rstrip("\x00")
+            if original:
+                return original
     return None
 
 

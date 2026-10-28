@@ -340,6 +340,71 @@ def test_version_resource_dll_load_is_restricted_to_windows_system32(tmp_path, m
     assert calls == [(("version.dll",), {"use_last_error": True, "winmode": 0x800})]
 
 
+def fake_version_resources(monkeypatch, resources, *, translations=((0x0409, 0x04B0),)):
+    """Real ctypes pointer outputs; no native DLL or executable is loaded."""
+    ctypes, real_os = module.ctypes, module.os
+    retained, queries = [], []
+    class WindowsOS:
+        name = "nt"
+        def __getattr__(self, key):
+            return getattr(real_os, key)
+    class Function:
+        def __init__(self, callback):
+            self.callback = callback
+        def __call__(self, *args):
+            return self.callback(*args)
+    def output(pointer, length, data, count):
+        retained.append(data)
+        ctypes.cast(pointer, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.addressof(data)
+        ctypes.cast(length, ctypes.POINTER(ctypes.c_uint))[0] = count
+        return 1
+    def query(_buffer, name, pointer, length):
+        queries.append(name)
+        if name == r"\VarFileInfo\Translation":
+            if not translations:
+                return 0
+            data = (ctypes.c_ushort * (len(translations) * 2))(*(part for pair in translations for part in pair))
+            return output(pointer, length, data, ctypes.sizeof(data))
+        value = resources.get(name)
+        if value is None:
+            return 0
+        data = ctypes.create_unicode_buffer(value)
+        return output(pointer, length, data, len(data))
+    library = SimpleNamespace(GetFileVersionInfoSizeW=Function(lambda *_: 64),
+                              GetFileVersionInfoW=Function(lambda *_: 1), VerQueryValueW=Function(query))
+    monkeypatch.setattr(module, "os", WindowsOS())
+    monkeypatch.setattr(module.ctypes, "WinDLL", lambda *_a, **_k: library, raising=False)
+    return queries
+
+
+@pytest.mark.parametrize("value", [None, "", "\x00"], ids=["absent", "one-nul", "all-nuls"])
+def test_absent_or_empty_optional_original_filename_is_none_not_invalid_empty(catalog, tmp_path, monkeypatch, value):
+    fake_version_resources(monkeypatch, {r"\StringFileInfo\040904b0\OriginalFilename": value})
+    path = executable(tmp_path / "Obsidian.exe")
+    assert module._original_filename(path) is None
+    catalog.inspector = module._original_filename
+    assert catalog.register_app(path, "Obsidian", approval=True)["name"] == "Obsidian"
+
+
+@pytest.mark.parametrize("runtime", ["python.exe", "node.exe", "cmd.exe"])
+def test_empty_first_translation_does_not_hide_later_blocked_runtime(catalog, tmp_path, monkeypatch, runtime):
+    first, second = r"\StringFileInfo\040904b0\OriginalFilename", r"\StringFileInfo\041904b0\OriginalFilename"
+    queries = fake_version_resources(monkeypatch, {first: "", second: runtime}, translations=((0x0409, 0x04B0), (0x0419, 0x04B0)))
+    path = executable(tmp_path / "Renamed.exe")
+    assert module._original_filename(path) == runtime and queries.index(first) < queries.index(second)
+    catalog.inspector = module._original_filename
+    with pytest.raises(ValueError):
+        catalog.register_app(path, "Innocent alias", approval=True)
+    assert not catalog.apps()
+
+
+def test_fake_inspector_empty_string_is_still_invalid(catalog, tmp_path):
+    catalog.inspector = lambda _path: ""
+    with pytest.raises(ValueError):
+        catalog.register_app(executable(tmp_path / "Unverified.exe"), "Alias", approval=True)
+    assert not catalog.apps()
+
+
 @pytest.mark.parametrize("operation,calls_before_revoke", [("rename", 1), ("set_aliases", 2)])
 def test_metadata_permission_expiry_before_commit_rolls_back_every_field(catalog, tmp_path, operation, calls_before_revoke):
     old = catalog.register_app(executable(tmp_path / "Useful.exe"), "Original", approval=True)
