@@ -24,6 +24,7 @@ DEFAULT_PREFERENCES = {
     "voice_rate": 185,
     "voice_engine": "auto",
     "voice_character": "aidar",
+    "free_mode": False,
     "multilingual_stt_enabled": False,
     "activity_monitor_enabled": False,
     "voice_owner_required": False,
@@ -239,7 +240,10 @@ class LocalStore:
             row = db.execute("SELECT value FROM preferences WHERE id=1").fetchone()
         if row is None:
             return dict(DEFAULT_PREFERENCES)
-        return {**DEFAULT_PREFERENCES, **json.loads(row["value"])}
+        value = {**DEFAULT_PREFERENCES, **json.loads(row["value"])}
+        if value["free_mode"] is True and value["voice_engine"] == "openai":
+            value["voice_engine"] = "auto"
+        return value
 
     def set_preferences(self, updates: dict) -> dict:
         if not isinstance(updates, dict) or set(updates) - DEFAULT_PREFERENCES.keys():
@@ -268,6 +272,10 @@ class LocalStore:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT value FROM preferences WHERE id=1").fetchone()
             value = {**DEFAULT_PREFERENCES, **(json.loads(row["value"]) if row else {}), **updates}
+            if value["free_mode"] is True and value["voice_engine"] == "openai":
+                if updates.get("voice_engine") == "openai":
+                    raise ValueError("Disable free mode before selecting paid speech")
+                value["voice_engine"] = "auto"
             db.execute("INSERT INTO preferences(id,value) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value",
                        (json.dumps(value, ensure_ascii=False),))
         return value

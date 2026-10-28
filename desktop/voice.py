@@ -29,7 +29,7 @@ from desktop.model_setup import default_model_dir, model_ready
 _PREPARE_SPEECH = object()
 SPEECH_ECHO_TAIL = 0.25
 VOSK_ALIAS_CONFIDENCE = 0.90
-CLONE_READY_TIMEOUT = 120.0
+CLONE_READY_TIMEOUT = 45.0
 UTTERANCE_SILENCE_SECONDS = 0.8
 _CONFIDENT_READ_ONLY = frozenset({"как дела", "что ты умеешь", "помощь", "команды", "привет", "ты здесь",
                                 "ты меня слышишь", "доброе утро", "good morning", "can you hear me",
@@ -1004,6 +1004,8 @@ class VoiceService:
     def apply_preferences(self, preferences: dict):
         """Apply bounded local settings; no model download or recording."""
         engine = preferences.get("voice_engine", self.speech_engine)
+        if preferences.get("free_mode") is True and engine == "openai":
+            engine = "auto"
         rate = preferences.get("voice_rate", self.speech_rate)
         character = preferences.get("voice_character", self.speech_character)
         multilingual = preferences.get("multilingual_stt_enabled", self.multilingual_stt_enabled)

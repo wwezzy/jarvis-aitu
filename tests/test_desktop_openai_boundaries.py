@@ -167,13 +167,14 @@ def test_default_main_window_factories_share_live_explicit_environment_without_e
     from desktop.ui import MainWindow
 
     app = QApplication.instance() or QApplication([])
-    clients, services = [], []
+    clients, services, local_factories = [], [], []
     class Speech:
         def __init__(self, *, state_dir, environ):
             clients.append(("speech", state_dir, environ))
     class Decoder:
-        def __init__(self, state_dir, *, environ):
+        def __init__(self, state_dir, *, environ, local_factory=None):
             clients.append(("stt", state_dir, environ))
+            local_factories.append(local_factory)
     class FakeVoice:
         def __init__(self, on_text, on_state, model_dir=None, **options):
             self.options = options
@@ -211,11 +212,12 @@ def test_default_main_window_factories_share_live_explicit_environment_without_e
     widget = MainWindow(core, voice_factory=None, quiet_start=True, enable_integrations=False,
                         enable_tray=False, personal_path=tmp_path / "missing.db")
     try:
-        assert len(services) == 1 and not clients
+        assert len(services) == 1 and not clients and not local_factories
         service = services[0]
         service.options["transcriber_factory"]()
         service.options["speech_factory"]()
         assert [entry[:2] for entry in clients] == [("stt", core.state_dir), ("speech", core.state_dir)]
+        assert len(local_factories) == 1 and callable(local_factories[0])
         environment = clients[0][2]
         assert clients[1][2] is environment
         assert environment.get("JARVIS_CLOUD_STT_ENABLED") == environment.get("JARVIS_CLOUD_SPEECH_ENABLED") == "1"

@@ -735,8 +735,15 @@ class MainWindow(QMainWindow):
             from desktop.openai_mode import OpenAIEnvironment
             factory = VoiceService
             state_dir = self.core.state_dir
-            cloud_environment = OpenAIEnvironment(state_dir, self.core.store.preferences)
-            options["transcriber_factory"] = lambda: FallbackTranscription(state_dir, environ=cloud_environment)
+            preferences = self.core.store.preferences
+            cloud_environment = OpenAIEnvironment(state_dir, preferences)
+            def local_transcriber():
+                from desktop.multilingual_stt import MultilingualSTT
+                current = preferences()
+                language = current.get("language", "ru") if current.get("free_mode", False) else None
+                return MultilingualSTT(preferred_language=language)
+            options["transcriber_factory"] = lambda: FallbackTranscription(
+                state_dir, environ=cloud_environment, local_factory=local_transcriber)
             options["speech_factory"] = lambda: OpenAIRealtimeSpeech(state_dir=state_dir, environ=cloud_environment)
             options["on_command"] = self._command_callback(self._capture_session)
         voice = factory(on_text=self._recognition_callback(self._capture_session), on_state=self.events.voice_state.emit,
@@ -1011,6 +1018,13 @@ class MainWindow(QMainWindow):
         content = QVBoxLayout(card)
         content.setContentsMargins(22, 20, 22, 20)
         content.setSpacing(10)
+        self.free_mode_toggle = QCheckBox("Работать локально, без платных API")
+        self.free_mode_toggle.setObjectName("freeModeToggle")
+        self.free_mode_toggle.setChecked(bool(self.preferences.get("free_mode", False)))
+        self.free_mode_toggle.toggled.connect(self._free_mode_changed)
+        content.addWidget(self.free_mode_toggle)
+        content.addWidget(label("Распознавание, диалог и голос используют установленные локальные модели. "
+                               "Запросы к платным ИИ-сервисам отключены; выбранный локальный тембр сохраняется.", "muted", True))
         content.addWidget(label("Голос и микрофон", "section"))
         self.speech_toggle = QCheckBox("Отвечать голосом")
         self.speech_toggle.setObjectName("speechToggle")
@@ -1087,6 +1101,7 @@ class MainWindow(QMainWindow):
         self.multilingual_toggle.setEnabled(self.preferences.get("voice_engine") != "openai")
         self.multilingual_toggle.toggled.connect(self._multilingual_changed)
         content.addWidget(self.multilingual_toggle)
+        self._sync_free_mode_controls()
         content.addWidget(label("Двуязычный режим использует отдельно установленную локальную модель. Если её нет, продолжает работать русский режим; аудио не отправляется в облако.", "muted", True))
         self.launch_at_login_toggle = QCheckBox("Запускать JARVIS при входе в Windows")
         self.launch_at_login_toggle.setObjectName("launchAtLoginToggle")
@@ -1631,6 +1646,59 @@ class MainWindow(QMainWindow):
         if was_listening:
             self.start_listening()
 
+    def _sync_free_mode_controls(self):
+        free = bool(self.preferences.get("free_mode", False))
+        self._set_checked_silently(self.free_mode_toggle, free)
+        index = self.voice_engine.findData("openai")
+        if index >= 0:
+            self.voice_engine.model().item(index).setEnabled(not free)
+        engine = self.preferences.get("voice_engine", "auto")
+        blocked = self.voice_engine.blockSignals(True)
+        self.voice_engine.setCurrentIndex(max(0, self.voice_engine.findData(engine)))
+        self.voice_engine.blockSignals(blocked)
+        personal = engine == "expressive"
+        for widget in (self.voice_character_label, self.voice_character):
+            widget.setVisible(personal)
+        self.voice_personal_license.setVisible(engine in {"expressive", "clone"})
+        cloud = engine == "openai" and not free
+        self.multilingual_toggle.setEnabled(not cloud)
+        self._set_checked_silently(self.multilingual_toggle,
+                                  cloud or self.preferences.get("multilingual_stt_enabled", False))
+
+    def _free_mode_changed(self, enabled):
+        if self._quitting:
+            return
+        pending = getattr(self, "_voice_mode_restart", None)
+        pending_capture = (pending is not None and pending[0] == self._capture_session
+                           and pending[1] is self.voice)
+        was_listening = self.listening or self._capture_requested or pending_capture
+        # No response or queued recognition admitted in the previous mode may
+        # gain authority after the mode changes. Already issued OS actions
+        # cannot be undone; cancellation fences all subsequent dispatch.
+        self.stop_response()
+        if was_listening:
+            self.stop_listening()
+        updates = {"free_mode": bool(enabled)}
+        if enabled and self.preferences.get("voice_engine") == "openai":
+            updates["voice_engine"] = "auto"
+        try:
+            self.preferences = self.core.store.set_preferences(updates)
+        except Exception:
+            self._sync_free_mode_controls()
+            self.status.setText("Не удалось сохранить режим. Прежние настройки сохранены.")
+        else:
+            self._sync_free_mode_controls()
+            apply_preferences = getattr(self.voice, "apply_preferences", None)
+            if callable(apply_preferences):
+                apply_preferences(dict(self.preferences))
+            prepare = getattr(self.voice, "prepare", None)
+            if callable(prepare):
+                prepare()
+            self.status.setText("Локальный режим включён. Платные API отключены." if enabled else
+                                "Локальный режим выключен. Подключение платных API определяется выбранными настройками.")
+        if was_listening:
+            self._resume_voice_after_mode_change()
+
     def save_preference(self, key, value):
         if key == "speech_enabled" and value is False:
             self._cancel_morning_followup()
@@ -1658,6 +1726,12 @@ class MainWindow(QMainWindow):
     def _voice_engine_changed(self, _index):
         engine = self.voice_engine.currentData()
         previous = self.preferences.get("voice_engine", "auto")
+        if engine == "openai" and self.preferences.get("free_mode", False):
+            blocked = self.voice_engine.blockSignals(True)
+            self.voice_engine.setCurrentIndex(self.voice_engine.findData(previous))
+            self.voice_engine.blockSignals(blocked)
+            self.status.setText("OpenAI отключён в локальном режиме.")
+            return
         multilingual = self.preferences.get("multilingual_stt_enabled", False)
         recognition_changed = (multilingual or previous == "openai") != (multilingual or engine == "openai")
         pending = getattr(self, "_voice_mode_restart", None)

@@ -84,10 +84,19 @@ class OpenAIEnvironment(Mapping):
             return None
 
     def __getitem__(self, key):
+        cloud_flags = {"JARVIS_CLOUD_STT_ENABLED", "JARVIS_CLOUD_CHAT_ENABLED", "JARVIS_CLOUD_SPEECH_ENABLED"}
+        preferences = self.preferences() if key == "OPENAI_API_KEY" or key in cloud_flags else {}
+        if preferences.get("free_mode") is True:
+            # Explicit local operation overrides inherited process flags and
+            # never opens the owner's credential source, even during probing.
+            self._signature = self._key = None
+            if key == "OPENAI_API_KEY":
+                raise KeyError(key)
+            return "0"
         if key == "OPENAI_API_KEY":
             value = self.environ.get(key) or self._file_key()
-        elif key in {"JARVIS_CLOUD_STT_ENABLED", "JARVIS_CLOUD_CHAT_ENABLED", "JARVIS_CLOUD_SPEECH_ENABLED"}:
-            value = "1" if self.preferences().get("voice_engine") == "openai" else self.environ.get(key)
+        elif key in cloud_flags:
+            value = "1" if preferences.get("voice_engine") == "openai" else self.environ.get(key)
         else:
             value = self.environ.get(key)
         if value is None:
