@@ -158,6 +158,9 @@ _CAPABILITIES = {"помощь", "команды", "список команд", 
     "tell me what you can do", "show commands"}
 _POLITE_REQUEST = re.compile(r"^(?:можешь(?: ты)?|будь добр|будь добра|прошу тебя|can you|could you|would you|will you)[\s,]+")
 _ACTION_WORDS = re.compile(r"\b(?:откр\w*|запус\w*|включ\w*|выключ\w*|закр\w*|удал\w*|выполн\w*|перезагруз\w*|заблокир\w*|свер\w*|развер\w*|громк\w*|громче|тише|open|launch|start|play|resume|close|delete|run|shutdown|restart|lock|hibernate|mute|unmute|minimize|maximize)\b")
+# These whole phrases select only a recorded personal greeting. The final
+# homophone is a bounded ASR variant, never an inferred family/OS intent.
+_WELCOME_HOME = re.compile(r"(?:(?:wake up )?daddy['’]?s home|(?:дадис|дэддис) хоум|wake up that is home)")
 
 
 def _intent_phrase(text):
@@ -613,7 +616,7 @@ class DesktopCore:
         intent_phrase = _intent_phrase(text)
         # This is an explicit playback cue, never a system-readiness claim or
         # an inferred PC action. The user's recording stays outside the repo.
-        if re.fullmatch(r"wake up dadd(?:y['’]?s|ys) home", intent_phrase):
+        if _WELCOME_HOME.fullmatch(intent_phrase):
             return self._answer(Reply("Добро пожаловать домой, сэр.", media_cue="welcome_home"))
         information = _desktop_information(intent_phrase)
         if information is not None:

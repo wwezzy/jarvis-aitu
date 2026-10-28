@@ -6,6 +6,8 @@ import struct
 import wave
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -186,3 +188,39 @@ def test_invalid_json_or_deep_structure_never_leaks_errors_or_private_paths(tmp_
         config.write_text(text, encoding="utf-8")
         assert CueLibrary(config).read("welcome_home") is None
     assert capsys.readouterr() == ("", "")
+
+
+def test_personal_cue_cancels_at_next_output_block_without_tts_or_real_audio(tmp_path, monkeypatch):
+    from desktop import voice
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    written, aborted = [], []
+    pcm = b"\x11\x00" * 16000
+    cue = module.Cue(pcm=pcm, sample_rate=16000, channels=1)
+    monkeypatch.setattr(module, "CueLibrary", lambda: SimpleNamespace(read=lambda name: cue if name == "welcome_home" else None))
+    class Output:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            finished.set()
+        def write(self, data):
+            written.append(data)
+            entered.set()
+            assert release.wait(2), "Synthetic output block not released"
+        def abort(self):
+            aborted.append(True)
+    def audio_only(name):
+        assert name == "sounddevice", "Personal cue must never initialize a speech engine"
+        return SimpleNamespace(RawOutputStream=lambda **_kwargs: Output())
+    monkeypatch.setattr(voice, "importlib", SimpleNamespace(import_module=audio_only))
+    monkeypatch.setattr(voice, "os", SimpleNamespace(name="nt"))
+    service = voice.VoiceService(lambda _text: pytest.fail("Cue dispatched a command"), lambda _state: None, tmp_path)
+    try:
+        assert service.play_cue("welcome_home") is True
+        assert entered.wait(2)
+        service.interrupt()
+        release.set()
+        assert finished.wait(2)
+    finally:
+        release.set()
+        service.close()
+    assert written == [pcm[:2048]] and aborted == [True] and not service._speaking.is_set()

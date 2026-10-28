@@ -185,9 +185,22 @@ def test_quotes_negations_and_compound_requests_do_not_trigger_welcome(window, p
     assert window.effects == window.model_calls == []
 
 
-def test_ui_queues_only_the_named_available_cue_without_double_speaking(app, window):
+@pytest.mark.parametrize("phrase", ["Jarvis wake up daddy’s home", "Jarvis daddy’s home",
+                                    "Джарвис дадис хоум", "Джарвис дэддис хоум", "Jarvis wake up that is home"])
+def test_ui_queues_only_the_named_available_cue_without_double_speaking(app, window, phrase):
     window.voice.cue_result = True
-    window.submit("Jarvis wake up daddy’s home")
+    window.submit(phrase)
+    settled(app, window)
+    assert window.voice.cues == ["welcome_home"] and window.voice.spoken == []
+    assert window.effects == window.model_calls == []
+
+
+@pytest.mark.parametrize("command", ["daddys home", "дадис хоум", "дэддис хоум", "wake up that is home"])
+def test_wake_authorized_voice_tail_plays_recording_without_normal_tts(app, window, command):
+    window.voice.cue_result = True
+    window.start_listening()
+    settled(app, window)
+    window.voice.on_text(command)
     settled(app, window)
     assert window.voice.cues == ["welcome_home"] and window.voice.spoken == []
     assert window.effects == window.model_calls == []
