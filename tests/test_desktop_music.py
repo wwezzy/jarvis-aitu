@@ -216,9 +216,14 @@ def test_new_eligible_yandex_session_after_prior_video_can_play_but_ambiguous_re
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell projection policy test")
-def test_actual_smtc_policy_with_fake_sessions_rejects_video_unknown_and_never_toggles():
+def test_actual_smtc_policy_with_fake_sessions_rejects_video_unknown_and_never_toggles(tmp_path):
     """Execute only the pure policy using synthetic session methods, no WinRT."""
-    script = media._SMTC_POLICY + r"""
+    script = r"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$PSModuleAutoLoadingPreference = 'None'
+[Console]::Error.WriteLine('policy:start')
+""" + media._SMTC_POLICY + r"""
 class FakeSession {
     [string]$SourceAppUserModelId
     [string]$Kind
@@ -239,39 +244,56 @@ class FakeSession {
     }
 }
 function Start-Sleep { param([int]$Milliseconds) }
-$output = @()
+function Invoke-TestMusicCase([string]$Name, $Session) {
+    [Console]::Error.WriteLine('case:' + $Name)
+    $state = Invoke-CurrentMusicPlay $Session {param($operation,$type) return $operation}
+    [Console]::Out.WriteLine($Name + '|' + [string]$state + '|' + [string]$Session.Calls)
+}
 foreach ($kind in @('Video','Unknown','Music')) {
     $s=[FakeSession]::new();$s.Kind=$kind;$s.SourceAppUserModelId='ru.yandex.desktop.music';$s.Status='Paused'
-    $state=Invoke-CurrentMusicPlay $s {param($operation,$type) return $operation}
-    $output += @{kind=$kind;state=$state;calls=$s.Calls}
+    Invoke-TestMusicCase $kind $s
 }
 $s=[FakeSession]::new();$s.Kind='Music';$s.SourceAppUserModelId='chrome.exe';$s.Status='Paused'
-$output += @{kind='Browser';state=(Invoke-CurrentMusicPlay $s {param($op,$type) return $op});calls=$s.Calls}
+Invoke-TestMusicCase 'Browser' $s
 $s=[FakeSession]::new();$s.Kind='Music';$s.SourceAppUserModelId='Spotify.exe';$s.Status='Playing'
-$output += @{kind='Already';state=(Invoke-CurrentMusicPlay $s {param($op,$type) return $op});calls=$s.Calls}
+Invoke-TestMusicCase 'Already' $s
 $s=[FakeSession]::new();$s.Kind='Music';$s.SourceAppUserModelId='Spotify.exe';$s.Status='Paused';$s.BecomePlaying=$false
-$output += @{kind='Unconfirmed';state=(Invoke-CurrentMusicPlay $s {param($op,$type) return $op});calls=$s.Calls}
+Invoke-TestMusicCase 'Unconfirmed' $s
 $s=[FakeSession]::new();$s.Kind='Music';$s.SourceAppUserModelId='Spotify.exe';$s.Status='Paused';$s.CanPlay=$false
-$output += @{kind='Disabled';state=(Invoke-CurrentMusicPlay $s {param($op,$type) return $op});calls=$s.Calls}
+Invoke-TestMusicCase 'Disabled' $s
 $s=[FakeSession]::new();$s.Kind='Music';$s.SourceAppUserModelId='Spotify.exe';$s.Status='Paused';$s.Accept=$false;$s.BecomePlaying=$false
-$output += @{kind='Rejected';state=(Invoke-CurrentMusicPlay $s {param($op,$type) return $op});calls=$s.Calls}
+Invoke-TestMusicCase 'Rejected' $s
 $s=[FakeSession]::new();$s.Kind='Music';$s.SourceAppUserModelId='Spotify.exe';$s.Status='Paused';$s.SwitchTypeAfterPlay=$true
-$output += @{kind='ChangedType';state=(Invoke-CurrentMusicPlay $s {param($op,$type) return $op});calls=$s.Calls}
-$output | ConvertTo-Json -Compress
+Invoke-TestMusicCase 'ChangedType' $s
+[Console]::Error.WriteLine('policy:done')
+exit 0
 """
     # The fake policy defines neither RequestAsync nor a live manager. It never
     # enumerates sessions, changes volume, opens a browser or plays any audio.
     encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
-    result = subprocess.run(["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-        # CI may cold-compile PowerShell classes and load Windows modules much
-        # more slowly than the policy itself. Keep the production bridge's
-        # isolated module environment and closed stdin. Inheriting a runner's
-        # host input can leave nested Windows PowerShell waiting on that host.
-        # The production bridge's own shorter action deadline stays unchanged.
-        shell=False, stdin=subprocess.DEVNULL, capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW,
-        env=media.powershell_environment(Path("C:/Windows/System32")))
-    assert result.returncode == 0, "Synthetic Windows media policy failed"
-    states = {row["kind"]: (row["state"], row["calls"]) for row in json.loads(result.stdout.decode("utf-8-sig"))}
+    stdout_path, stderr_path = tmp_path / "states.txt", tmp_path / "phases.txt"
+    # Windows communicate() waits for pipe EOF before checking process exit.
+    # An inherited writer can therefore time out an already-finished child on
+    # CI. File handles let run() wait for this exact PID, without reader threads.
+    # Direct .NET writes also avoid unrelated ConvertTo-Json module autoload and
+    # progress CLIXML. No execution-policy override or longer deadline is used.
+    with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+        try:
+            result = subprocess.run(["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Mta", "-EncodedCommand", encoded],
+                shell=False, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, timeout=30,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                env=media.powershell_environment(Path("C:/Windows/System32")))
+        except subprocess.TimeoutExpired:
+            phases = stderr_path.read_bytes()[:2048].decode("ascii", errors="replace")
+            pytest.fail(f"Synthetic media policy process exceeded 30s; phases: {phases}", pytrace=False)
+    diagnostics = stderr_path.read_bytes()[:2048].decode("ascii", errors="replace")
+    assert result.returncode == 0, f"Synthetic Windows media policy failed: {diagnostics}"
+    assert diagnostics.splitlines() == ["policy:start", "case:Video", "case:Unknown", "case:Music", "case:Browser",
+        "case:Already", "case:Unconfirmed", "case:Disabled", "case:Rejected", "case:ChangedType", "policy:done"]
+    assert stdout_path.stat().st_size <= 4096
+    rows = [line.split("|") for line in stdout_path.read_text(encoding="ascii").splitlines()]
+    assert len(rows) == 9 and all(len(row) == 3 for row in rows)
+    states = {kind: (state, int(calls)) for kind, state, calls in rows}
     assert states == {"Video": ("not_music", 0), "Unknown": ("not_music", 0), "Music": ("playing", 1),
                       "Browser": ("unknown_source", 0), "Already": ("already_playing", 0), "Unconfirmed": ("not_confirmed", 1),
                       "Disabled": ("not_playable", 0), "Rejected": ("rejected", 1), "ChangedType": ("not_music", 1)}
