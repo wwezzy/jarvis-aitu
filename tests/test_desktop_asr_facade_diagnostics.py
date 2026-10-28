@@ -1,6 +1,4 @@
 """The installed STT facade must preserve safe failure labels, not private errors."""
-from types import SimpleNamespace
-
 import pytest
 
 from desktop.ai_routing import FallbackTranscription
@@ -108,8 +106,8 @@ def test_real_decoder_prepare_is_idempotent_through_facade(tmp_path, monkeypatch
     monkeypatch.setattr(multilingual_stt, "_load_backend", lambda path: loads.append(path) or backend)
     monkeypatch.setattr(multilingual_stt, "_pcm_samples", lambda _pcm, _rate: [])
     monkeypatch.setattr(multilingual_stt, "_decode", lambda actual, _samples, _rate: (
-        SimpleNamespace(text="Проверка связи.", language="ru", language_probability=0.98,
-                        avg_logprob=-0.1, no_speech_probability=0.01, speech_seconds=1.0)
+        multilingual_stt._Decoded(text="Проверка связи.", language="ru", language_probability=0.98,
+                                 avg_logprob=-0.1, no_speech_probability=0.01, speech_seconds=1.0)
         if actual is backend else pytest.fail("The cached CPU backend changed")))
     value = facade(tmp_path, local)
     assert value.prepare()
