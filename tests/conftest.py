@@ -37,7 +37,7 @@ def pytest_collection_modifyitems(items):
     """Keep the desktop CI group complete when optional adapters are added."""
     related = {"test_local_recovery.py", "test_local_chat_runtime.py", "test_model_runtime.py",
                "test_neural_speech.py", "test_expressive_speech.py", "test_clone_speech.py",
-               "test_multilingual_stt.py", "test_phone_delivery.py", "test_voice_lifecycle_review.py"}
+               "test_multilingual_stt.py", "test_phone_delivery.py", "test_voice_lifecycle_review.py", "test_voice_handoff.py"}
     for item in items:
         if item.path.name.startswith("test_desktop_") or item.path.name in related:
             item.add_marker(pytest.mark.desktop)

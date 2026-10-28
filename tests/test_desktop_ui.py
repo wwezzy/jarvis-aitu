@@ -569,7 +569,17 @@ def test_reported_voice_backend_can_differ_from_auto_preference(app, window, mon
     monkeypatch.setattr(window.voice, "available", lambda: {"ready": True, "model": True, "speech_backend": "neural"})
     window.voice.on_state("Говорю…")
     app.processEvents()
-    assert window.voice_backend_status.text() == "Используется локальный нейроголос."
+    assert "Piper" in window.voice_backend_status.text()
+    assert "образцу" not in window.voice_backend_status.text()
+
+
+def test_model_transport_label_is_hidden_without_changing_history(window):
+    stored = "Локальная модель: Синтетический ответ"
+    window.core.store.record("assistant", stored)
+    window.refresh()
+    displayed = [item.text() for item in window.findChildren(QLabel)]
+    assert "Синтетический ответ" in displayed and stored not in displayed
+    assert window.core.snapshot()["recent"][-1]["text"] == stored
 
 
 def test_new_request_interrupts_old_speech_without_new_actions(app, window, monkeypatch):

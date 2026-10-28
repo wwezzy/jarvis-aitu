@@ -70,16 +70,16 @@ $arguments += @('--add-data', ($licensePath + ';licenses'),
 $versionPath = Join-Path $outputPath 'version-info.txt'
 @'
 VSVersionInfo(
-  ffi=FixedFileInfo(filevers=(4,3,0,0), prodvers=(4,3,0,0), mask=0x3f, flags=0,
+  ffi=FixedFileInfo(filevers=(4,3,1,0), prodvers=(4,3,1,0), mask=0x3f, flags=0,
                     OS=0x40004, fileType=0x1, subtype=0x0, date=(0,0)),
   kids=[StringFileInfo([StringTable('040904B0', [
     StringStruct('CompanyName','Jarvis personal project'),
     StringStruct('FileDescription','Jarvis local desktop assistant'),
-    StringStruct('FileVersion','4.3.0.0'),
+    StringStruct('FileVersion','4.3.1.0'),
     StringStruct('InternalName','JarvisDesktop'),
     StringStruct('OriginalFilename','JarvisDesktop.exe'),
     StringStruct('ProductName','Jarvis Desktop'),
-    StringStruct('ProductVersion','4.3.0')])]),
+    StringStruct('ProductVersion','4.3.1')])]),
     VarFileInfo([VarStruct('Translation',[1033,1200])])])
 '@ | Set-Content -LiteralPath $versionPath -Encoding utf8
 $arguments += @('--version-file', $versionPath)
@@ -148,6 +148,6 @@ if (-not $IsccPath) {
 if (-not $IsccPath) { throw 'Portable build succeeded. Install official Inno Setup or pass -IsccPath to build the per-user installer.' }
 & $IsccPath ('/DBundleDir=' + $bundlePath) ('/DOutputDir=' + $outputPath) (Join-Path $PSScriptRoot 'installer.iss')
 if ($LASTEXITCODE -ne 0) { throw 'Inno Setup compilation failed.' }
-$installer = Join-Path $outputPath 'JarvisDesktop-Setup-4.3.0.exe'
+$installer = Join-Path $outputPath 'JarvisDesktop-Setup-4.3.1.exe'
 if (-not (Test-Path -LiteralPath $installer)) { throw 'Installer output not found.' }
 Get-FileHash -LiteralPath $installer -Algorithm SHA256 | Select-Object Algorithm, Hash, Path

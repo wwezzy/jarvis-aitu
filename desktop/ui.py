@@ -936,10 +936,10 @@ class MainWindow(QMainWindow):
         engine_row.addWidget(label("Голос", "muted"))
         self.voice_engine = QComboBox()
         self.voice_engine.setObjectName("voiceEngineChoice")
-        self.voice_engine.addItem("Локальный нейроголос, иначе Windows", "auto")
+        self.voice_engine.addItem("Базовый голос: Дмитрий (Piper) / Windows", "auto")
         self.voice_engine.addItem("Голос Windows", "windows")
         self.voice_engine.addItem("Выразительный голос (личное использование)", "expressive")
-        self.voice_engine.addItem("Голос по личному образцу (RU/EN)", "clone")
+        self.voice_engine.addItem("Голос по вашему образцу (RU/EN)", "clone")
         engine_index = self.voice_engine.findData(self.preferences.get("voice_engine", "auto"))
         self.voice_engine.setCurrentIndex(max(0, engine_index))
         self.voice_engine.currentIndexChanged.connect(self._voice_engine_changed)
@@ -958,7 +958,7 @@ class MainWindow(QMainWindow):
             content.addWidget(widget)
         self.voice_personal_license.setVisible(self.voice_engine.currentData() in {"expressive", "clone"})
         content.addWidget(self.voice_personal_license)
-        content.addWidget(label("Нейроголос работает с установленной локальной моделью. При подготовке или отказе доступен резервный голос. Сходство с личным образцом и произношение проверяются на слух.", "muted", True))
+        content.addWidget(label("Режим по образцу не подменяет тембр другим голосом. Пока он готовится или недоступен, ответ остаётся текстом. Сходство и произношение можно проверить кнопкой ниже.", "muted", True))
         self.voice_backend_status = label("Источник голоса определяется при подготовке.", "muted", True)
         self.voice_backend_status.setObjectName("voiceBackendStatus")
         content.addWidget(self.voice_backend_status)
@@ -1108,6 +1108,9 @@ class MainWindow(QMainWindow):
         chat_layout.addWidget(self.usage_status)
         chat_layout.addWidget(label("Учёт хранит только числа, без текстов бесед. Недоступные значения не считаются нулевыми; стоимость не оценивается.", "muted", True))
         outer.addWidget(local_chat)
+        self.exit_button = button("Завершить Jarvis", self.quit_application, "quiet")
+        self.exit_button.setObjectName("exitApplication")
+        outer.addWidget(self.exit_button)
         outer.addStretch()
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1207,7 +1210,10 @@ class MainWindow(QMainWindow):
         content.setContentsMargins(16, 12, 16, 14)
         content.setSpacing(7)
         content.addWidget(label("ВЫ" if role == "user" else "JARVIS", "eyebrow"))
-        body = label(str(text), wrap=True)
+        displayed = str(text)
+        if role == "assistant" and displayed.startswith("Локальная модель: "):
+            displayed = displayed[len("Локальная модель: "):]
+        body = label(displayed, wrap=True)
         body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         content.addWidget(body)
         return card
@@ -1573,10 +1579,12 @@ class MainWindow(QMainWindow):
         state = self.voice.available() if state is None else state
         labels = {
             "not_prepared": "Голос ещё подготавливается; ответы доступны текстом.",
-            "neural": "Используется локальный нейроголос.",
+            "neural": "Используется базовый голос Дмитрий (Piper).",
             "windows": "Используется установленный голос Windows.",
             "expressive": "Используется выразительный голос для личного использования.",
             "clone": "Используется голос по личному образцу (личное использование).",
+            "clone_warming": "Голос по образцу готовится. Пока ответы доступны текстом.",
+            "clone_unavailable": "Голос по образцу недоступен. Ответы доступны текстом; другой тембр не подставляется.",
             "unavailable": "Озвучивание недоступно; ответ доступен текстом.",
         }
         self.voice_backend_status.setText(labels.get(state.get("speech_backend"), "Источник голоса определяется при подготовке."))

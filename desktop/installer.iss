@@ -10,7 +10,7 @@
 [Setup]
 AppId={{8C4D752A-F032-4B93-9A13-470BDE75B420}
 AppName=Jarvis Desktop
-AppVersion=4.3.0
+AppVersion=4.3.1
 AppPublisher=Jarvis personal project
 DefaultDirName={localappdata}\Programs\JarvisDesktop
 DefaultGroupName=Jarvis Desktop
@@ -20,7 +20,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.17763
 OutputDir={#OutputDir}
-OutputBaseFilename=JarvisDesktop-Setup-4.3.0
+OutputBaseFilename=JarvisDesktop-Setup-4.3.1
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

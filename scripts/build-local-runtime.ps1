@@ -149,7 +149,7 @@ runpy.run_path(str(APP / "desktop_app.py"), run_name="__main__")
 $launcherPath = Join-Path $installPath 'launcher.pyw'
 [IO.File]::WriteAllText($launcherPath, $launcher, [Text.UTF8Encoding]::new($false))
 $manifest = @{
-    version = '4.3.0'; kind = 'isolated-source-runtime'; sourceCommit = (& git -C $repoPath rev-parse HEAD).Trim()
+    version = '4.3.1'; kind = 'isolated-source-runtime'; sourceCommit = (& git -C $repoPath rev-parse HEAD).Trim()
     runtimeSigner = $signature.SignerCertificate.Subject
     pythonwSha256 = (Get-FileHash -LiteralPath (Join-Path $runtimePath 'pythonw.exe') -Algorithm SHA256).Hash
     personalDataBundled = $false; cloudCredentialsBundled = $false
@@ -215,7 +215,7 @@ if (-not $NoShortcut) {
     $shortcut.Description = 'JARVIS — локальный голосовой ассистент'
     $shortcut.Save()
     Write-Output ('Start Menu shortcut: ' + $shortcutPath)
-    $downloadPath = Join-Path $env:USERPROFILE 'Downloads\Jarvis-Desktop-4.3.0'
+    $downloadPath = Join-Path $env:USERPROFILE 'Downloads\Jarvis-Desktop-4.3.1'
     New-Item -ItemType Directory -Path $downloadPath -Force | Out-Null
     Copy-Item -LiteralPath $shortcutPath -Destination (Join-Path $downloadPath 'JARVIS.lnk') -Force
     Write-Output ('Ready launch shortcut: ' + (Join-Path $downloadPath 'JARVIS.lnk'))
