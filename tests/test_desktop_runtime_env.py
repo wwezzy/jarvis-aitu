@@ -295,18 +295,71 @@ def test_linked_profile_or_settings_never_escape_approved_directory(tmp_path):
     assert update_phone_environment(real, origin=ORIGIN) == "refused" and target.read_bytes() == before
 
 
-def test_parallel_migrations_generate_one_pair_without_lost_old_settings(tmp_path):
+def test_parallel_migrations_generate_one_pair_without_lost_old_settings(tmp_path, monkeypatch):
     (tmp_path / "phone.env").write_text(f"JARVIS_PHONE_TOKEN={PHONE}\nTWILIO_TO=preserve-operator-value\n", encoding="utf-8")
     barrier = threading.Barrier(8)
+    snapshots = threading.Barrier(8)
+    seen, writes = set(), []
+    observation_lock = threading.Lock()
+    fstat, write = module.os.fstat, module.os.write
+    def same_empty_snapshot(descriptor):
+        info = fstat(descriptor)
+        with observation_lock:
+            first = threading.get_ident() not in seen
+            seen.add(threading.get_ident())
+        if first:
+            # Every contender sees the new empty lock before any can acquire
+            # it. That snapshot must not authorize an unlocked write later.
+            assert info.st_size == 0
+            snapshots.wait(timeout=5)
+        return info
+    def observe_write(descriptor, raw):
+        with observation_lock:
+            writes.append(raw)
+        return write(descriptor, raw)
+    monkeypatch.setattr(module.os, "fstat", same_empty_snapshot)
+    monkeypatch.setattr(module.os, "write", observe_write)
     def migrate(_index):
         barrier.wait(timeout=5)
         return create_phone_environment(tmp_path)
     with ThreadPoolExecutor(max_workers=8) as workers:
         statuses = list(workers.map(migrate, range(8)))
+    monkeypatch.setattr(module.os, "fstat", fstat)
+    monkeypatch.setattr(module.os, "write", write)
     assert statuses.count("migrated") == 1 and statuses.count("preserved") == 7
     values = loaded(tmp_path)
     assert values["JARVIS_PHONE_TOKEN"] == PHONE and values["TWILIO_TO"] == "preserve-operator-value"
     assert values["JARVIS_REMOTE_ENABLED"] == "0" and values["JARVIS_REMOTE_TOKEN"] != PHONE
+    assert writes == [b"0"]
+
+
+def test_new_lock_byte_is_initialized_only_while_exclusively_locked(tmp_path, monkeypatch):
+    owned, writes = set(), []
+    if os.name == "nt":
+        import msvcrt as locking_module
+        function, acquire, release = "locking", locking_module.LK_NBLCK, locking_module.LK_UNLCK
+    else:
+        import fcntl as locking_module
+        function, acquire, release = "flock", locking_module.LOCK_EX | locking_module.LOCK_NB, locking_module.LOCK_UN
+    locking = getattr(locking_module, function)
+    write = module.os.write
+    def observe_lock(descriptor, mode, *arguments):
+        result = locking(descriptor, mode, *arguments)
+        if mode == acquire:
+            owned.add(descriptor)
+        elif mode == release:
+            owned.remove(descriptor)
+        return result
+    def checked_write(descriptor, raw):
+        assert descriptor in owned, "Lock-byte initialization preceded the exclusive OS lock"
+        writes.append(raw)
+        return write(descriptor, raw)
+    monkeypatch.setattr(locking_module, function, observe_lock)
+    monkeypatch.setattr(module.os, "write", checked_write)
+    with module._writer_lock(tmp_path):
+        assert len(owned) == 1
+    assert not owned and writes == [b"0"]
+    assert (tmp_path / "phone.env.lock").read_bytes() == b"0"
 
 
 def test_concurrent_process_migrations_cannot_undo_explicit_enablement(tmp_path):

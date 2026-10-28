@@ -143,9 +143,7 @@ def _writer_lock(root):
         _identity(info)
         if (info.st_dev, info.st_ino) != _identity(path.lstat())[:2]:
             raise ValueError("Private lock redirected")
-        if info.st_size == 0:
-            os.write(descriptor, b"0")
-        elif info.st_size != 1:
+        if info.st_size not in (0, 1):
             raise ValueError("Invalid private lock")
         deadline = time.monotonic() + LOCK_TIMEOUT
         while True:
@@ -163,6 +161,19 @@ def _writer_lock(root):
                 if time.monotonic() >= deadline:
                     raise TimeoutError("Private settings busy") from None
                 time.sleep(0.02)
+        # Windows permits a byte-range lock past EOF. Initialize the marker
+        # only after acquiring it: another opener may already own byte zero
+        # even though our earlier fstat observed an empty, newly created file.
+        # An unlocked write from that stale snapshot would fail with EACCES.
+        current = _identity(os.fstat(descriptor))
+        if current[:2] != _identity(path.lstat())[:2]:
+            raise ValueError("Private lock redirected")
+        if current[2] == 0:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            if os.write(descriptor, b"0") != 1:
+                raise OSError("Private lock initialization failed")
+        elif current[2] != 1:
+            raise ValueError("Invalid private lock")
         _root(root)
         yield
     finally:
