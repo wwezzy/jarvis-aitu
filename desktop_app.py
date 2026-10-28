@@ -10,6 +10,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from desktop.model_runtime import should_start_local_model
+
 
 def write_report(path, report):
     if path:
@@ -187,7 +189,7 @@ def main(argv=None):
                             quiet_start=args.quiet_start)
         if not args.smoke_test:
             preferences = core.store.preferences()
-            if preferences.get("local_chat_enabled") is True:
+            if should_start_local_model(preferences):
                 from threading import Thread
                 Thread(target=_warm_local_chat, args=(preferences["local_chat_model"],),
                        name="JarvisModelWarmup", daemon=True).start()

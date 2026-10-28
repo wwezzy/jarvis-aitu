@@ -5,6 +5,7 @@ No preferences, OS settings, existing processes or network rules are changed.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import closing
 import hashlib
 import json
@@ -16,8 +17,16 @@ import sqlite3
 import subprocess
 
 
+def should_start_local_model(preferences, environ=None) -> bool:
+    """Warm only an explicitly enabled local primary; no key/profile lookup."""
+    environment = os.environ if environ is None else environ
+    return (isinstance(preferences, Mapping) and preferences.get("local_chat_enabled") is True
+            and preferences.get("voice_engine") != "openai"
+            and environment.get("JARVIS_CLOUD_CHAT_ENABLED") != "1")
+
+
 def ensure_model_runtime(state_dir: Path, manifest: dict,
-                         connector=socket.create_connection, spawn=subprocess.Popen) -> str:
+                         connector=socket.create_connection, spawn=subprocess.Popen, *, environ=None) -> str:
     """Return disabled/already_listening/started/refused/unavailable; never raise.
 
     Reads only an existing preferences row. A missing/corrupt setting cannot
@@ -33,7 +42,7 @@ def ensure_model_runtime(state_dir: Path, manifest: dict,
         if not row or not isinstance(row[0], str) or len(row[0]) > 65536:
             return "disabled"
         preferences = json.loads(row[0])
-        if not isinstance(preferences, dict) or preferences.get("local_chat_enabled") is not True:
+        if not should_start_local_model(preferences, environ):
             return "disabled"
         try:
             connection = connector(("127.0.0.1", 11434), timeout=0.35)
