@@ -29,6 +29,10 @@ HISTORY_TTL_SECONDS = 60 * 60 * 24 * 30
 
 redis = create_redis()
 
+
+def _free_only() -> bool:
+    return getattr(settings, "llm_free_only", False) is True
+
 _provider_cooldown_until: dict[str, float] = {}
 _llm_state: dict[str, object | None] = {
     "last_success_at": None,
@@ -267,6 +271,8 @@ async def _openai_reply(
     filename: str | None = None,
     attachments: list | None = None,
 ) -> tuple[str, str]:
+    if _free_only():
+        raise RuntimeError("Paid provider disabled by free-only policy")
     if not settings.openai_api_key or not settings.openai_default_model:
         raise RuntimeError("OpenAI is not configured")
 
@@ -290,6 +296,8 @@ async def _nvidia_reply(
     user_text: str,
     system_instruction: str,
 ) -> tuple[str, str]:
+    if _free_only():
+        raise RuntimeError("Paid provider disabled by free-only policy")
     if not settings.nvidia_api_key or not settings.nvidia_model:
         raise RuntimeError("NVIDIA is not configured")
 
@@ -313,6 +321,10 @@ async def _nvidia_reply(
 
 
 async def _gemini_generate(contents, config, capability, input_text):
+    if _free_only():
+        # This legacy path rotates keys/models and does not attest billing.
+        # The free-only branch has its own one-attempt bounded transport.
+        raise RuntimeError("Legacy provider path disabled by free-only policy")
     last_exc = None
     models = list(dict.fromkeys(m for m in (settings.gemini_model, settings.gemini_fallback_model) if m))
     for model in models:
@@ -370,6 +382,9 @@ async def generate_reply(
     filename: str | None = None,
     attachments: list | None = None,
 ) -> str:
+    if _free_only():
+        return await _free_reply(text=text, user_id=user_id, preferences=preferences,
+                                 memory_context=memory_context, file_bytes=file_bytes, attachments=attachments)
     user_text = text or "Проанализируй вложение и выполни запрос пользователя."
     history = await get_chat_history(user_id)
     system_instruction = _system_prompt(user_name, preferences, memory_context)
@@ -438,6 +453,45 @@ async def generate_reply(
     )
 
 
+async def _free_reply(*, text, user_id, preferences, memory_context, file_bytes, attachments):
+    """No paid construction, private-file reads, native attachments or retries."""
+    if file_bytes or attachments:
+        return ("В бесплатном режиме этот AI-канал принимает только текст. "
+                "Изображения и исходные файлы в платный сервис не отправляю. Пришли текст нужного фрагмента.")
+    from services.free_ai import FreeAIUnavailable, reply as free_reply
+    history = await get_chat_history(user_id) if settings.llm_free_history_enabled else []
+    try:
+        reply, model = await free_reply(text=text, settings=settings, redis=redis, history=history,
+                                        preferences=preferences, memory_context=memory_context)
+        _mark_success("gemini_free", model, "reply")
+        if settings.llm_free_history_enabled:
+            history.extend(({"role": "user", "text": text}, {"role": "assistant", "text": reply}))
+            await save_chat_history(user_id, history)
+        return reply
+    except asyncio.CancelledError:
+        raise
+    except FreeAIUnavailable as error:
+        reason = error.reason
+    except Exception:
+        reason = "provider_unavailable"
+    _llm_state.update({"last_error_at": datetime.now(settings.timezone).isoformat(),
+                       "last_error": "gemini_free: " + reason, "last_provider": "gemini_free", "last_mode": "free_only"})
+    logger.warning("Free-only AI unavailable reason=%s", reason)
+    detail = {
+        "not_configured": "Бесплатный AI пока не настроен.",
+        "free_project_unverified": "Бесплатный проект Gemini не подтверждён.",
+        "free_project_expired": "Срок подтверждения бесплатного проекта Gemini истёк.",
+        "quota_exhausted": "Бесплатная квота Gemini временно исчерпана.",
+        "budget_exceeded": "Дневной предел AI-запросов приложения достигнут.",
+        "budget_unavailable": "Проверка дневного предела временно недоступна.",
+        "authentication": "Gemini отклонил настроенный ключ.",
+        "access_denied": "Для этого проекта Gemini отказал в доступе.",
+        "timeout": "Gemini не ответил за отведённое время.",
+        "input_limit": "Запрос слишком большой; отправь более короткий фрагмент.",
+    }.get(reason, "Бесплатный AI временно недоступен.")
+    return detail + " Расписание, дедлайны, задачи и напоминания продолжают работать. Платные сервисы не вызываются."
+
+
 async def _extract_actions_impl(
     *,
     text: str,
@@ -446,6 +500,10 @@ async def _extract_actions_impl(
     memory_context: str,
 ) -> dict:
     """Best-effort side effect extraction. Failure must never suppress the user reply."""
+    if _free_only():
+        # Explicit deterministic handlers remain available. A second AI call
+        # per reply would waste the free allowance and grant no action rights.
+        return JarvisActions().model_dump()
     user_text = text or ""
     instruction = (
         _read_prompt_file("action_extractor.md")
@@ -511,10 +569,11 @@ def get_llm_diagnostics() -> dict:
     }
     return {
         "providers": {
-            "openai": bool(settings.openai_api_key and settings.openai_default_model),
-            "nvidia": bool(settings.nvidia_api_key and settings.nvidia_model),
+            "openai": not _free_only() and bool(settings.openai_api_key and settings.openai_default_model),
+            "nvidia": not _free_only() and bool(settings.nvidia_api_key and settings.nvidia_model),
             "gemini": bool(settings.gemini_api_keys and settings.gemini_model),
         },
+        "free_only": _free_only(),
         "models": {
             "openai_default": settings.openai_default_model,
             "openai_planner": settings.openai_planner_model,

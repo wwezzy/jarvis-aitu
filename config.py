@@ -76,6 +76,12 @@ class Settings:
     lms_ical_url: str | None
     lms_sync_minutes: int
     log_level: str
+    llm_free_only: bool = False
+    gemini_api_key: str | None = None
+    gemini_free_project_attestation: str | None = None
+    gemini_free_state_dir: str | None = None
+    llm_free_history_enabled: bool = False
+    llm_free_context_enabled: bool = False
 
 
 @lru_cache(maxsize=1)
@@ -88,12 +94,17 @@ def get_settings() -> Settings:
     if admin_id <= 0:
         raise RuntimeError("ADMIN_ID is missing or invalid")
 
-    openai_api_key = os.getenv("OPENAI_API_KEY", "").strip() or None
-    nvidia_api_key = os.getenv("NVIDIA_API_KEY", "").strip() or None
-    gemini_api_keys = _collect_gemini_api_keys()
+    free_only = _env_bool("LLM_FREE_ONLY")
+    # Free-only is an application-wide credential fence: attachments and
+    # semantic rankers also use Settings, so their paid clients cannot obtain
+    # a key even if paid-provider env vars remain configured accidentally.
+    openai_api_key = None if free_only else os.getenv("OPENAI_API_KEY", "").strip() or None
+    nvidia_api_key = None if free_only else os.getenv("NVIDIA_API_KEY", "").strip() or None
+    gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip() or None
+    gemini_api_keys = ((gemini_api_key,) if gemini_api_key else ()) if free_only else _collect_gemini_api_keys()
 
     webapp_url = os.getenv("WEBAPP_URL", "").strip() or None
-    fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "").strip() or None
+    fallback_model = None if free_only else os.getenv("GEMINI_FALLBACK_MODEL", "").strip() or None
 
     return Settings(
         bot_token=bot_token,
@@ -112,7 +123,7 @@ def get_settings() -> Settings:
             "NVIDIA_MODEL", ""
         ).strip(),
         gemini_api_keys=gemini_api_keys,
-        gemini_model=os.getenv("GEMINI_MODEL", "").strip(),
+        gemini_model="gemini-3.5-flash-lite" if free_only else os.getenv("GEMINI_MODEL", "").strip(),
         gemini_fallback_model=fallback_model,
         llm_timeout_seconds=max(8.0, float(os.getenv("LLM_TIMEOUT_SECONDS", "35"))),
         redis_url=os.getenv("UPSTASH_REDIS_REST_URL", "").strip() or None,
@@ -129,4 +140,10 @@ def get_settings() -> Settings:
         lms_ical_url=os.getenv("LMS_ICAL_URL", "").strip() or None,
         lms_sync_minutes=max(5, int(os.getenv("LMS_SYNC_MINUTES", "15"))),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper().strip(),
+        llm_free_only=free_only,
+        gemini_api_key=gemini_api_key,
+        gemini_free_project_attestation=os.getenv("JARVIS_GEMINI_FREE_PROJECT_ATTESTATION", "").strip() or None,
+        gemini_free_state_dir=os.getenv("JARVIS_GEMINI_FREE_STATE_DIR", "").strip() or None,
+        llm_free_history_enabled=_env_bool("LLM_FREE_HISTORY_ENABLED"),
+        llm_free_context_enabled=_env_bool("LLM_FREE_CONTEXT_ENABLED"),
     )
