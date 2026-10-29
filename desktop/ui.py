@@ -4,12 +4,13 @@ from __future__ import annotations
 import math
 from pathlib import Path
 import threading
+import uuid
 import weakref
 
-from PySide6.QtCore import QDate, QObject, QRunnable, QTime, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QDate, QObject, QPoint, QRunnable, QTime, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QKeySequence, QLinearGradient, QPainter, QPen, QPixmap, QRadialGradient, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDateEdit, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QApplication, QCheckBox, QComboBox, QDateEdit, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMenu, QPlainTextEdit, QPushButton, QScrollArea, QStackedWidget,
     QSlider, QSpinBox, QSystemTrayIcon, QTabWidget, QTimeEdit, QVBoxLayout, QWidget,
 )
@@ -127,7 +128,8 @@ class Orb(QWidget):
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        center = self.rect().center()
+        painter.scale(self.width() / 160, self.height() / 160)
+        center = QPoint(80, 80)
         glow = QRadialGradient(center, 79)
         glow.setColorAt(0, QColor(77, 185, 187, 55 if self.active else 24))
         glow.setColorAt(1, QColor(77, 185, 187, 0))
@@ -628,6 +630,9 @@ class MainWindow(QMainWindow):
         self.events = Events(self)
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(1)
+        self._document_pool = QThreadPool(self)
+        self._document_pool.setMaxThreadCount(1)
+        self._document_stop = threading.Event()
         self._workers = set()
         # Only positively classified conversational requests use this lane.
         # Keep one running request and one latest replacement, never a growing
@@ -679,7 +684,24 @@ class MainWindow(QMainWindow):
         self._startup_pending = False
         self.tray = None
         self.voice_factory = voice_factory
-        self.preferences = self.core.snapshot().get("preferences", {})
+        initial_snapshot = self.core.snapshot()
+        self.preferences = initial_snapshot.get("preferences", {})
+        from desktop.conversations import ConversationStore
+        self.conversations = ConversationStore(self.core.state_dir)
+        legacy = initial_snapshot.get("recent", [])
+        if not self.conversations.path.exists() and callable(getattr(self.core.store, "connection", None)):
+            with self.core.store.connection() as database:
+                legacy = list(reversed([dict(row) for row in database.execute(
+                    "SELECT role,text,timestamp FROM history ORDER BY id DESC LIMIT 300")]))
+        self.conversations.import_legacy(legacy)
+        self._conversation_ids = self.conversations.threads()
+        self._attachments = []
+        self._attachment_importing = False
+        self._documents = None
+        self._confirmation_channel = "text"
+        self._stream_channel = "text"
+        self._context_replay_blocked = False
+        self._memory_mutations = 0
         self.setWindowTitle("JARVIS — личный ассистент")
         self.setWindowIcon(app_icon())
         self.resize(1120, 790)
@@ -732,11 +754,14 @@ class MainWindow(QMainWindow):
             from desktop.voice import VoiceService
             from desktop.ai_routing import FallbackTranscription
             from desktop.cloud_speech import OpenAIRealtimeSpeech
+            from desktop.gemini_speech import GeminiSpeech
             from desktop.openai_mode import OpenAIEnvironment
+            from desktop.gemini_mode import GeminiEnvironment
             factory = VoiceService
             state_dir = self.core.state_dir
             preferences = self.core.store.preferences
             cloud_environment = OpenAIEnvironment(state_dir, preferences)
+            gemini_environment = GeminiEnvironment(state_dir, preferences)
             def local_transcriber():
                 from desktop.multilingual_stt import MultilingualSTT
                 current = preferences()
@@ -745,6 +770,7 @@ class MainWindow(QMainWindow):
             options["transcriber_factory"] = lambda: FallbackTranscription(
                 state_dir, environ=cloud_environment, local_factory=local_transcriber)
             options["speech_factory"] = lambda: OpenAIRealtimeSpeech(state_dir=state_dir, environ=cloud_environment)
+            options["gemini_speech_factory"] = lambda: GeminiSpeech(state_dir=state_dir, environ=gemini_environment)
             options["on_command"] = self._command_callback(self._capture_session)
         voice = factory(on_text=self._recognition_callback(self._capture_session), on_state=self.events.voice_state.emit,
                         model_dir=self.model_dir, **options)
@@ -810,7 +836,7 @@ class MainWindow(QMainWindow):
         side.addWidget(label("НА ЭТОМ КОМПЬЮТЕРЕ", "eyebrow"))
         side.addWidget(label("Задачи и заметки доступны\nбез интернета.", "muted", True))
         side.addSpacing(15)
-        side.addWidget(label("DESKTOP 4.5.0", "eyebrow"))
+        side.addWidget(label("DESKTOP 4.6.0", "eyebrow"))
         shell.addWidget(sidebar)
         content = QWidget()
         main = QVBoxLayout(content)
@@ -832,7 +858,7 @@ class MainWindow(QMainWindow):
         self.plan = PlanPanel(self.core, self._plan_changed)
         self.pages.addWidget(self.plan)
         from desktop.control_panel import ControlsPanel
-        self.controls = ControlsPanel(self.core, main_window=self, on_reply=self._reply,
+        self.controls = ControlsPanel(self.core, main_window=self, on_reply=lambda reply: self._reply(reply, channel="text"),
                                       remote_status=self._remote_status)
         from desktop.remote_setup_ui import RemoteSetupPanel
         self.remote_setup = RemoteSetupPanel(self.core, on_configured=self._apply_remote_setup)
@@ -857,12 +883,13 @@ class MainWindow(QMainWindow):
         layout.setSpacing(16)
         hero = QHBoxLayout()
         titles = QVBoxLayout()
+        titles.setSpacing(6)
         titles.addWidget(label("К вашим услугам.", "title"))
         titles.addWidget(label("Один следующий шаг. Всё важное — под рукой.", "subtitle", True))
         self.timer_hint = label("", "muted")
         self.timer_hint.hide()
         titles.addWidget(self.timer_hint)
-        titles.addSpacing(12)
+        titles.addSpacing(4)
         quick = QHBoxLayout()
         for text, command in [("Следующий шаг", "следующий шаг"), ("Мои задачи", "задачи"), ("Что ты умеешь?", "помощь")]:
             quick.addWidget(button(text, lambda _checked=False, value=command: self.submit(value), "quiet"))
@@ -870,34 +897,23 @@ class MainWindow(QMainWindow):
         titles.addLayout(quick)
         hero.addLayout(titles, 1)
         self.orb = Orb()
+        self.orb.setFixedSize(112, 112)
         hero.addWidget(self.orb)
         layout.addLayout(hero)
-        self.history_scroll = QScrollArea()
-        self.history_scroll.setWidgetResizable(True)
-        self.history_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.history_container = QWidget()
-        self.history_layout = QVBoxLayout(self.history_container)
-        self.history_layout.setContentsMargins(0, 0, 7, 0)
-        self.history_layout.setSpacing(10)
-        self.history_layout.addStretch()
-        self.history_scroll.setWidget(self.history_container)
-        layout.addWidget(self.history_scroll, 1)
-        self.stream_preview = QFrame()
-        self.stream_preview.setObjectName("message")
-        preview_layout = QVBoxLayout(self.stream_preview)
-        preview_layout.setContentsMargins(16, 12, 16, 12)
-        preview_layout.addWidget(label("ПРЕДВАРИТЕЛЬНЫЙ ТЕКСТ · ОТВЕТ ЕЩЁ ФОРМИРУЕТСЯ", "eyebrow", True))
-        preview_scroll = QScrollArea()
-        preview_scroll.setWidgetResizable(True)
-        preview_scroll.setMinimumHeight(48)
-        preview_scroll.setMaximumHeight(150)
-        self.stream_text = label("", wrap=True)
+        from desktop.conversation_ui import ConversationWorkspace
+        self.conversation_workspace = ConversationWorkspace()
+        self.conversation_workspace.attach_requested.connect(self._choose_attachments)
+        self.conversation_workspace.analyze_requested.connect(self._analyze_attachments)
+        self.conversation_workspace.remove_requested.connect(self._remove_attachment)
+        self.conversation_workspace.archive_requested.connect(self._show_imported_history)
+        self.conversation_workspace.files_requested.connect(self._manage_documents)
+        self.conversation_workspace.archive_button.setVisible("imported" in self._conversation_ids)
+        text_pane = self.conversation_workspace.text
+        # Stable aliases for the written conversation; voice uses its own pane.
+        for name in ("history_scroll", "history_container", "history_layout", "stream_preview", "stream_text"):
+            setattr(self, name, getattr(text_pane, name))
         self.stream_text.setObjectName("streamPreviewText")
-        self.stream_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        preview_scroll.setWidget(self.stream_text)
-        preview_layout.addWidget(preview_scroll)
-        self.stream_preview.hide()
-        layout.addWidget(self.stream_preview)
+        layout.addWidget(self.conversation_workspace, 1)
         self.confirmation = QFrame()
         self.confirmation.setObjectName("confirmation")
         confirm_layout = QVBoxLayout(self.confirmation)
@@ -917,7 +933,7 @@ class MainWindow(QMainWindow):
         command_row.setSpacing(9)
         self.command = QLineEdit()
         self.command.setObjectName("commandInput")
-        self.command.setPlaceholderText("Напишите команду или скажите «Джарвис»…")
+        self.command.setPlaceholderText("Напишите в переписку… Ответ останется текстом")
         self.command.setMaxLength(5000)
         self.command.setMinimumHeight(49)
         self.command.returnPressed.connect(self.submit_current)
@@ -1018,13 +1034,13 @@ class MainWindow(QMainWindow):
         content = QVBoxLayout(card)
         content.setContentsMargins(22, 20, 22, 20)
         content.setSpacing(10)
-        self.free_mode_toggle = QCheckBox("Работать локально, без платных API")
+        self.free_mode_toggle = QCheckBox("Блокировать платные обращения OpenAI")
         self.free_mode_toggle.setObjectName("freeModeToggle")
         self.free_mode_toggle.setChecked(bool(self.preferences.get("free_mode", False)))
         self.free_mode_toggle.toggled.connect(self._free_mode_changed)
         content.addWidget(self.free_mode_toggle)
-        content.addWidget(label("Распознавание, диалог и голос используют установленные локальные модели. "
-                               "Запросы к платным ИИ-сервисам отключены; выбранный локальный тембр сохраняется.", "muted", True))
+        content.addWidget(label("OpenAI не получает запросов при включённой блокировке. Локальные модели и выбранный тембр сохраняются. "
+                               "Gemini подключается отдельно ниже и передаёт выбранные данные Google.", "muted", True))
         content.addWidget(label("Голос и микрофон", "section"))
         self.speech_toggle = QCheckBox("Отвечать голосом")
         self.speech_toggle.setObjectName("speechToggle")
@@ -1040,6 +1056,7 @@ class MainWindow(QMainWindow):
         self.voice_engine.addItem("Выразительный голос (личное использование)", "expressive")
         self.voice_engine.addItem("Голос по вашему образцу (RU/EN)", "clone")
         self.voice_engine.addItem("OpenAI · естественный голос и умный диалог", "openai")
+        self.voice_engine.addItem("Gemini · голос Google, резерв по образцу", "gemini")
         engine_index = self.voice_engine.findData(self.preferences.get("voice_engine", "auto"))
         self.voice_engine.setCurrentIndex(max(0, engine_index))
         self.voice_engine.currentIndexChanged.connect(self._voice_engine_changed)
@@ -1056,7 +1073,7 @@ class MainWindow(QMainWindow):
         for widget in (self.voice_character_label, self.voice_character):
             widget.setVisible(self.voice_engine.currentData() == "expressive")
             content.addWidget(widget)
-        self.voice_personal_license.setVisible(self.voice_engine.currentData() in {"expressive", "clone"})
+        self.voice_personal_license.setVisible(self.voice_engine.currentData() in {"expressive", "clone", "gemini"})
         content.addWidget(self.voice_personal_license)
         content.addWidget(label("Режим по образцу не подменяет тембр другим голосом. Пока он готовится или недоступен, ответ остаётся текстом. Сходство и произношение можно проверить кнопкой ниже.", "muted", True))
         self.voice_backend_status = label("Источник голоса определяется при подготовке.", "muted", True)
@@ -1216,6 +1233,34 @@ class MainWindow(QMainWindow):
         chat_layout.addWidget(self.usage_status)
         chat_layout.addWidget(label("Учёт хранит только числа, без текстов бесед. Недоступные значения не считаются нулевыми; стоимость не оценивается.", "muted", True))
         outer.addWidget(local_chat)
+        cloud_card = QFrame()
+        cloud_card.setObjectName("card")
+        cloud_layout = QVBoxLayout(cloud_card)
+        cloud_layout.addWidget(label("Модель разговора", "section"))
+        self.gemini_toggle = QCheckBox("Использовать Gemini для разговоров и анализа файлов")
+        self.gemini_toggle.setObjectName("geminiPrimaryToggle")
+        self.gemini_toggle.setChecked(bool(self.preferences.get("gemini_enabled", False)))
+        self.gemini_toggle.toggled.connect(self._gemini_changed)
+        cloud_layout.addWidget(self.gemini_toggle)
+        cloud_layout.addWidget(label("При включении тексты и выбранные для анализа файлы передаются Google. "
+            "История, план и личная память требуют своих разрешений. Доступность, квоты и условия тарифа определяются Google; "
+            "при недоступности используется включённая локальная модель.", "muted", True))
+        self.gemini_status = label("", "muted", True)
+        self.gemini_status.setObjectName("geminiConnectionStatus")
+        cloud_layout.addWidget(self.gemini_status)
+        self.personal_context_toggle = QCheckBox("Использовать разрешённую личную память в ответах")
+        self.personal_context_toggle.setObjectName("personalContextToggle")
+        self.personal_context_toggle.setChecked(bool(self.preferences.get("personal_context_enabled", False)))
+        self.personal_context_toggle.toggled.connect(self._personal_context_changed)
+        cloud_layout.addWidget(self.personal_context_toggle)
+        outer.addWidget(cloud_card)
+        self._sync_gemini_status()
+        from desktop.conversation_ui import MemoryPanel
+        self.memory_panel = MemoryPanel(self.core, self._run_memory_io, lambda: self._quitting, self.personal_path,
+                                        on_context_changed=self._begin_memory_mutation,
+                                        on_mutation_finished=self._finish_memory_mutation)
+        self.memory_panel.enabled.hide()  # One explicit context switch controls both gates above.
+        outer.addWidget(self.memory_panel)
         self.exit_button = button("Завершить Jarvis", self.quit_application, "quiet")
         self.exit_button.setObjectName("exitApplication")
         outer.addWidget(self.exit_button)
@@ -1322,7 +1367,7 @@ class MainWindow(QMainWindow):
         content.addWidget(label("ВЫ" if role == "user" else "JARVIS", "eyebrow"))
         displayed = str(text)
         if role == "assistant":
-            for prefix in ("Локальная модель: ", "OpenAI: "):
+            for prefix in ("Локальная модель: ", "OpenAI: ", "Gemini: "):
                 if displayed.startswith(prefix):
                     displayed = displayed[len(prefix):]
                     break
@@ -1337,15 +1382,20 @@ class MainWindow(QMainWindow):
         reminder_count = len(snapshot.get("reminders", []))
         self.timer_hint.setVisible(bool(reminder_count))
         self.timer_hint.setText(f"Активные таймеры и напоминания: {reminder_count}")
-        self._clear_layout(self.history_layout)
-        self.history_layout.addStretch()
-        recent = snapshot.get("recent", [])[-12:]
-        if not recent:
-            recent = [{"role": "assistant", "text": "Я готов помочь. Сохраню задачу или заметку, открою нужное приложение и подскажу следующий шаг. Напишите команду — или включите микрофон."}]
-        self._rendered_messages = {(item.get("role"), item.get("text")) for item in recent}
-        for item in recent:
-            self.history_layout.addWidget(self._message(item.get("role", "assistant"), item.get("text", "")))
-        QTimer.singleShot(0, lambda: self.history_scroll.verticalScrollBar().setValue(self.history_scroll.verticalScrollBar().maximum()))
+        self._rendered_conversations = set()
+        for channel in ("voice", "text"):
+            pane = self.conversation_workspace.pane(channel)
+            self._clear_layout(pane.history_layout)
+            pane.history_layout.addStretch()
+            recent = self.conversations.messages(self._conversation_ids[channel], limit=100)
+            if not recent:
+                hint = "Включите микрофон и скажите «Джарвис». Голосовая история останется здесь." if channel == "voice" else "Можно задать вопрос, написать команду или прикрепить файл. Эта переписка не озвучивается."
+                recent = [{"role": "assistant", "text": hint}]
+            for item in recent:
+                self._rendered_conversations.add((channel, item["role"], item["text"]))
+                pane.history_layout.addWidget(self._message(item["role"], item["text"]))
+            QTimer.singleShot(0, lambda view=pane.history_scroll: view.verticalScrollBar().setValue(view.verticalScrollBar().maximum()))
+        self._rendered_messages = {(role, text) for channel, role, text in self._rendered_conversations if channel == "text"}
         self.refresh_tasks(snapshot)
         self.refresh_notes(snapshot=snapshot)
         self.plan.refresh()
@@ -1383,6 +1433,105 @@ class MainWindow(QMainWindow):
             row.addWidget(control)
             self.task_layout.addWidget(card)
         self.task_layout.addStretch()
+
+    def _document_service(self):
+        if self._documents is None:
+            from desktop.document_files import DocumentFiles
+            self._documents = DocumentFiles(self.core.state_dir)
+        return self._documents
+
+    def _choose_attachments(self):
+        paths, _filter = QFileDialog.getOpenFileNames(self, "Прикрепить файлы", "",
+            "Документы (*.txt *.md *.markdown *.pdf *.docx)")
+        if paths:
+            self.attach_paths(paths)
+
+    def attach_paths(self, paths):
+        if self._quitting or self._attachment_importing or not isinstance(paths, list) or not paths or len(paths) + len(self._attachments) > 4:
+            self.conversation_workspace.attachment_hint.setText("Можно выбрать не больше четырёх файлов.")
+            return False
+        self.conversation_workspace.attach_button.setEnabled(False)
+        self._attachment_importing = True
+        self.conversation_workspace.attachment_hint.setText("Готовлю локальный предпросмотр…")
+        service = self._document_service()
+        stopped = self._document_stop
+        def imported():
+            rows, errors = [], 0
+            for path in paths:
+                if stopped.is_set():
+                    break
+                try:
+                    rows.append(service.import_file(Path(path)))
+                except Exception:
+                    errors += 1
+            return rows, errors
+        def done(result):
+            if self._quitting:
+                return
+            rows, errors = result
+            self._attachment_importing = False
+            self.conversation_workspace.attach_button.setEnabled(True)
+            self._attachments.extend(rows)
+            self.conversation_workspace.set_attachments(self._attachments)
+            self.conversation_workspace.select("text")
+            self.conversation_workspace.attachment_hint.setText("Часть файлов не удалось прочитать. Остальные доступны для предпросмотра." if errors else
+                "Двойной щелчок — предпросмотр. Файлы ещё не отправлены модели.")
+        def failed(_error):
+            if not self._quitting:
+                self._attachment_importing = False
+                self.conversation_workspace.attach_button.setEnabled(True)
+                self.conversation_workspace.attachment_hint.setText("Не удалось прочитать файл. Проверь формат и размер; защищённые и повреждённые документы не открываются.")
+        self._run(imported, done, on_error=failed, pool=self._document_pool)
+        return True
+
+    def _remove_attachment(self, identity):
+        if self._quitting:
+            return
+        if self._active_request is not None and self._active_request.get("provenance") == "analysis":
+            self.stop_response()
+        service = self._document_service()
+        def removed(success):
+            if not self._quitting:
+                if success:
+                    self._attachments = [row for row in self._attachments if row["id"] != identity]
+                    self.conversation_workspace.set_attachments(self._attachments)
+                    self.conversation_workspace.attachment_hint.setText("Локальная копия файла удалена. Уже отправленные сервису данные отозвать невозможно.")
+                else:
+                    self.conversation_workspace.attachment_hint.setText("Удаление не подтверждено. Обновите список файлов.")
+        self._run(lambda: service.delete(identity), removed,
+                  on_error=lambda _error: self.conversation_workspace.attachment_hint.setText("Не удалось удалить локальную копию.") if not self._quitting else None,
+                  pool=self._document_pool)
+
+    def _analyze_attachments(self):
+        if not self._attachments:
+            return
+        question = self.command.text().strip() or "Кратко изложи главное в выбранных файлах и предложи полезные следующие шаги."
+        if self.submit(question, attachment_ids=[row["id"] for row in self._attachments]):
+            self.command.clear()
+
+    def _show_imported_history(self):
+        identity = self._conversation_ids.get("imported")
+        if identity:
+            rows = self.conversations.messages(identity, 300)
+            text = "История до разделения каналов. Источник сообщений неизвестен; в контекст новых разговоров она не передаётся.\n\n"
+            text += "\n\n".join(("Вы: " if row["role"] == "user" else "Jarvis: ") + row["text"] for row in rows)
+            self.conversation_workspace.show_text("Старая история · только чтение", text[:150000])
+
+    def _manage_documents(self):
+        if self._quitting:
+            return
+        service = self._document_service()
+        def select(rows):
+            if not self._quitting:
+                self._attachments = rows
+                self.conversation_workspace.set_attachments(rows)
+                self.conversation_workspace.select("text")
+        def loaded(rows):
+            if not self._quitting:
+                self.conversation_workspace.manage_files(rows, select, self._remove_attachment)
+        self._run(service.list, loaded, on_error=lambda _error:
+                  self.conversation_workspace.attachment_hint.setText("Не удалось прочитать локальные файлы.") if not self._quitting else None,
+                  pool=self._document_pool)
 
     def refresh_notes(self, _text=None, snapshot=None):
         snapshot = snapshot or self.core.snapshot()
@@ -1659,7 +1808,7 @@ class MainWindow(QMainWindow):
         personal = engine == "expressive"
         for widget in (self.voice_character_label, self.voice_character):
             widget.setVisible(personal)
-        self.voice_personal_license.setVisible(engine in {"expressive", "clone"})
+        self.voice_personal_license.setVisible(engine in {"expressive", "clone", "gemini"})
         cloud = engine == "openai" and not free
         self.multilingual_toggle.setEnabled(not cloud)
         self._set_checked_silently(self.multilingual_toggle,
@@ -1694,12 +1843,90 @@ class MainWindow(QMainWindow):
             prepare = getattr(self.voice, "prepare", None)
             if callable(prepare):
                 prepare()
-            self.status.setText("Локальный режим включён. Платные API отключены." if enabled else
-                                "Локальный режим выключен. Подключение платных API определяется выбранными настройками.")
+            self.status.setText("Платные обращения OpenAI заблокированы." if enabled else
+                                "Блокировка OpenAI выключена. Подключение определяется выбранными настройками.")
         if was_listening:
             self._resume_voice_after_mode_change()
 
+    def _sync_gemini_status(self):
+        self.gemini_status.setText("Gemini выбран. Доступность станет известна после запроса; квоты определяет Google. Данные передаются Google." if self.preferences.get("gemini_enabled", False)
+                                  else "Gemini выключен. Локальные команды доступны.")
+
+    def _gemini_changed(self, enabled):
+        previous = bool(self.preferences.get("gemini_enabled", False))
+        self.stop_response()
+        if not self.save_preference("gemini_enabled", enabled):
+            self._set_checked_silently(self.gemini_toggle, previous)
+        self._sync_gemini_status()
+
+    def _personal_context_changed(self, enabled):
+        previous = bool(self.preferences.get("personal_context_enabled", False))
+        memory = getattr(self.core, "memory", None)
+        if memory is None:
+            self._set_checked_silently(self.personal_context_toggle, previous)
+            return
+        self.stop_response()
+        if not enabled:
+            if not self._memory_context_changed():
+                self._set_checked_silently(self.personal_context_toggle, previous)
+                return
+        self._memory_mutations += 1
+        self.personal_context_toggle.setEnabled(False)
+        store = self.core.store
+        def configure():
+            # Both gates must permit export. A partial storage failure leaves
+            # either the preference or memory disabled, never bypassing owner.
+            memory.set_enabled(enabled)
+            return store.set_preferences({"personal_context_enabled": enabled})
+        def done(preferences):
+            self._finish_memory_mutation()
+            if not self._quitting:
+                self.preferences = preferences
+                self.personal_context_toggle.setEnabled(True)
+                self._set_checked_silently(self.personal_context_toggle, enabled)
+                self.memory_panel.refresh()
+        def failed(_error):
+            self._finish_memory_mutation()
+            if not self._quitting:
+                try:
+                    current = bool(store.preferences().get("personal_context_enabled", False)) and memory.status()["enabled"]
+                except Exception:
+                    current = previous
+                self.personal_context_toggle.setEnabled(True)
+                self._set_checked_silently(self.personal_context_toggle, current)
+                self.status.setText("Не удалось изменить разрешение памяти. Проверь подтверждение владельца и повтори настройку.")
+        self._run_memory_io(configure, done, on_error=failed)
+
+    def _run_memory_io(self, function, done, *, on_error=None):
+        self._run(function, done, on_error=on_error, pool=self._document_pool)
+
+    def _begin_memory_mutation(self):
+        if not self._memory_context_changed():
+            return False
+        self._memory_mutations += 1
+        return True
+
+    def _finish_memory_mutation(self):
+        self._memory_mutations = max(0, self._memory_mutations - 1)
+
+    def _memory_context_changed(self):
+        if self._quitting:
+            return False
+        self.stop_response()
+        self._context_replay_blocked = True
+        try:
+            self.conversations.reset_model_context()
+        except Exception:
+            self.status.setText("Не удалось сохранить изменение памяти. История временно исключена из контекста; повторите настройку позже.")
+            return False
+        self._context_replay_blocked = False
+        return True
+
     def save_preference(self, key, value):
+        if key == "local_chat_history" and value is False:
+            if not self._memory_context_changed():
+                self._set_checked_silently(self.local_chat_history_toggle, self.preferences.get(key, False))
+                return False
         if key == "speech_enabled" and value is False:
             self._cancel_morning_followup()
             self._interrupt_voice()
@@ -1748,7 +1975,7 @@ class MainWindow(QMainWindow):
         personal = engine == "expressive"
         for widget in (self.voice_character_label, self.voice_character):
             widget.setVisible(personal)
-        self.voice_personal_license.setVisible(engine in {"expressive", "clone"})
+        self.voice_personal_license.setVisible(engine in {"expressive", "clone", "gemini"})
         if hasattr(self, "multilingual_toggle"):
             cloud = engine == "openai"
             self.multilingual_toggle.setEnabled(not cloud)
@@ -1889,6 +2116,9 @@ class MainWindow(QMainWindow):
             "clone_unavailable": "Голос по образцу недоступен. Ответы доступны текстом; другой тембр не подставляется.",
             "personal_cue": "Личное приветствие из записи.",
             "openai": "Естественный голос OpenAI (потоковая озвучка).",
+            "gemini": "Озвучивание Google Gemini. Это другой голос; запасной голос по образцу работает локально.",
+            "clone_fallback": "Используется ваш локальный голос по образцу — резерв для Gemini.",
+            "gemini_unavailable": "Голос Gemini и локальный резерв недоступны. Ответ остаётся на экране.",
             "openai_unavailable": "Голос OpenAI пока недоступен: подключение, ключ или дневной лимит. Ответы доступны текстом.",
             "unavailable": "Озвучивание недоступно; ответ доступен текстом.",
         }
@@ -1931,8 +2161,10 @@ class MainWindow(QMainWindow):
         self._active_stream_id = None
         self._stream_timer.stop()
         self._stream_buffer = ""
-        self.stream_text.setText("")
-        self.stream_preview.hide()
+        for pane in (self.conversation_workspace.text, self.conversation_workspace.voice):
+            pane.stream_text.setText("")
+            pane.body.setCurrentWidget(pane.history_scroll)
+            pane.stream_preview.hide()
 
     def _receive_stream_chunk(self, request_id, delta):
         if self._quitting or not self.busy or request_id != self._active_stream_id:
@@ -1951,8 +2183,10 @@ class MainWindow(QMainWindow):
             return
         # This is literal, provisional display only: no persistence, speech,
         # confirmation metadata or command dispatch can originate here.
-        self.stream_text.setText(self._stream_buffer)
-        self.stream_preview.show()
+        pane = self.conversation_workspace.pane(self._stream_channel)
+        pane.stream_text.setText(self._stream_buffer)
+        pane.body.setCurrentWidget(pane.stream_preview)
+        pane.stream_preview.show()
         self.request_hint.setText("Формирую ответ. Можно дать новую команду или нажать «Стоп».")
 
     def _poll_reminders(self):
@@ -2005,6 +2239,11 @@ class MainWindow(QMainWindow):
                     return False
             if event is not None and not is_current():
                 continue
+            try:
+                self.conversations.append(self._conversation_ids["voice"], "assistant", reply.text,
+                                          provenance="notification")
+            except Exception:
+                pass  # A notification still reaches its existing tray/TTS path.
             if (self._integrations_enabled and isinstance(event, dict)
                     and isinstance(event.get("id"), str)):
                 # Only explicit organizer events are forwarded. No commands,
@@ -2022,9 +2261,10 @@ class MainWindow(QMainWindow):
                     # Legacy/fake voices still receive only events validated
                     # immediately above; current speech backends recheck at play.
                     self.voice.say(reply.text)
+        self.refresh()
         self._schedule_phone_work()
 
-    def _run(self, function, done, *, on_error=None):
+    def _run(self, function, done, *, on_error=None, pool=None):
         worker = Worker(function)
         self._workers.add(worker)
         def finished(value):
@@ -2040,15 +2280,22 @@ class MainWindow(QMainWindow):
             self._show_request_failure()
         worker.signals.done.connect(finished)
         worker.signals.failed.connect(failed)
-        self.pool.start(worker)
+        (self.pool if pool is None else pool).start(worker)
 
-    def _show_request_failure(self):
+    def _show_request_failure(self, channel=None):
         from desktop.core import Reply
         self._sync_request_controls()
         failure = Reply("Не удалось выполнить действие. Повтори команду или напиши её иначе.")
         # A storage failure must not retry snapshot()/record from its handler.
-        self.history_layout.addWidget(self._message("assistant", failure.text))
-        self._speak_reply(failure)
+        pane = self.conversation_workspace.pane(channel or "text")
+        pane.history_layout.addWidget(self._message("assistant", failure.text))
+        if channel is not None:
+            try:
+                self.conversations.append(self._conversation_ids[channel], "assistant", failure.text)
+            except Exception:
+                pass
+        if channel != "text":
+            self._speak_reply(failure)
         self.mic_button.setEnabled(True)
         self.model_button.setEnabled(True)
         self.status.setText("Не удалось выполнить действие")
@@ -2127,9 +2374,11 @@ class MainWindow(QMainWindow):
         if trusted:
             self._clear_stream_preview()
             if failed:
-                self._show_request_failure()
+                self._show_request_failure(record.get("channel"))
             elif reply is not None:
-                self._reply(reply, request_id=record["id"])
+                self._reply(reply, request_id=record["id"], channel=record.get("channel"),
+                            exchange_id=record.get("exchange_id"), provenance=record.get("provenance", "command"),
+                            persist=record.get("persist", True))
         if self._pending_chat is not None and self._chat_active is None and not self._quitting:
             pending, self._pending_chat = self._pending_chat, None
             if pending["id"] == self._foreground_request_id and not pending["cancel"].is_set():
@@ -2140,11 +2389,12 @@ class MainWindow(QMainWindow):
         if text and self.submit(text):
             self.command.clear()
 
-    def submit(self, text, source="typed"):
-        if self._quitting or not isinstance(text, str) or not text.strip():
+    def submit(self, text, source="typed", *, attachment_ids=None):
+        if (self._quitting or source not in {"typed", "voice"} or not isinstance(text, str) or not text.strip()
+                or attachment_ids is not None and source != "typed"):
             return False
         try:
-            kind = self.core.request_kind(text, source=source)
+            kind = "chat" if attachment_ids is not None and source == "typed" else self.core.request_kind(text, source=source)
         except Exception:
             self.status.setText("Не удалось определить запрос. Повтори команду.")
             return False
@@ -2153,6 +2403,9 @@ class MainWindow(QMainWindow):
             return True
         if kind not in {"command", "chat"}:
             self.status.setText("Запрос не принят. Повтори команду.")
+            return False
+        if kind == "chat" and self._memory_mutations:
+            self.status.setText("Сохраняю память. Повторите вопрос после завершения.")
             return False
         if self._action_request is not None and not self._action_request.get("morning"):
             self.status.setText("Действие ещё выполняется. Можно нажать «Стоп»; следующая команда не отправлена.")
@@ -2164,11 +2417,36 @@ class MainWindow(QMainWindow):
         record = self._new_request(kind, None)
         request_id = record["id"]
         cancelled = record["cancel"]
+        channel = "voice" if source == "voice" else "text"
+        thread_id = self._conversation_ids[channel]
+        exchange = uuid.uuid4().hex
+        provenance = "analysis" if attachment_ids is not None else "model" if kind == "chat" else "command"
+        record.update(channel=channel, thread_id=thread_id, exchange_id=exchange, provenance=provenance)
+        try:
+            owner = getattr(core, "owner", None)
+            record["persist"] = owner is None or not owner.enabled or owner.allowed() is True
+        except Exception:
+            record["persist"] = False
+        self._stream_channel = channel
+        self.conversation_workspace.select(channel)
+        try:
+            history = self.conversations.model_history(thread_id) if (record["persist"] and not self._context_replay_blocked
+                and self.preferences.get("local_chat_history", False)) else []
+            if record["persist"]:
+                self.conversations.append(thread_id, "user", text, provenance=provenance,
+                                          exchange_id=exchange, attachments=attachment_ids)
+        except Exception:
+            cancelled.set()
+            self._active_request = None
+            self._sync_request_controls()
+            self.status.setText("Не удалось сохранить запрос в переписке. Он не отправлен.")
+            return False
         self._active_stream_id = request_id if kind == "chat" else None
         # Echo the original request immediately. The next persisted refresh
         # replaces this temporary card without duplicating database records.
-        self.history_layout.addWidget(self._message("user", text))
-        QTimer.singleShot(0, lambda: self.history_scroll.verticalScrollBar().setValue(self.history_scroll.verticalScrollBar().maximum()))
+        pane = self.conversation_workspace.pane(channel)
+        pane.history_layout.addWidget(self._message("user", text))
+        QTimer.singleShot(0, lambda view=pane.history_scroll: view.verticalScrollBar().setValue(view.verticalScrollBar().maximum()))
         def on_chunk(delta):
             if cancelled.is_set():
                 return False
@@ -2179,7 +2457,14 @@ class MainWindow(QMainWindow):
                 except RuntimeError:
                     return False
             return not cancelled.is_set()
-        record["function"] = lambda event: core.handle(text, source=source, on_chunk=on_chunk, cancel_event=event)
+        if attachment_ids is not None:
+            service = self._document_service()
+            identities = list(attachment_ids)
+            record["function"] = lambda event: core.analyze_documents(text, service.context(identities),
+                conversation_id=thread_id, conversation_history=history, on_chunk=on_chunk, cancel_event=event)
+        else:
+            record["function"] = lambda event: core.handle(text, source=source, on_chunk=on_chunk, cancel_event=event,
+                conversation_id=thread_id, conversation_history=history)
         if kind == "chat" and self._chat_active is not None:
             self._pending_chat = record
             self._sync_request_controls()
@@ -2188,7 +2473,7 @@ class MainWindow(QMainWindow):
         self.status.setText("Готовлю ответ…" if kind == "chat" else "Выполняю…")
         return True
 
-    def _reply(self, reply, *, request_id=None):
+    def _reply(self, reply, *, request_id=None, channel=None, exchange_id=None, provenance="command", persist=True):
         if self._quitting:
             return
         if request_id is not None and request_id != self._foreground_request_id:
@@ -2203,20 +2488,34 @@ class MainWindow(QMainWindow):
         self._clear_stream_preview()
         self._sync_request_controls()
         if reply.confirmation_id:
+            self._confirmation_channel = channel or "text"
             old_token, self._confirmation = self._confirmation, reply.confirmation_id
             if old_token and old_token != self._confirmation:
                 self._cancel_confirmation_token(old_token)
             self.confirm_text.setText(reply.text)
             self.confirmation.show()
             self.navigate(0)
+        if channel is not None and persist:
+            try:
+                actual_provenance = provenance
+                if provenance == "model" and not reply.text.startswith(("Локальная модель: ", "OpenAI: ", "Gemini: ")):
+                    actual_provenance = "command"  # Clarifications/failures are not completed model exchanges.
+                self.conversations.append(self._conversation_ids[channel], "assistant", reply.text,
+                                          provenance=actual_provenance, exchange_id=exchange_id)
+            except Exception:
+                self.status.setText("Ответ получен, но история не сохранена.")
         self.refresh()
-        if ("assistant", reply.text) not in self._rendered_messages:
+        if (channel or "text", "assistant", reply.text) not in self._rendered_conversations:
             # Consent/validation feedback deliberately need not persist any
             # user request. It must still be visible when speech is disabled.
-            self.history_layout.addWidget(self._message("assistant", reply.text))
+            self.conversation_workspace.pane(channel or "text").history_layout.addWidget(self._message("assistant", reply.text))
         self.status.setText("Ожидаю «Джарвис»" if self.listening else self._capture_error or "Микрофон выключен")
-        self._speak_reply(reply, trusted_request_id=request_id)
-        self.command.setFocus()
+        if channel != "text":
+            self._speak_reply(reply, trusted_request_id=request_id)
+        elif getattr(reply, "followup_id", None) is not None:
+            self._cancel_morning_followup()
+        if channel != "voice":
+            self.command.setFocus()
         self._poll_organizer_events("interaction")
 
     def _speak_reply(self, reply, *, trusted_request_id=None):
@@ -2237,7 +2536,8 @@ class MainWindow(QMainWindow):
                             and trusted_request_id is not None and trusted_request_id == self._foreground_request_id):
                         bridge = weakref.ref(self.events)
                         request_id = trusted_request_id
-                        self._morning_followup = {"id": request_id, "token": followup, "cancel": threading.Event(), "queued": False}
+                        self._morning_followup = {"id": request_id, "token": followup, "cancel": threading.Event(), "queued": False,
+                                                  "channel": "voice", "provenance": "command"}
                         def completed(played):
                             receiver = bridge()
                             if receiver is not None:
@@ -2286,9 +2586,10 @@ class MainWindow(QMainWindow):
 
     def _cancel_confirmation_token(self, token, *, request_id=None):
         core = self.core
+        channel = self._confirmation_channel
         def complete(reply):
             if request_id is not None and request_id == self._foreground_request_id and not self._quitting:
-                self._reply(reply, request_id=request_id)
+                self._reply(reply, request_id=request_id, channel=channel)
         def failed(_error):
             if request_id is not None and request_id == self._foreground_request_id and not self._quitting:
                 self.status.setText("Не удалось подтвердить отмену действия. Не подтверждай прежний запрос.")
@@ -2325,7 +2626,9 @@ class MainWindow(QMainWindow):
         self._cancel_chat_requests()
         self._interrupt_voice()
         core = self.core
-        self._start_request(self._new_request("command", lambda _event: core.confirm(token, source="button")))
+        record = self._new_request("command", lambda _event: core.confirm(token, source="button"))
+        record.update(channel=self._confirmation_channel, provenance="command")
+        self._start_request(record)
 
     def cancel_action(self):
         if (not self._confirmation or self._quitting
@@ -2338,6 +2641,7 @@ class MainWindow(QMainWindow):
         self._interrupt_voice()
         core = self.core
         record = self._new_request("command", lambda _event: core.cancel(token))
+        record.update(channel=self._confirmation_channel, provenance="command")
         record["revocation"] = True
         self._start_request(record)
 
@@ -2494,7 +2798,8 @@ class MainWindow(QMainWindow):
         return super().nativeEvent(event_type, message)
 
     def _finish_close(self):
-        if (self.pool.activeThreadCount() == 0 and self._chat_pool.activeThreadCount() == 0 and not self._integration_workers
+        if (self.pool.activeThreadCount() == 0 and self._chat_pool.activeThreadCount() == 0
+                and self._document_pool.activeThreadCount() == 0 and not self._integration_workers
                 and self._integration_pool.activeThreadCount() == 0
                 and self._phone_stop_complete and self.controls.shutdown_complete
                 and self.remote_setup.shutdown_complete
@@ -2518,6 +2823,7 @@ class MainWindow(QMainWindow):
                 self._tray_notice_shown = True
             return
         self._quitting = True
+        self._document_stop.set()
         self.controls.shutdown()
         self.remote_setup.shutdown()
         self.obsidian_panel.shutdown()
@@ -2550,13 +2856,15 @@ class MainWindow(QMainWindow):
         # finish without freezing the UI or closing its database under it.
         self.pool.clear()
         self._chat_pool.clear()
+        self._document_pool.clear()
         discarded = {worker for worker in self._workers if not worker.started.is_set()}
         self._workers.difference_update(discarded)
         if self._action_request is not None and self._action_request.get("worker") in discarded:
             self._action_request = None
         if self._active_request is not None and self._active_request.get("worker") in discarded:
             self._active_request = None
-        if (self.pool.activeThreadCount() or self._chat_pool.activeThreadCount() or self._integration_workers or self._integration_pool.activeThreadCount()
+        if (self.pool.activeThreadCount() or self._chat_pool.activeThreadCount() or self._document_pool.activeThreadCount()
+                or self._integration_workers or self._integration_pool.activeThreadCount()
                 or not self._phone_stop_complete or not self.controls.shutdown_complete
                 or not self.remote_setup.shutdown_complete
                 or not self.obsidian_panel.shutdown_complete

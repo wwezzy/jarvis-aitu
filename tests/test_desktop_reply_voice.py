@@ -101,8 +101,8 @@ def settled(app, window):
     ("выключи непонятно что", "Уточни действие"),
     ("добавь задачу Разобрать одну тему", "Добавил задачу"),
 ])
-def test_typed_deterministic_and_clarification_replies_use_selected_voice(app, window, phrase, fragment):
-    window.submit(phrase)
+def test_voice_deterministic_and_clarification_replies_use_selected_voice(app, window, phrase, fragment):
+    window.submit(phrase, source="voice")
     settled(app, window)
     assert len(window.voice.spoken) == 1
     text, engine, thread = window.voice.spoken[0]
@@ -132,7 +132,7 @@ def test_explicit_mute_or_speak_false_policy_suppresses_text_and_cue(app, window
 
 def test_safe_owner_prompt_is_audible_without_history_or_auth_side_effects(app, window):
     window.core.set_owner_required(True)
-    window.submit("как дела")
+    window.submit("как дела", source="voice")
     settled(app, window)
     assert len(window.voice.spoken) == 1 and "Windows Hello" in window.voice.spoken[0][0]
     assert window.core.snapshot()["recent"] == []
@@ -158,7 +158,7 @@ def test_worker_failure_speaks_fixed_feedback_without_database_refresh(app, wind
     monkeypatch.setattr(window.core, "handle", unavailable)
     monkeypatch.setattr(window.core, "snapshot", forbidden_refresh)
     monkeypatch.setattr(window, "refresh", forbidden_refresh)
-    window.submit("как дела")
+    window.submit("как дела", source="voice")
     settled(app, window)
     assert calls == [] and len(window.voice.spoken) == 1
     text, engine, _thread = window.voice.spoken[0]
@@ -190,7 +190,7 @@ def test_quotes_negations_and_compound_requests_do_not_trigger_welcome(window, p
                                     "Джарвис дадис хоум", "Джарвис дэддис хоум", "Jarvis wake up that is home"])
 def test_ui_queues_only_the_named_available_cue_without_double_speaking(app, window, phrase):
     window.voice.cue_result = True
-    window.submit(phrase)
+    window.submit(phrase, source="voice")
     settled(app, window)
     assert window.voice.cues == ["welcome_home"] and window.voice.spoken == []
     assert window.effects == window.model_calls == []
@@ -210,7 +210,7 @@ def test_wake_authorized_voice_tail_plays_recording_without_normal_tts(app, wind
 @pytest.mark.parametrize("result", [False, None, 1, RuntimeError("private cue failure")])
 def test_unavailable_or_failed_cue_falls_back_to_selected_text_voice(app, window, result):
     window.voice.cue_result = result
-    window.submit("Jarvis wake up daddy’s home")
+    window.submit("Jarvis wake up daddy’s home", source="voice")
     settled(app, window)
     assert window.voice.cues == ["welcome_home"]
     assert len(window.voice.spoken) == 1
@@ -220,7 +220,7 @@ def test_unavailable_or_failed_cue_falls_back_to_selected_text_voice(app, window
 
 def test_voice_backend_without_optional_cue_api_still_speaks_selected_text(app, window, monkeypatch):
     monkeypatch.setattr(window.voice, "play_cue", None)
-    window.submit("Jarvis wake up daddy’s home")
+    window.submit("Jarvis wake up daddy’s home", source="voice")
     settled(app, window)
     assert not window.voice.cues and window.voice.spoken[0][:2] == ("Добро пожаловать домой, сэр.", "clone")
 

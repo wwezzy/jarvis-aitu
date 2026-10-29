@@ -106,7 +106,7 @@ def test_command_preempts_blocked_model_without_old_reply_error_history_or_actio
     window.model.fail = failure
     begin_chat(app, window)
     assert window.command.isEnabled() and window.send_button.isEnabled()
-    assert window.submit("открой калькулятор")
+    assert window.submit("открой калькулятор", source="voice")
     wait_for(app, lambda: window.effects == ["calculator"] and not window.busy)
     assert not window.model.release.is_set()  # The command did not wait for model I/O.
     assert window.model.events[0].is_set() and not window.stream_preview.isVisible()
@@ -155,7 +155,7 @@ def test_new_chat_retains_only_latest_replacement_and_never_starts_two_models(ap
     window.model.release.set()
     wait_for(app, lambda: not window.busy and not window._workers)
     assert window.model.calls == [FIRST, "Третий вопрос"]
-    assert window.voice.spoken == ["Локальная модель: СВЕЖИЙ ОТВЕТ: Третий вопрос"]
+    assert window.voice.spoken == []  # These replacement questions are written.
     assert "Второй вопрос" not in str(window.core.snapshot()["recent"])
     assert "СТАРЫЙ ОТВЕТ" not in str(window.core.snapshot()["recent"])
 

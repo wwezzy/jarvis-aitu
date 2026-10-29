@@ -110,7 +110,7 @@ def test_local_only_checkbox_is_explicit_default_off_and_persisted_without_chang
     window = make_window()
     toggle = window.findChild(QCheckBox, "freeModeToggle")
     assert toggle is window.free_mode_toggle and not toggle.isChecked()
-    assert toggle.text() == "Работать локально, без платных API"
+    assert toggle.text() == "Блокировать платные обращения OpenAI"
     before = window.core.store.preferences()
     toggle.setChecked(True)
     after = window.core.store.preferences()
@@ -171,7 +171,7 @@ def test_mode_change_cancels_inflight_response_and_cannot_surface_late_paid_resu
     entered, release = threading.Event(), threading.Event()
     events = []
 
-    def handle(_text, source="typed", *, on_chunk=None, cancel_event=None):
+    def handle(_text, source="typed", *, on_chunk=None, cancel_event=None, conversation_id=None, conversation_history=None):
         events.append(cancel_event)
         on_chunk("Незавершённый старый ответ")
         entered.set()

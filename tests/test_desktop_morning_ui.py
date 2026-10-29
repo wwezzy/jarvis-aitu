@@ -79,7 +79,7 @@ def wait_for(app, condition, timeout=3):
 
 def begin(app, window):
     count = len(window.voice.callbacks)
-    assert window.submit("доброе утро")
+    assert window.submit("доброе утро", source="voice")
     wait_for(app, lambda: len(window.voice.callbacks) > count and not window.busy)
     assert window.effects == [] and window.voice.spoken == []
     token = window._morning_followup["token"]
@@ -190,7 +190,7 @@ def test_old_morning_completion_cannot_resume_a_new_morning_session(app, window)
 
 def test_unavailable_cue_uses_selected_text_without_any_morning_continuation(app, window):
     window.voice.accept = False
-    window.submit("доброе утро")
+    window.submit("доброе утро", source="voice")
     wait_for(app, lambda: not window.busy and not window._workers)
     assert window.voice.spoken == ["Доброе утро, сэр."] and window.effects == []
     assert window._morning_followup is None
