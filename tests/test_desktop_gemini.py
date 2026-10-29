@@ -876,3 +876,25 @@ def test_unknown_provider_diagnostic_code_not_copied_and_success_clears_metadata
     client.opener = Opener()
     assert client.answer("Question") and client.last_error_stage is None
     assert client.last_http_status is client.last_error_code is None
+
+
+def test_automatic_history_and_plan_redact_credentials_and_links_before_cloud_json(tmp_path, env):
+    env.update({"JARVIS_GEMINI_HISTORY_ENABLED": "1", "JARVIS_GEMINI_PLAN_CONTEXT_ENABLED": "1"})
+    aq = "AQ." + "SYNTHETIC_PRIVATE_0123456789abcdef"
+    sk = "sk-" + "SYNTHETIC_PRIVATE_0123456789abcdef"
+    url = "private-lms.invalid/path/calendar"
+    history = [{"role": "user", "content": "Stored question " + aq + " " + url},
+               {"role": "assistant", "content": "Stored answer " + sk}]
+    title = "Review " + url + " " + aq
+    plan = {"today": {"date": "2026-10-29", "items": [{"title": title, "time": None, "status": "unknown", "provenance": "unknown"}]},
+            "tomorrow": {"date": "2026-10-30", "items": []}, "gym_days": [1, 3, 6], "observations": None}
+    original = "Current original question must remain verbatim."
+    opener = Opener()
+    module.GeminiChat(tmp_path, environ=env, opener=opener).answer(original, history=history, plan_context=plan)
+    payload = json.loads(opener.calls[0][0].data)
+    serialized = json.dumps(payload["contents"], ensure_ascii=False)
+    assert all(secret not in serialized for secret in (aq, sk, url))
+    assert payload["contents"][-1]["parts"][0]["text"].endswith(original)
+    assert "Stored question" in serialized and "Review" in serialized
+    assert "unknown" in serialized and "2026-10-29" in serialized
+    assert history[0]["content"].endswith(url) and plan["today"]["items"][0]["title"] == title
