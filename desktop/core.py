@@ -643,6 +643,20 @@ class DesktopCore:
 
     def _personal_reply(self, kind: str) -> Reply:
         from desktop.personal import display_due, safe_text
+        if kind == "memory":
+            memory_status = self.memory.status()
+            if memory_status["imported"] or memory_status["count"]:
+                lines = ["Текущая редактируемая память Jarvis:"]
+                facts = self.memory.list_facts()
+                for fact in facts[:30]:
+                    origin = "архив, требует проверки" if fact["historical"] else "подтверждено владельцем"
+                    lines.append(f"{safe_text(fact['key'], 80)}: {safe_text(fact['value'], 300)} ({origin}; {fact['observed_at'][:10]})")
+                if not facts:
+                    lines.append("Сохранённых фактов нет. Забытые факты из архива не подставляются.")
+                if not memory_status["enabled"] or not self.store.preferences().get("personal_context_enabled"):
+                    lines.append("Использование личной памяти в ответах ИИ отключено.")
+                lines.append("Изменить или забыть факт можно в настройках памяти. Историческая копия доступна отдельно в «Мои данные».")
+                return Reply("\n".join(lines))
         snapshot = self._personal_snapshot()
         if snapshot is None:
             return Reply("Локальная копия личных данных не подключена. Созданные здесь задачи и заметки доступны отдельно; подключение копии показано в разделе «Мои данные».")

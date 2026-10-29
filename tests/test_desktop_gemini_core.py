@@ -14,6 +14,35 @@ from desktop.voice import VoiceService
 KEY = "AQ." + "synthetic_core_never_real_key_0123456789"
 
 
+def test_memory_command_uses_current_owner_edit_without_loading_old_snapshot(tmp_path, monkeypatch):
+    core = DesktopCore(tmp_path / "state", executor=lambda _action: pytest.fail("No action permitted"))
+    try:
+        core.memory.upsert("preferred_editor", "Synthetic new editor")
+        monkeypatch.setattr(core, "_personal_snapshot", lambda: pytest.fail("Current memory must not replay archive"))
+        answer = core.handle("что ты обо мне помнишь")
+        assert "Synthetic new editor" in answer.text
+        assert "подтверждено владельцем" in answer.text
+        assert "отключено" in answer.text
+    finally:
+        core.close()
+
+
+def test_forgotten_imported_memory_command_does_not_replay_old_facts(tmp_path, monkeypatch):
+    core = DesktopCore(tmp_path / "state")
+    try:
+        from desktop import profile_memory
+        monkeypatch.setattr(profile_memory, "load_personal_snapshot", lambda _path: {
+            "status": "ready", "name": "Synthetic forgotten name", "memory": []})
+        assert core.memory.import_snapshot()["status"] == "imported"
+        core.memory.delete("name")
+        monkeypatch.setattr(core, "_personal_snapshot", lambda: pytest.fail("Forgotten facts must not replay archive"))
+        answer = core.handle("моя память")
+        assert "Synthetic forgotten name" not in answer.text
+        assert "Сохранённых фактов нет" in answer.text
+    finally:
+        core.close()
+
+
 class Provider:
     def __init__(self, result, model):
         self.result, self.model = result, model
