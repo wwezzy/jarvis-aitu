@@ -335,6 +335,8 @@ class DesktopCore:
         # A core used in tests/smoke mode never discovers global personal files.
         # Only the actual entry point may opt in with an identified local copy.
         self.personal_path = Path(personal_path) if personal_path is not None else None
+        from desktop.profile_memory import PersonalMemory
+        self.memory = PersonalMemory(state_dir, authorization_guard=self._catalog_authorized)
 
     def snapshot(self) -> dict:
         value = self.store.snapshot()
@@ -514,6 +516,8 @@ class DesktopCore:
     def _answer(self, reply: Reply) -> Reply:
         if self._request_cancelled():
             return Reply("Запрос отменён.", speak=False)
+        if getattr(self._request_context, "chat_only", False) and not self._model_authorized():
+            return Reply("Доступ отозван. Подтверди владельца через Windows Hello.", speak=False)
         if len(reply.text) > MAX_REPLY_CHARS:
             label = "\n\n[Краткий фрагмент ответа: достигнут лимит чата. Исходные заметки сохранены полностью в разделе «Заметки».]"
             reply = replace(reply, text=reply.text[:MAX_REPLY_CHARS - len(label)] + label)
@@ -524,6 +528,12 @@ class DesktopCore:
     def _request_cancelled(self):
         event = getattr(self._request_context, "cancel_event", None)
         return self._closed.is_set() or event is not None and event.is_set()
+
+    def _model_authorized(self):
+        try:
+            return not self._request_cancelled() and (not self.owner.enabled or self.owner.allowed() is True)
+        except Exception:
+            return False
 
     def request_kind(self, text, source="typed"):
         """Pure admission classification; it never dispatches an action.
@@ -718,13 +728,22 @@ class DesktopCore:
             result = "Обработчик завершился без подтверждения результата. Проверь действие на компьютере."
         return self._answer(Reply(result, action=action))
 
-    def handle(self, text: str, source: str = "typed", *, on_chunk=None, cancel_event=None) -> Reply:
+    def handle(self, text: str, source: str = "typed", *, on_chunk=None, cancel_event=None,
+               conversation_id=None, conversation_history=None, attachment_context=None) -> Reply:
+        if attachment_context is not None:
+            if source != "typed":
+                return Reply("Файлы анализируются только по явному запросу в переписке.", speak=False)
+            return self.analyze_documents(text, attachment_context, conversation_id=conversation_id,
+                conversation_history=conversation_history, on_chunk=on_chunk, cancel_event=cancel_event)
         if cancel_event is not None and not isinstance(cancel_event, type(threading.Event())):
             raise ValueError("A cancellation event is required")
+        self._validate_conversation(conversation_id, conversation_history)
         previous = getattr(self._request_context, "cancel_event", None)
         previous_chat = getattr(self._request_context, "chat_only", False)
+        previous_history = getattr(self._request_context, "conversation_history", None)
         self._request_context.cancel_event = cancel_event
         self._request_context.chat_only = self.request_kind(text, source) == "chat"
+        self._request_context.conversation_history = conversation_history
         try:
             if self._request_cancelled():
                 return Reply("Запрос отменён.", speak=False)
@@ -733,6 +752,47 @@ class DesktopCore:
         finally:
             self._request_context.cancel_event = previous
             self._request_context.chat_only = previous_chat
+            self._request_context.conversation_history = previous_history
+
+    @staticmethod
+    def _validate_conversation(conversation_id, history):
+        if conversation_id is not None and (not isinstance(conversation_id, str)
+                or not 1 <= len(conversation_id) <= 128 or "\x00" in conversation_id):
+            raise ValueError("Invalid conversation identity")
+        if history is not None and (not isinstance(history, list) or len(history) > 6
+                or any(not isinstance(row, dict) or set(row) != {"role", "content"}
+                       or row["role"] not in {"user", "assistant"} or not isinstance(row["content"], str)
+                       or "\x00" in row["content"] for row in history)
+                or sum(len(row["content"]) for row in history) > 4000):
+            raise ValueError("Bounded conversation history required")
+
+    def analyze_documents(self, question, attachment_context, *, conversation_id=None,
+                          conversation_history=None, on_chunk=None, cancel_event=None) -> Reply:
+        """Explicit data analysis has no command dispatch path, even for injected files."""
+        self._validate_conversation(conversation_id, conversation_history)
+        if cancel_event is not None and not isinstance(cancel_event, threading.Event):
+            raise ValueError("A cancellation event is required")
+        if (not isinstance(question, str) or not question.strip() or len(question) > 8000 or "\x00" in question
+                or not isinstance(attachment_context, list) or not 1 <= len(attachment_context) <= 5):
+            return Reply("Выбери от одного до пяти файлов и задай вопрос длиной до 8000 символов.", speak=False)
+        if self._closed.is_set() or cancel_event is not None and cancel_event.is_set():
+            return Reply("Запрос отменён.", speak=False)
+        if self.owner.enabled and not self.owner.allowed():
+            return Reply("Сначала подтверди владельца через Windows Hello.", speak=False)
+        previous = {key: getattr(self._request_context, key, None)
+                    for key in ("cancel_event", "chat_only", "conversation_history")}
+        self._request_context.cancel_event = cancel_event
+        self._request_context.chat_only = True
+        self._request_context.conversation_history = conversation_history
+        try:
+            self.cancel_morning()
+            request_id = self.store.record("user", question.strip())
+            reply = self._model_reply(question.strip(), request_id, on_chunk=on_chunk,
+                                      document_context=attachment_context)
+            return replace(reply, speak=False)
+        finally:
+            for key, value in previous.items():
+                setattr(self._request_context, key, value)
 
     def _handle_request(self, text: str, source: str = "typed", *, on_chunk=None) -> Reply:
         if self._closed.is_set():
@@ -935,37 +995,64 @@ class DesktopCore:
             return self._answer(Reply(clarification))
         if self.request_kind(text, source) != "chat":
             return self._answer(Reply("Уточни команду: что открыть, сохранить или изменить. Свободный вопрос можно задать отдельно."))
+        return self._model_reply(text, request_id, on_chunk=on_chunk)
+
+    def _model_reply(self, text, request_id, *, on_chunk=None, document_context=None):
         preferences = self.store.preferences()
         from desktop.openai_mode import OpenAIEnvironment
         cloud_environment = OpenAIEnvironment(self.state_dir, self.store.preferences)
         cloud_chat = cloud_environment.get("JARVIS_CLOUD_CHAT_ENABLED") == "1"
-        if preferences["local_chat_enabled"] or cloud_chat:
+        gemini = preferences.get("gemini_enabled") is True
+        contextual_router = gemini or document_context is not None or preferences.get("personal_context_enabled") is True
+        if preferences["local_chat_enabled"] or cloud_chat or gemini:
             from desktop.chat import LocalChat, LocalChatCancelled, LocalChatTruncated, LocalChatUnavailable
             from desktop.cloud_ai import CloudCancelled, CloudUnavailable
+            from desktop.gemini_ai import GeminiCancelled, GeminiUnavailable
             client = None
             usage_model = preferences["local_chat_model"] if not cloud_chat else "cloud-router"
             try:
                 # A model's result stays display-only. Optional context is
                 # exclusively earlier completed model-chat exchanges, never
                 # note/task/PC-command/personal-data records or the current row.
-                if cloud_chat:
+                if contextual_router:
+                    from desktop.gemini_ai import GeminiRouter
+                    from desktop.gemini_mode import GeminiEnvironment
+                    client = GeminiRouter(self.state_dir, environ=GeminiEnvironment(self.state_dir, self.store.preferences),
+                        local_enabled=preferences["local_chat_enabled"], local_model=preferences["local_chat_model"])
+                elif cloud_chat:
                     from desktop.ai_routing import ChatRouter
                     client = ChatRouter(self.state_dir, local_enabled=preferences["local_chat_enabled"],
                                         local_model=preferences["local_chat_model"], environ=cloud_environment)
                 else:
                     client = LocalChat(preferences["local_chat_model"])
-                options = {"on_chunk": on_chunk} if on_chunk is not None else {}
+                def guarded_chunk(chunk):
+                    if not self._model_authorized():
+                        raise GeminiCancelled()
+                    return on_chunk(chunk)
+
+                if not self._model_authorized():
+                    return Reply("Доступ отозван. Подтверди владельца через Windows Hello.", speak=False)
+                options = {"on_chunk": guarded_chunk} if on_chunk is not None else {}
                 cancel_event = getattr(self._request_context, "cancel_event", None)
                 if cancel_event is not None:
                     options["cancel_event"] = cancel_event
-                history = _dialogue_history(self.store.model_chat_history(before_id=request_id)) if preferences["local_chat_history"] else None
+                selected = getattr(self._request_context, "conversation_history", None)
+                history = (selected if selected is not None else _dialogue_history(
+                    self.store.model_chat_history(before_id=request_id))) if preferences["local_chat_history"] else None
                 if preferences["local_chat_plan_context"] and _needs_plan_context(text, history):
                     options["plan_context"] = self._current_plan_context(preferences)
+                if contextual_router:
+                    if document_context is not None:
+                        options["document_context"] = document_context
+                    if preferences.get("personal_context_enabled") is True:
+                        personality = self.memory.export_context(current_plan=self.organizer.snapshot(), preferences=preferences)
+                        if personality:
+                            options["personality_context"] = personality
                 if history is not None:
                     answer = client.answer(text, history=history, **options)
                 else:
                     answer = client.answer(text, **options)
-            except (LocalChatCancelled, CloudCancelled):
+            except (LocalChatCancelled, CloudCancelled, GeminiCancelled):
                 if client is not None:
                     self._record_chat_usage(usage_model, client, success=False)
                 return Reply("Запрос отменён.", speak=False)
@@ -993,12 +1080,18 @@ class DesktopCore:
                 }
                 message = reasons.get(error.reason, "Облачный помощник сейчас недоступен или достигнут локальный лимит запросов. Проверь подключение и настройки.")
                 return self._answer(Reply(message + " Команды, задачи и заметки продолжают работать."))
+            except GeminiUnavailable:
+                if client is not None:
+                    self._record_chat_usage(usage_model, client, success=False)
+                return self._answer(Reply("Gemini сейчас недоступен, а локальный резерв не ответил. "
+                    "Команды, задачи и заметки продолжают работать; проверь локальную модель в настройках."))
             finally:
-                if cloud_chat and client is not None:
+                if (cloud_chat or contextual_router) and client is not None:
                     client.close()
             model = getattr(client, "last_model", None) or usage_model
             self._record_chat_usage(model, client, success=True)
-            prefix = "OpenAI: " if getattr(client, "last_provider", None) == "openai" else "Локальная модель: "
+            provider = getattr(client, "last_provider", None)
+            prefix = "Gemini: " if provider == "gemini" else "OpenAI: " if provider == "openai" else "Локальная модель: "
             return self._answer(Reply(prefix + answer))
         return self._answer(Reply("Не распознал точную команду. " + HELP))
 

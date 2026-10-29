@@ -304,14 +304,18 @@ class VoiceService:
     """
 
     def __init__(self, on_text: Callable[[str], None], on_state: Callable[[str], None],
-                 model_dir: Path | None = None, *, transcriber_factory=None, on_command=None, speech_factory=None):
+                 model_dir: Path | None = None, *, transcriber_factory=None, on_command=None, speech_factory=None,
+                 gemini_speech_factory=None):
         if transcriber_factory is not None and not callable(transcriber_factory):
             raise ValueError("A transcriber factory is required")
         if on_command is not None and not callable(on_command):
             raise ValueError("A command receiver is required")
         if speech_factory is not None and not callable(speech_factory):
             raise ValueError("A speech factory is required")
+        if gemini_speech_factory is not None and not callable(gemini_speech_factory):
+            raise ValueError("A Gemini speech factory is required")
         self._speech_factory = speech_factory
+        self._gemini_speech_factory = gemini_speech_factory
         self._on_command = on_command
         self._transcriber_factory = transcriber_factory
         self.on_text, self.on_state = on_text, on_state
@@ -430,6 +434,10 @@ class VoiceService:
                     self.speech_backend = "clone"
             except Exception:
                 pass
+        if self.speech_engine == "gemini" and self._active_backend is not None:
+            backend = getattr(self._active_backend, "backend", None)
+            if backend in {"gemini", "clone_fallback", "clone_warming", "gemini_unavailable"}:
+                self.speech_backend = backend
         speech_error = None
         if self.speech_engine == "openai" and self.speech_backend == "openai_unavailable":
             raw_reason = getattr(self._active_backend, "reason", None)
@@ -1011,7 +1019,7 @@ class VoiceService:
         multilingual = preferences.get("multilingual_stt_enabled", self.multilingual_stt_enabled)
         if type(multilingual) is not bool:
             raise ValueError("Boolean recognition preference required")
-        if not isinstance(engine, str) or engine not in {"auto", "windows", "expressive", "clone", "openai"}:
+        if not isinstance(engine, str) or engine not in {"auto", "windows", "expressive", "clone", "openai", "gemini"}:
             raise ValueError("Unsupported speech engine")
         if not isinstance(character, str) or character not in {"aidar", "eugene"}:
             raise ValueError("Unsupported speech character")
@@ -1081,7 +1089,7 @@ class VoiceService:
 
     @staticmethod
     def _speech_text(text: str) -> str:
-        text = re.sub(r"^(?:Локальная модель|OpenAI):\s*", "", str(text).strip())
+        text = re.sub(r"^(?:Локальная модель|OpenAI|Gemini):\s*", "", str(text).strip())
         text = re.sub(r"(?m)^\s*(?:#{1,6}\s+|[-*]\s+)", "", text)
         text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
         text = re.sub(r"\s+", " ", text).strip()
@@ -1340,7 +1348,7 @@ class VoiceService:
                 engine, speech_rate, character = self.speech_engine, self.speech_rate, self.speech_character
                 use_neural = False
                 renderer, fixed_audio = None, None
-                if engine in {"auto", "expressive", "clone", "openai"}:
+                if engine in {"auto", "expressive", "clone", "openai", "gemini"}:
                     try:
                         key = (engine, character if engine == "expressive" else None)
                         if neural is None or neural_key != key or self._active_backend is not neural:
@@ -1351,6 +1359,12 @@ class VoiceService:
                                     candidate = OpenAIRealtimeSpeech()
                                 else:
                                     candidate = self._speech_factory()
+                            elif engine == "gemini":
+                                from desktop.speech_routing import GeminiLocalSpeech
+                                factory = self._gemini_speech_factory
+                                if factory is None:
+                                    raise ValueError("Explicit Gemini speech configuration required")
+                                candidate = GeminiLocalSpeech(gemini_factory=factory)
                             elif engine == "clone":
                                 from desktop.clone_speech import CloneSpeech
                                 candidate = CloneSpeech(personal_use=True)
@@ -1396,10 +1410,11 @@ class VoiceService:
                         use_neural = False
                 if not _event_current(validator):
                     continue
-                if engine == "openai" and not use_neural:
+                if engine in {"openai", "gemini"} and not use_neural:
                     if self._backend_current(generation, engine, character):
-                        self.speech_backend = "openai_unavailable"
-                        self._emit(self.on_state, "Голос OpenAI недоступен. Проверь подключение и лимит; ответ остаётся на экране.")
+                        self.speech_backend = engine + "_unavailable"
+                        self._emit(self.on_state, "Голос OpenAI недоступен. Проверь подключение и лимит; ответ остаётся на экране."
+                                   if engine == "openai" else "Голос Gemini и локальный голос недоступны. Ответ остаётся на экране.")
                     continue
                 if engine == "clone" and text is not _PREPARE_SPEECH and not use_neural:
                     if self._backend_current(generation, engine, character):
@@ -1415,6 +1430,8 @@ class VoiceService:
                         if engine == "clone":
                             self.speech_backend = ("clone" if use_neural else "clone_warming"
                                                    if neural is not None and getattr(neural, "is_warming", False) else "clone_unavailable")
+                        elif engine == "gemini":
+                            self.speech_backend = getattr(neural, "backend", "gemini_unavailable")
                         else:
                             self.speech_backend = ("openai" if engine == "openai" else "expressive" if engine == "expressive" else "neural") if use_neural else "windows"
                         continue
@@ -1427,12 +1444,14 @@ class VoiceService:
                                 self.speech_backend = "clone"
                                 pcm, rate = fixed_audio
                                 self._play_pcm(pcm, rate, is_current=validator)
-                            elif engine in {"clone", "openai"} and renderer is neural:
+                            elif engine in {"clone", "openai", "gemini"} and renderer is neural:
                                 self.speech_backend = engine
                                 chunks = neural.stream(text, rate=speech_rate,
                                     cancel=lambda: self._closed.is_set() or self._halt_speech.is_set()
                                     or not self.speech_enabled or not _event_current(validator))
                                 self._play_pcm_stream(chunks, is_current=validator)
+                                if engine == "gemini":
+                                    self.speech_backend = getattr(neural, "backend", "gemini_unavailable")
                             else:
                                 pcm, rate = renderer.synthesize(text, rate=speech_rate)
                                 self.speech_backend = "expressive" if engine in {"expressive", "clone"} else "neural"
@@ -1448,7 +1467,7 @@ class VoiceService:
                             if self._utterance_audio_started:
                                 self._emit(self.on_state, "Озвучивание прервалось. Полный ответ остаётся на экране.")
                                 continue
-                            if engine in {"clone", "openai"}:
+                            if engine in {"clone", "openai", "gemini"}:
                                 self.speech_backend = engine + "_unavailable"
                                 self._emit(self.on_state, "Выбранный голос недоступен. Ответ показан текстом.")
                                 continue

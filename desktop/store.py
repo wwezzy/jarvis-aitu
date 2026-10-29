@@ -25,6 +25,9 @@ DEFAULT_PREFERENCES = {
     "voice_engine": "auto",
     "voice_character": "aidar",
     "free_mode": False,
+    "gemini_enabled": False,
+    "gemini_model": "gemini-3.5-flash-lite",
+    "personal_context_enabled": False,
     "multilingual_stt_enabled": False,
     "activity_monitor_enabled": False,
     "voice_owner_required": False,
@@ -254,7 +257,7 @@ class LocalStore:
         if "voice_rate" in updates and (type(updates["voice_rate"]) is not int or not 90 <= updates["voice_rate"] <= 240):
             raise ValueError("Voice rate must be 90..240")
         if "voice_engine" in updates and (not isinstance(updates["voice_engine"], str)
-                                          or updates["voice_engine"] not in {"auto", "windows", "expressive", "clone", "openai"}):
+                                          or updates["voice_engine"] not in {"auto", "windows", "expressive", "clone", "openai", "gemini"}):
             raise ValueError("Unsupported speech engine")
         if "voice_character" in updates and (not isinstance(updates["voice_character"], str)
                                              or updates["voice_character"] not in {"aidar", "eugene"}):
@@ -264,6 +267,9 @@ class LocalStore:
             raise ValueError("Evening planning time must be HH:MM (UTC+5)")
         if "language" in updates and updates["language"] not in {"ru", "en"}:
             raise ValueError("Unsupported language")
+        if "gemini_model" in updates and (not isinstance(updates["gemini_model"], str)
+                or updates["gemini_model"] not in {"gemini-3.8-flash", "gemini-3.5-flash-lite"}):
+            raise ValueError("Unsupported free Gemini model")
         if "local_chat_model" in updates:
             model = updates["local_chat_model"]
             if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,99}", model) or "cloud" in model.casefold() or "://" in model:
@@ -299,7 +305,7 @@ class LocalStore:
         from desktop.chat import bounded_history
         with self.connection() as db:
             rows = db.execute("SELECT role,text FROM history WHERE id<? ORDER BY id DESC LIMIT 250", (before_id,)).fetchall()
-        prefixes = ("Локальная модель: ", "OpenAI: ")
+        prefixes = ("Локальная модель: ", "OpenAI: ", "Gemini: ")
         question = None
         pairs = []
         for row in reversed(rows):

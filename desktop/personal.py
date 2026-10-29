@@ -17,7 +17,31 @@ _MAX_ROWS = 200
 _URL = re.compile(r"\b(?:https?|rediss?|postgres(?:ql)?(?:\+asyncpg)?)://[^\s<>]+", re.I)
 _SENSITIVE_KEY = re.compile(r"token|secret|password|api[\s_-]*key|парол|токен|ключ\s+api|(?:lms|calendar).*url", re.I)
 _CREDENTIAL = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{20,}|\d{6,12}:[A-Za-z0-9_-]{25,})\b")
+_AQ_CREDENTIAL = re.compile(r"(?<![A-Za-z0-9_-])AQ\.[A-Za-z0-9_-]{20,197}(?![A-Za-z0-9_-])")
 _ASSIGNMENT = re.compile(r"\b(?:[A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY))\s*=\s*\S+", re.I)
+_FACT_SECRET = re.compile(r"token|secret|password|credential|authorization|cookie|session|парол|токен|api[\s_-]*key|lms|moodle|url|ссылк", re.I)
+_FACT_URL = re.compile(r"\b(?:[a-z][a-z0-9+.-]{1,20}://\S+|(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}(?:[/?:#]\S*)?)", re.I)
+
+
+def safe_context_text(value, maximum=2000):
+    """Bounded model-facing data: redact bare domains and credential values."""
+    if type(maximum) is not int or not 1 <= maximum <= 50000:
+        raise ValueError("Invalid context text limit")
+    clean = _FACT_URL.sub("[ссылка скрыта]", safe_text(value, maximum))
+    return re.sub(r"(?i)\b(?:bearer|password|пароль|secret|token|токен)\s*[:= ]\s*\S+", "[секрет скрыт]", clean)[:maximum]
+
+
+def sanitize_fact(key, value, maximum=500):
+    """Explicit profile projection, never a prompt or execution instruction."""
+    if (not isinstance(key, str) or not key.strip() or len(key) > 80 or _FACT_SECRET.search(key)
+            or not isinstance(value, str) or not value.strip() or len(value) > 2000):
+        raise ValueError("Invalid or sensitive personal fact")
+    clean_key = " ".join(safe_text(key, 80).split())
+    clean = safe_context_text(value, 2000)
+    clean = " ".join("".join(char if ord(char) >= 32 else " " for char in clean).split())
+    if not clean or not clean_key:
+        raise ValueError("Empty personal fact")
+    return clean_key, clean[:maximum]
 
 
 def default_snapshot_path() -> Path:
@@ -31,6 +55,7 @@ def default_snapshot_path() -> Path:
 
 def safe_text(value, maximum: int = 2000) -> str:
     text = str(value or "").replace("\x00", "")
+    text = _AQ_CREDENTIAL.sub("[секрет скрыт]", text)
     text = _URL.sub("[ссылка скрыта]", text)
     text = _CREDENTIAL.sub("[секрет скрыт]", text)
     text = _ASSIGNMENT.sub("[настройка скрыта]", text)

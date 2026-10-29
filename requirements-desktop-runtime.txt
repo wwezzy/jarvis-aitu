@@ -14,3 +14,6 @@ huggingface-hub==0.36.2
 PyYAML==6.0.3
 # Bounded optional OpenAI Realtime speech transport (BSD-3-Clause).
 websockets==16.1.1
+# Bounded explicit local PDF/DOCX text extraction; no office executable or OCR.
+pypdf==6.19.0
+defusedxml==0.7.1
