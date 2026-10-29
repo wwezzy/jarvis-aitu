@@ -1,4 +1,12 @@
-Jarvis Desktop 4.5.0
+Jarvis Desktop 4.6.0
+
+Optional Gemini text and speech are AI-generated Google services, enabled only
+for an explicitly verified Free project. Free quotas are limited and can change;
+submitted Free-tier content may be used to improve Google's products. The
+default personal voice and speech recognition stay local. No Google credential
+or private document is included in this distribution.
+Local document extraction uses pypdf (BSD-3-Clause) and defusedxml (PSF license).
+Their installed notices remain with the replaceable runtime packages.
 
 This is an independent local personal assistant. It is not affiliated with
 Marvel, Disney, the Iron Man films or the third-party JARVIS installer.
