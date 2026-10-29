@@ -191,7 +191,10 @@ def main(argv=None):
                             quiet_start=args.quiet_start)
         if not args.smoke_test:
             preferences = core.store.preferences()
-            if should_start_local_model(preferences):
+            # Keep the local service available for fallback, but load Qwen's
+            # weights only when it is the selected primary assistant. Gemini
+            # primary leaves GPU memory available for the accepted local voice.
+            if preferences.get("gemini_enabled") is not True and should_start_local_model(preferences):
                 from threading import Thread
                 Thread(target=_warm_local_chat, args=(preferences["local_chat_model"],),
                        name="JarvisModelWarmup", daemon=True).start()

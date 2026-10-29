@@ -60,11 +60,16 @@ def test_actual_runtime_cloud_primary_never_checks_listener_manifest_hash_or_spa
     assert not calls and path.read_bytes() == original
 
 
-@pytest.mark.parametrize("cloud", ["voice_mode", "explicit_cloud_flag", "local_primary"])
+@pytest.mark.parametrize("cloud", ["voice_mode", "explicit_cloud_flag", "local_primary", "gemini_primary", "gemini_disabled", "gemini_truthy"])
 def test_actual_entrypoint_uses_same_gate_without_starting_gui_or_model(tmp_path, monkeypatch, cloud):
     assert desktop_app.should_start_local_model is model_runtime.should_start_local_model
     preferences = {"local_chat_enabled": True, "voice_engine": "openai" if cloud == "voice_mode" else "clone",
                    "local_chat_model": "synthetic-local-model"}
+    if cloud.startswith("gemini_"):
+        preferences.update(free_mode=True, gemini_enabled={"gemini_primary": True, "gemini_disabled": False, "gemini_truthy": 1}[cloud])
+        # Service admission remains true for an available on-demand fallback.
+        # Only entrypoint model weight preloading is suppressed for Gemini.
+        assert model_runtime.should_start_local_model(preferences, {}) is True
     started = []
     if cloud == "explicit_cloud_flag":
         monkeypatch.setenv("JARVIS_CLOUD_CHAT_ENABLED", "1")
@@ -139,4 +144,4 @@ def test_actual_entrypoint_uses_same_gate_without_starting_gui_or_model(tmp_path
     module("desktop.runtime_env", create_phone_environment=lambda _state: None, load_phone_environment=lambda _state: None)
     module("desktop.personal", default_snapshot_path=lambda: tmp_path / "absent-archive.db")
     assert desktop_app.main(["--state-dir", str(tmp_path), "--quiet-start"]) == 0
-    assert started == ([("synthetic-local-model",)] if cloud == "local_primary" else [])
+    assert started == ([("synthetic-local-model",)] if cloud in {"local_primary", "gemini_disabled", "gemini_truthy"} else [])
